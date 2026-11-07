@@ -149,35 +149,51 @@ html, body {
 .card.container { background: var(--surface-3); }
 .card.step { padding: 9px 10px 8px; }
 
-/* 连接线：每张子卡自带一段「肘线」——从上一张卡底边垂下来、到标题行高度
- * 向右拐进卡里。线跟着卡走，最后一张之后自然就没有线，不用去猜整组有多高
- * （父容器上一条 border-left 做不到这件事：它只能一路画到底，读者会以为
- * 「下面还有一张」）。
- * 首张卡顶边上提 8px 贴住父卡的底边（父卡 margin-bottom: 8px），线从父卡
- * 底边直接长出来；后面的卡各自往回补 8px，把中间那道 7px 的缝接上。 */
+/* 连接线：`::before` 画竖轨、`::after` 画横枝，最后一张把竖轨截到拐点。
+ * 这是树形控件的通行做法（VS Code 的 tree、各种纯 CSS tree 教程都一样）：
+ * 竖轨必须**贯穿整张子卡**，否则每张卡只在自己头顶那 20px 有线，卡与卡之间
+ * 就成了一截一截的「断线」——第一版就踩了这个坑。
+ *
+ * 竖轨向上多吃 9px：左右各一张卡之间是 8px 缝，多出的 1px 压在上一张卡
+ * （或父卡）的底边上，分数像素缩放时不会露白。 */
 .subtree {
   position: relative;
-  margin: -8px 0 8px 12px;
+  margin: 0 0 8px 12px;
   padding-left: 14px;
   display: flex;
   flex-direction: column;
 }
 .subtree > .card { position: relative; margin-bottom: 0; }
-.subtree > .card + .card { margin-top: 7px; }
+/* 子卡之间 8px = 父卡到首张的间距（.card 的 margin-bottom），整组节奏一致 */
+.subtree > .card + .card { margin-top: 8px; }
+
+/* 竖轨：贯穿整张子卡 */
 .subtree > .card::before {
   content: "";
   position: absolute;
   left: -14px;
-  /* 往上多吃 1px：分数像素下（125%/150% 缩放）接缝会露白，压 1px 盖住 */
-  top: -1px;
-  width: 14px;
-  height: 19px;
-  border-left: 1px solid var(--tree-line);
-  border-bottom: 1px solid var(--tree-line);
-  border-bottom-left-radius: 7px;
+  top: -9px;
+  bottom: -1px;
+  width: 1px;
+  background: var(--tree-line);
   pointer-events: none;
 }
-.subtree > .card + .card::before { top: -9px; height: 27px; }
+/* 最后一张只画到拐点，后面不留「下面还有东西」的尾巴 */
+.subtree > .card:last-child::before { bottom: auto; height: 18px; }
+
+/* 横枝：从竖轨圆角拐进卡片标题行（y=18px 处） */
+.subtree > .card::after {
+  content: "";
+  position: absolute;
+  left: -14px;
+  top: 9px;
+  width: 14px;
+  height: 9px;
+  border-left: 1px solid var(--tree-line);
+  border-bottom: 1px solid var(--tree-line);
+  border-bottom-left-radius: 9px;
+  pointer-events: none;
+}
 
 /* 第一行：点 · 标题 · 状态 · 计时（计时靠右） */
 .row1 { display: flex; align-items: center; gap: 7px; min-width: 0; }
