@@ -18,19 +18,30 @@
  * ⚠️ lib/ 里禁止出现指向插件内文件的静态 import。
  */
 
+import fs from 'node:fs'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 const Q = import.meta.url.includes('?') ? `?${import.meta.url.split('?')[1]}` : ''
 const imp = (name) => import(pathToFileURL(path.join(import.meta.dirname, 'lib', `${name}.mjs`)).href + Q)
 
-const { latestForSession, livenessOf, pruneLiveFiles, LIVE_DIR } = await imp('live-store')
+const { latestForSession, livenessOf, pruneLiveFiles, readLiveFiles, liveDirOf } = await imp('live-store')
 const { sessionKeyOf } = await imp('session-key')
 const { listLineages, activeCount } = await imp('lineage')
 const { describeDegrade } = await imp('degrade')
+const { buildInboxItem, pruneLedger, seedLedger, selectNewCompletions } = await imp('inbox-watch')
+
+/** 面板 id：与 manifest `panels[].id` 一致，信箱条目的落点 */
+const PANEL_ID = 'fleet'
+/** 巡检间隔：信箱不是实时通道，5s 足够，也不至于把盘读热 */
+const INBOX_SWEEP_MS = 5_000
+/** 台账文件名（dataDir 下）：已通知过的 `<sessionKey>|<runId>` */
+const LEDGER_FILE = 'notified.json'
 
 /** @type {{ ctx: any } | null} */
 let rt = null
+/** @type {any} */
+let sweepTimer = null
 
 /**
  * 会话上下文里拿不到 sessionFile 时也返回一份可渲染的结果：
@@ -83,39 +94,122 @@ function stateFor(sessionFile) {
   }
 }
 
-/** @param {any} pluginContext */
-export async function activate(pluginContext) {
-  rt = { ctx: pluginContext }
-  const removed = pruneLiveFiles(pluginContext.dataDir)
-  pluginContext.log(`subagents-board active, dataDir=${pluginContext.dataDir}${removed ? `, pruned ${removed} stale file(s)` : ''}`)
-  return {
-    /**
-     * @param {string} method
-     * @param {any} params
-     */
-    async invoke(method, params) {
-      switch (method) {
-        case 'getState':
-          return stateFor(params?.sessionFile)
-        case 'getDiagnostics': {
-          const file = String(params?.sessionFile ?? '').trim()
-          if (!file) return { ok: false, error: 'no sessionFile' }
-          const latest = latestForSession(rt.ctx.dataDir, sessionKeyOf(file))
-          return {
-            ok: true,
-            liveDir: path.join(rt.ctx.dataDir, LIVE_DIR),
-            dataFile: latest?.file ?? '',
-            mtimeMs: latest?.mtimeMs ?? null,
-            state: latest?.state ?? null,
-          }
-        }
-        default:
-          throw new Error(`unknown method: ${method}`)
-      }
-    },
+/** @param {any} ctx */
+function ledgerPath(ctx) {
+  return path.join(ctx.dataDir, LEDGER_FILE)
+}
+
+/** 读台账；坏了就重来（丢的是「已通知」标记，最坏结果是重复通知一次） @param {any} ctx */
+function readLedger(ctx) {
+  try {
+    const raw = JSON.parse(fs.readFileSync(ledgerPath(ctx), 'utf8'))
+    return raw && typeof raw === 'object' ? /** @type {Record<string, number>} */ (raw) : {}
+  } catch {
+    return {}
   }
 }
 
+/** @param {any} ctx @param {Record<string, number>} ledger */
+function writeLedger(ctx, ledger) {
+  try {
+    const file = ledgerPath(ctx)
+    const tmp = `${file}.tmp`
+    fs.writeFileSync(tmp, JSON.stringify(ledger, null, 2))
+    fs.renameSync(tmp, file)
+  } catch (error) {
+    ctx.log('ledger write failed:', error instanceof Error ? error.message : error)
+  }
+}
+
+/**
+ * 巡检一次：把新结束的 run 投进宿主信箱。
+ *
+ * 只做「值得你知道」的那一层——完整记录在面板里，条目点开回到那段会话。
+ * 宿主的 `dedupeKey` 再兜一层：同一 run 重复投递也只留一条。
+ * @param {any} ctx
+ */
+function sweepInbox(ctx) {
+  const inbox = ctx.ui?.inbox
+  if (typeof inbox !== 'function') return
+  const files = readLiveFiles(ctx.dataDir)
+  if (!files.length) return
+  const ledger = readLedger(ctx)
+  // 启动/热重载时把「早就结束」的段记进台账，不发通知：否则每次重启都会把历史重播一遍
+  const seeded = seedLedger(files, ledger, Date.now())
+  const pending = selectNewCompletions(files, ledger)
+  for (const entry of pending) {
+    try {
+      inbox(buildInboxItem(entry, ctx.pluginId, PANEL_ID))
+      ledger[entry.key] = Date.now()
+    } catch (error) {
+      ctx.log('inbox push failed:', error instanceof Error ? error.message : error)
+    }
+  }
+  const pruned = pruneLedger(ledger, Date.now())
+  if (pending.length || seeded || pruned) writeLedger(ctx, ledger)
+}
+
+/**
+ * @param {any} method
+ * @param {any} params
+ */
+async function handleInvoke(method, params) {
+  switch (method) {
+    case 'getState':
+      return stateFor(params?.sessionFile)
+    case 'getDiagnostics': {
+      const file = String(params?.sessionFile ?? '').trim()
+      if (!file) return { ok: false, error: 'no sessionFile' }
+      const latest = latestForSession(rt.ctx.dataDir, sessionKeyOf(file))
+      return {
+        ok: true,
+        liveDir: liveDirOf(rt.ctx.dataDir),
+        dataFile: latest?.file ?? '',
+        mtimeMs: latest?.mtimeMs ?? null,
+        state: latest?.state ?? null,
+      }
+    }
+    case 'openSession': {
+      // 「这段子会话到底在干什么」→ 宿主只读预览。刻意不做可写打开：
+      // 观测层不该获得指挥用户会话的能力（用户想接手，自己从侧栏切过去）。
+      const target = String(params?.sessionFile ?? '').trim()
+      if (!target) return { ok: false, error: 'no sessionFile' }
+      const revealed = await rt.ctx.sessions.reveal(target)
+      return { ok: Boolean(revealed), sessionFile: target }
+    }
+    default:
+      throw new Error(`unknown method: ${method}`)
+  }
+}
+
+/** @param {any} pluginContext */
+export async function activate(pluginContext) {
+  // 热重载会再调一次 activate：旧实例的定时器必须先停，否则两个巡检并存、台账互相覆盖
+  if (sweepTimer) {
+    clearInterval(sweepTimer)
+    sweepTimer = null
+  }
+  rt = { ctx: pluginContext }
+  const removed = pruneLiveFiles(pluginContext.dataDir)
+  // 先巡检一次：把历史终态段记进台账（不发通知），之后只发新增的
+  sweepInbox(pluginContext)
+  sweepTimer = setInterval(() => {
+    if (!rt) return
+    try {
+      sweepInbox(rt.ctx)
+    } catch (error) {
+      rt.ctx.log('inbox sweep failed:', error instanceof Error ? error.message : error)
+    }
+  }, INBOX_SWEEP_MS)
+  if (typeof sweepTimer.unref === 'function') sweepTimer.unref()
+  pluginContext.log(`subagents-board active, dataDir=${pluginContext.dataDir}${removed ? `, pruned ${removed} stale file(s)` : ''}`)
+  return { invoke: handleInvoke }
+}
+
 export async function deactivate() {
+  if (sweepTimer) {
+    clearInterval(sweepTimer)
+    sweepTimer = null
+  }
   rt = null
 }

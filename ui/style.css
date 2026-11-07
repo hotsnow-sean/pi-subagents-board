@@ -143,6 +143,51 @@ html, body {
 }
 .child-agent { font-weight: 500; }
 
+/* 可点的 child 行：整行可点，悬停才显出箭头（静息态别太吵） */
+.child-btn {
+  all: unset;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+  font-size: 12px;
+  cursor: pointer;
+  border-radius: 4px;
+  padding: 1px 3px;
+  margin: -1px -3px;
+}
+.child-btn:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.child-btn:focus-visible { outline: 1px solid var(--accent); }
+.chev { margin-left: auto; color: var(--muted); opacity: .35; }
+.child-btn:hover .chev { opacity: 1; }
+
+.open-session {
+  all: unset;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--accent);
+}
+.open-session:hover { text-decoration: underline; }
+.open-session .chev { margin-left: 0; opacity: 1; }
+
+/* 动作结果（打开子会话）：常驻一行，不随重绘消失 */
+.result {
+  margin: 8px 0 0;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  border: 1px solid var(--border);
+}
+.result-ok { color: #15803d; border-color: #bbf7d0; background: color-mix(in srgb, #16a34a 8%, transparent); }
+.result-warn { color: #b45309; border-color: #fde68a; background: color-mix(in srgb, #d97706 8%, transparent); }
+.result-error { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, var(--border)); }
+.result-info { color: var(--muted); }
+
 .summary {
   margin: 6px 0 0;
   font-size: 12px;

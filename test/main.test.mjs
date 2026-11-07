@@ -21,9 +21,20 @@ async function loadMain() {
   return mod
 }
 
-function fakeCtx(dataDir) {
+function fakeCtx(dataDir, opts = {}) {
   const logs = []
-  return { pluginId: 'subagents-board', dataDir, log: (...args) => logs.push(args.join(' ')), logs }
+  /** @type {any[]} */
+  const inbox = []
+  const reveal = opts.reveal ?? (async () => true)
+  return {
+    pluginId: 'subagents-board',
+    dataDir,
+    log: (...args) => logs.push(args.join(' ')),
+    logs,
+    inbox,
+    ui: { inbox: (/** @type {any} */ item) => inbox.push(item) },
+    sessions: { reveal: (/** @type {string} */ file) => reveal(file) },
+  }
 }
 
 function seedLive(dataDir, sessionFile) {
@@ -117,4 +128,66 @@ test('未知方法抛错（不是静默 undefined）', async () => {
   const mod = await loadMain()
   const api = await mod.activate(fakeCtx(dataDir))
   await assert.rejects(() => api.invoke('nope', {}), /unknown method/)
+})
+
+test('openSession: 走宿主 sessions.reveal，路径非法/不存在时回 ok:false 而不是抛错', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
+  const mod = await loadMain()
+
+  /** @type {string[]} */
+  const calls = []
+  const api = await mod.activate(fakeCtx(dataDir, { reveal: async (file) => (calls.push(file), true) }))
+  const ok = await api.invoke('openSession', { sessionFile: 'C:/sessions/child/session.jsonl' })
+  assert.equal(ok.ok, true)
+  assert.deepEqual(calls, ['C:/sessions/child/session.jsonl'])
+
+  // 宿主说「路径不可用」（文件被清理）：透传成 ok:false，不抛错
+  const mod2 = await loadMain()
+  const api2 = await mod2.activate(fakeCtx(dataDir, { reveal: async () => false }))
+  const gone = await api2.invoke('openSession', { sessionFile: 'C:/sessions/gone/session.jsonl' })
+  assert.equal(gone.ok, false)
+
+  // 空路径直接拒绝，不该白调宿主
+  const empty = await api2.invoke('openSession', {})
+  assert.equal(empty.ok, false)
+  assert.match(empty.error, /sessionFile/)
+})
+
+test('信箱: 激活时只通知「刚结束」的 run，历史终态段记进台账不重播', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
+  const sessionFile = path.join(dataDir, 'sessions', 'd.jsonl')
+  const sessionKey = sessionKeyOf(sessionFile)
+  const startedAt = Date.now() - 60_000
+  const state = createState({ sessionKey, sessionFile, pid: 7, startedAt })
+  const now = Date.now()
+  applyStarted(state, { id: 'run-fresh', agent: 'worker' }, now - 20_000)
+  applyComplete(
+    state,
+    { id: 'run-fresh', state: 'complete', success: true, timestamp: now - 5_000, durationMs: 15_000, summary: '八轮跑完', sessionFile: 'C:/sessions/child/session.jsonl' },
+    now - 5_000,
+  )
+  applyStarted(state, { id: 'run-old', agent: 'reviewer' }, now - 50_000)
+  applyComplete(state, { id: 'run-old', state: 'complete', success: true, timestamp: now - 300_000, durationMs: 1_000 }, now - 300_000)
+  state.updatedAt = now
+  ensureLiveDir(dataDir)
+  writeJsonAtomic(liveFileOf(dataDir, { sessionKey, pid: 7, startedAt }), state)
+
+  const mod = await loadMain()
+  const ctx = fakeCtx(dataDir)
+  await mod.activate(ctx)
+
+  assert.equal(ctx.inbox.length, 1, '只有 5 秒前结束的那次该通知')
+  const item = ctx.inbox[0]
+  assert.equal(item.title, 'worker 已完成')
+  assert.equal(item.tone, 'success')
+  assert.equal(item.sessionFile, sessionFile, '点开要回到产出它的会话')
+  assert.deepEqual(item.target, { pluginId: 'subagents-board', panelId: 'fleet' })
+  assert.match(item.body, /耗时 0:15/)
+  assert.match(item.body, /八轮跑完/)
+
+  // 台账落盘：再激活一次（等价于重启）不会重复通知
+  const ctx2 = fakeCtx(dataDir)
+  await mod.activate(ctx2)
+  assert.equal(ctx2.inbox.length, 0, '已通知过的 run 不许重播')
+  assert.ok(fs.existsSync(path.join(dataDir, 'notified.json')))
 })

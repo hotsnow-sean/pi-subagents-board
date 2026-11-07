@@ -30,6 +30,8 @@ let busy = false
 const expanded = new Set()
 /** 诊断折叠区的展开状态：每秒整块重绘会把它拍回去，必须自己记 */
 let diagOpen = false
+/** 最近一次「打开子会话」的结果；同样要活过重绘 */
+let actionResult = /** @type {{ text: string, tone: string } | null} */ (null)
 
 function esc(value) {
   return String(value ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c])
@@ -81,18 +83,26 @@ function segmentTiming(segment, now) {
 
 function renderChildren(segment, now) {
   const children = segment.children || []
-  if (!children.length) return ''
+  if (!children.length) {
+    // 没有 children 明细（status 中途接入的段）：只要能推导出子会话路径，就给一个卡级入口
+    return segment.childSessionFile
+      ? `<button class="open-session" data-open-session="${esc(segment.childSessionFile)}">打开子会话 <span class="chev">›</span></button>`
+      : ''
+  }
   return `<ul class="children">${children
-    .map(
-      (child) => `<li>
+    .map((child) => {
+      const inner = `
         <span class="dot dot-${esc(child.state || 'unknown')}"></span>
         <span class="child-agent">${esc(child.agent || '子代理')}</span>
         ${child.model ? `<span class="muted">${esc(child.model)}</span>` : ''}
         ${child.thinking ? `<span class="muted">thinking·${esc(child.thinking)}</span>` : ''}
         <span class="muted">${esc(STATE_TEXT[child.state] || child.state || '')}</span>
-        ${child.lastActivityAt ? `<span class="muted">${esc(fmtAge(now - child.lastActivityAt))}</span>` : ''}
-      </li>`,
-    )
+        ${child.lastActivityAt ? `<span class="muted">${esc(fmtAge(now - child.lastActivityAt))}</span>` : ''}`
+      // 有子会话路径才能点：路径来自 async-complete 的 results，后台 run 派发即返回时可能没有
+      return child.sessionFile
+        ? `<li><button class="child-btn" data-open-session="${esc(child.sessionFile)}" title="只读预览这段子会话">${inner}<span class="chev">›</span></button></li>`
+        : `<li>${inner}</li>`
+    })
     .join('')}</ul>`
 }
 
@@ -152,6 +162,34 @@ function renderBanner(degrade) {
   </div>`
 }
 
+/** 动作结果横幅：只读预览能不能打开，用户必须当场知道，不能一闪就没 */
+function renderActionResult() {
+  if (!actionResult) return ''
+  return `<div class="result result-${esc(actionResult.tone)}">${esc(actionResult.text)}</div>`
+}
+
+/**
+ * 打开子会话（只读预览）。
+ *
+ * 走宿主 `sessions.reveal`：预览不绑 worker、不能对它发提示词——观测层不该获得
+ * 指挥用户会话的能力。失败是常态（一次性 run 的会话会被清理），所以文案说清原因，
+ * 而不是静默。
+ * @param {string} sessionFile
+ */
+async function openSession(sessionFile) {
+  actionResult = { text: '正在打开…', tone: 'info' }
+  render()
+  try {
+    const result = await bridge.invoke('openSession', { sessionFile })
+    actionResult = result?.ok
+      ? { text: '已打开只读预览（不能向该会话发消息）', tone: 'ok' }
+      : { text: '子会话已不存在，可能已被清理', tone: 'warn' }
+  } catch (error) {
+    actionResult = { text: `打开失败：${error instanceof Error ? error.message : String(error)}`, tone: 'error' }
+  }
+  render()
+}
+
 function render() {
   const now = Date.now()
   const scrollTop = el.scrollTop
@@ -179,6 +217,7 @@ function render() {
       <span class="muted" title="数据源">${esc(modeText)}</span>
     </div>
     ${renderBanner(data.degrade)}
+    ${renderActionResult()}
     ${lineages.length ? lineages.map((lineage) => renderLineage(lineage, now)).join('') : data.degrade?.kind === 'ok' ? '<p class="muted pad">这个会话最近没有子代理运行。</p>' : ''}
     <details class="diag"${diagOpen ? ' open' : ''}>
       <summary>诊断</summary>
@@ -207,7 +246,14 @@ el.addEventListener(
   true,
 )
 el.addEventListener('click', (/** @type {MouseEvent} */ event) => {
-  const button = /** @type {HTMLElement | null} */ (/** @type {HTMLElement} */ (event.target)?.closest?.('[data-open]'))
+  const target = /** @type {HTMLElement} */ (event.target)
+  const sessionButton = /** @type {HTMLElement | null} */ (target?.closest?.('[data-open-session]'))
+  if (sessionButton) {
+    const file = sessionButton.getAttribute('data-open-session')
+    if (file) void openSession(file)
+    return
+  }
+  const button = /** @type {HTMLElement | null} */ (target?.closest?.('[data-open]'))
   if (!button) return
   const root = button.getAttribute('data-open')
   if (!root) return
