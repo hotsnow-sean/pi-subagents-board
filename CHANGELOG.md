@@ -19,4 +19,4 @@ P2-a：数据层打通。
 - `lib/degrade.mjs`：五种降级状态（ok / poll / rpc-unavailable / stale / no-data）的文案
 - `main.mjs`：`getState` / `getDiagnostics`
 - `ui/`：只读面板（卡片、children、代际链折叠、降级横幅、诊断折叠区）
-- 单测：聚合、会话 key、落盘、降级共 26 例
+- 单测：聚合、会话 key、落盘、降级共 37 例（含 main 侧 getState 集成）
