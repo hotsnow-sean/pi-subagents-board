@@ -28,7 +28,7 @@ import path from 'node:path'
 import { applyComplete, applyStarted, createState, isActiveState, mergeStatus } from './lib/lineage.mjs'
 import { INBOX_DIR, RECEIPT_DIR, isFresh, parseNoteFileName } from './lib/note-queue.mjs'
 import { ensureLiveDir, liveFileOf, writeJsonAtomic } from './lib/live-store.mjs'
-import { describeSteerFailure, isReviveNoise, readRunSnapshot, resolveRunTitle } from './lib/run-snapshot.mjs'
+import { describeSteerFailure, isReviveNoise, readRunSnapshot, resolveRunTitle, stepLabel } from './lib/run-snapshot.mjs'
 import { childSessionFile, sessionKeyOf } from './lib/session-key.mjs'
 
 const RPC_VERSION = 1
@@ -276,9 +276,12 @@ export default function subagentsBoard(pi, ctx) {
       for (const segment of lineage.segments ?? []) {
         if (!segment.asyncDir) continue
         const active = isActiveState(segment.state) || segment.state === 'stopping'
-        // 终态段的数据不会再变，但「名字缺失 / 名字是 resume 的模板废话」得补一次——
-        // 补完 sessionName 就有值了，之后每次心跳都跳过，不会长期占 IO。
-        if (!active && segment.sessionName && !isReviveNoise(segment.sessionName)) continue
+        // 终态段的数据不会再变，但三样东西得补一次：标题（含 label）、续跑来源、可打开的会话候选。
+        // 补完就不再读，不会长期占 IO。
+        const needTitle = !segment.sessionName || isReviveNoise(segment.sessionName)
+        const needLabel = !segment.label
+        const needOpen = !Array.isArray(segment.openCandidates)
+        if (!active && !needTitle && !needLabel && !needOpen) continue
         const snap = readRunSnapshot(segment.asyncDir)
         if (!snap) continue
 
@@ -288,8 +291,37 @@ export default function subagentsBoard(pi, ctx) {
           segment.revivedFrom = resolved.revivedFrom
           changed = true
         }
+        // 徽标要指「最初那个 run」而不是直接来源：`续 be55dc91` 这种没人看得懂（P1″）
+        if (resolved.rootRunId && segment.reviveRoot !== resolved.rootRunId) {
+          segment.reviveRoot = resolved.rootRunId
+          changed = true
+        }
+        if (resolved.hops !== (Number(segment.reviveHops) || 0)) {
+          segment.reviveHops = resolved.hops
+          changed = true
+        }
         if (resolved.title && resolved.title !== segment.sessionName) {
           segment.sessionName = resolved.title
+          changed = true
+        }
+
+        // workflow 的步骤名：卡片标题的第一顺位（P6）。`task-1` 这类占位符由 stepLabel 过滤
+        const label = stepLabel(snap)
+        if (label && label !== segment.label) {
+          segment.label = label
+          changed = true
+        }
+
+        // 可打开的会话候选（P8）：顶层 childSessionFile 常常悬空，真实的在 steps[] 里。
+        // 存在性判定放 main（那边每秒读一次，顺手 stat），这里只按优先级排候选。
+        /** @type {string[]} */
+        const candidates = []
+        if (segment.childSessionFile) candidates.push(String(segment.childSessionFile))
+        for (const child of segment.children ?? []) if (child?.sessionFile) candidates.push(String(child.sessionFile))
+        for (const step of snap.steps ?? []) if (step?.sessionFile) candidates.push(step.sessionFile)
+        const uniq = [...new Set(candidates)]
+        if (JSON.stringify(uniq) !== JSON.stringify(segment.openCandidates ?? [])) {
+          segment.openCandidates = uniq
           changed = true
         }
 

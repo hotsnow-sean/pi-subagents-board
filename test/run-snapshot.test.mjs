@@ -11,6 +11,7 @@ import {
   normalizeSteering,
   readRunSnapshot,
   resolveRunTitle,
+  stepLabel,
   steeringEntry,
 } from '../lib/run-snapshot.mjs'
 
@@ -204,7 +205,7 @@ test('resolveRunTitle: resume 段的标题去原 run 取，模板废话不上卡
   assert.equal(got.revivedFrom, 'run-a', 'revivedFrom 同时要带出来，卡片上要标「续」')
 })
 
-test('resolveRunTitle: 连环 resume 一路往回追', () => {
+test('resolveRunTitle: 连环 resume 一路往回追，并报出根 run 与续跑次数（P1″）', () => {
   clearRunSnapshotCache()
   const root = runsRoot({
     'run-a': { runId: 'run-a', steps: [{ agent: 'delegate', sessionName: REAL_ORIGIN_NAME }] },
@@ -214,6 +215,8 @@ test('resolveRunTitle: 连环 resume 一路往回追', () => {
   const got = resolveRunTitle(path.join(root, 'run-c'))
   assert.equal(got.title, REAL_ORIGIN_NAME)
   assert.equal(got.revivedFrom, 'run-b', 'revivedFrom 只报直接来源，追到哪一层是内部事')
+  assert.equal(got.rootRunId, 'run-a', '徽标要指最初那条，不是直接来源')
+  assert.equal(got.hops, 2, '续了两次')
 })
 
 test('resolveRunTitle: 原 run 目录已被清理 → 没有标题，但 revivedFrom 照样带出来', () => {
@@ -236,7 +239,37 @@ test('resolveRunTitle: status.json 里若有 name（扩展将来落地 P1′）�
 
 test('resolveRunTitle: 空路径 / 目录不存在 → 空标题，不抛', () => {
   clearRunSnapshotCache()
-  assert.deepEqual(resolveRunTitle(''), { title: '', revivedFrom: null })
-  assert.deepEqual(resolveRunTitle(null), { title: '', revivedFrom: null })
+  assert.deepEqual(resolveRunTitle(''), { title: '', revivedFrom: null, rootRunId: '', hops: 0 })
+  assert.deepEqual(resolveRunTitle(null), { title: '', revivedFrom: null, rootRunId: '', hops: 0 })
   assert.equal(resolveRunTitle(path.join(os.tmpdir(), 'board-nope-runs')).title, '')
+})
+
+/* ---------- P6：workflow 的 label 优先于 sessionName ---------- */
+
+test('stepLabel / resolveRunTitle: workflow 的步骤名优先，等于 workflowKey 的占位符被跳过', () => {
+  clearRunSnapshotCache()
+  const root = runsRoot({
+    // 实测：单个 step 的 workflow，label 会退化成 workflowKey（`task-1`）
+    'run-x': { runId: 'run-x', steps: [{ label: 'task-1', workflowKey: 'task-1', sessionName: 'worker: 你是测试用的' }] },
+    // 实测：编排者给了真名字
+    'run-y': { runId: 'run-y', steps: [{ label: '第一步-取数', workflowKey: 's1', sessionName: 'worker: 随便什么' }] },
+  })
+  assert.equal(stepLabel(readRunSnapshot(path.join(root, 'run-x'))), '', '占位符不算名字')
+  assert.equal(resolveRunTitle(path.join(root, 'run-x')).title, 'worker: 你是测试用的', '退回 sessionName')
+  assert.equal(stepLabel(readRunSnapshot(path.join(root, 'run-y'))), '第一步-取数')
+  assert.equal(resolveRunTitle(path.join(root, 'run-y')).title, '第一步-取数', 'label 排在 sessionName 前面')
+})
+
+test('readRunSnapshot: steps 带上 label / workflowKey / sessionFile（P6 + P8 的数据源）', () => {
+  clearRunSnapshotCache()
+  const dir = tmpRunDir({
+    'status.json': JSON.stringify({
+      runId: 'run-1',
+      steps: [{ label: '标签A-回声', workflowKey: 'a', sessionFile: 'C:/s/child.jsonl', status: 'completed' }],
+    }),
+  })
+  const snap = readRunSnapshot(dir)
+  assert.equal(snap.steps[0].label, '标签A-回声')
+  assert.equal(snap.steps[0].workflowKey, 'a')
+  assert.equal(snap.steps[0].sessionFile, 'C:/s/child.jsonl')
 })

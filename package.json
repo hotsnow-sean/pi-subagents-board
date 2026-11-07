@@ -1,6 +1,6 @@
 {
   "name": "pi-plugin-subagents-board",
-  "version": "0.4.0",
+  "version": "0.7.1",
   "private": true,
   "type": "module",
   "description": "pi-app 插件：在右栏观测 pi-subagents 的后台运行",

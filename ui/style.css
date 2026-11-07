@@ -58,6 +58,11 @@ html, body {
 .pad { padding: 12px 4px; }
 .spacer { flex: 1; }
 
+/* 渲染分区容器（P7）：本身不生成盒子，子元素直接参与 #app 的流——
+   这样 head 的吸顶、notice 的 fixed 都跟以前一样 */
+.slot { display: contents; }
+.cards { display: block; }
+
 /* ---------- 顶栏：吸顶，返回按钮也在这里（不再单独占一行顶内容） ---------- */
 .head {
   display: flex;
@@ -338,9 +343,9 @@ button.gen-line:hover .chev { opacity: 1; }
 .diag dt { color: var(--dim); }
 .diag dd { margin: 0; word-break: break-all; color: var(--muted); }
 
-/* ---------- 顶部浮层：absolute，脱离文档流，出现/消失都不推内容 ---------- */
+/* ---------- 顶部浮层：fixed，脱离文档流，出现/消失不推内容，滚动也不跟着跑 ---------- */
 .notice {
-  position: absolute;
+  position: fixed;
   top: 6px;
   left: 10px;
   right: 10px;

@@ -73,6 +73,56 @@ function emptyState(degrade) {
   }
 }
 
+/**
+ * 会话文件存在性探测。
+ *
+ * 面板每秒一次 getState，每个段最多三个候选路径——直接 statSync 就是几十次/秒。
+ * 会话文件不会秒级出现又消失，5 秒的缓存足够准，也把成本压到可忽略。
+ * @type {Map<string, { ok: boolean, at: number }>}
+ */
+const probeCache = new Map()
+const PROBE_TTL_MS = 5_000
+
+/** @param {string} file */
+function existsCached(file) {
+  const now = Date.now()
+  const hit = probeCache.get(file)
+  if (hit && now - hit.at < PROBE_TTL_MS) return hit.ok
+  let ok = false
+  try {
+    ok = fs.statSync(file).isFile()
+  } catch {
+    ok = false
+  }
+  if (probeCache.size > 512) probeCache.clear()
+  probeCache.set(file, { ok, at: now })
+  return ok
+}
+
+/**
+ * 给每个段标出「打开」按钮该指向哪份会话、能不能点（报告 P8）。
+ *
+ * 候选由 agent 侧按优先级排好（childSessionFile → children[].sessionFile →
+ * status.json 的 steps[].sessionFile），这里只做存在性判定。放在 main 而不是 UI：
+ * UI 不该自己猜路径，也拿不到 fs。
+ *
+ * `openState` 的三种值决定卡片怎么说：
+ *   ok      能打开
+ *   missing 有候选但都不在磁盘上了（临时目录被清理）→ 按钮置灰，说清原因
+ *   none    这条 run 本来就没有自己的会话（前台 run / 启动失败）→ 不出按钮
+ * @param {any[]} lineages
+ */
+function decorateOpen(lineages) {
+  for (const lineage of lineages) {
+    for (const segment of lineage.segments ?? []) {
+      const candidates = Array.isArray(segment.openCandidates) ? segment.openCandidates : []
+      const target = candidates.find((file) => file && existsCached(String(file))) || ''
+      segment.openTarget = target
+      segment.openState = target ? 'ok' : candidates.length ? 'missing' : 'none'
+    }
+  }
+}
+
 /** @param {string} sessionFile */
 function stateFor(sessionFile) {
   const file = String(sessionFile ?? '').trim()
@@ -102,6 +152,7 @@ function stateFor(sessionFile) {
   const liveness = livenessOf(state)
   const degrade = describeDegrade(state, liveness)
   const lineages = state ? listLineages(state) : []
+  decorateOpen(lineages)
   return {
     ok: true,
     sessionFile: file,

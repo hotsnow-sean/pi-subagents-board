@@ -113,6 +113,41 @@ test('getState: 心跳过期时 degrade 变 stale，数据照常返回', async (
   assert.equal(state.lineages.length, 1, '陈旧也要把最后一次快照给出去')
 })
 
+test('getState: 打开目标按候选顺序取第一个真实存在的，全不在则置灰（P8）', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
+  const sessionFile = path.join(dataDir, 'sessions', 'open.jsonl')
+  const sessionKey = sessionKeyOf(sessionFile)
+  const startedAt = Date.now() - 5_000
+  const state = createState({ sessionKey, sessionFile, pid: 7, startedAt })
+  const a = applyStarted(state, { id: 'run-a', agent: 'worker', cwd: 'C:/w' }, startedAt + 100)
+  const b = applyStarted(state, { id: 'run-b', agent: 'worker', cwd: 'C:/w' }, startedAt + 200)
+  const c = applyStarted(state, { id: 'run-c', agent: 'worker', cwd: 'C:/w' }, startedAt + 300)
+
+  const real = path.join(dataDir, 'child-real.jsonl')
+  fs.writeFileSync(real, '{}')
+  // 实测形状：childSessionFile 悬空，真实路径排在候选后面
+  a.segment.openCandidates = [path.join(dataDir, 'gone.jsonl'), real]
+  b.segment.openCandidates = [path.join(dataDir, 'gone.jsonl')]
+  c.segment.openCandidates = []
+
+  state.source.rpc = true
+  state.source.mode = 'push'
+  state.updatedAt = Date.now()
+  ensureLiveDir(dataDir)
+  writeJsonAtomic(liveFileOf(dataDir, { sessionKey, pid: 7, startedAt }), state)
+
+  const mod = await loadMain()
+  const api = await mod.activate(fakeCtx(dataDir))
+  const got = await api.invoke('getState', { sessionFile })
+  const byId = Object.fromEntries(got.lineages.flatMap((lineage) => lineage.segments).map((seg) => [seg.runId, seg]))
+
+  assert.equal(byId['run-a'].openTarget, real, '第一个悬空就往下找，不能短路')
+  assert.equal(byId['run-a'].openState, 'ok')
+  assert.equal(byId['run-b'].openTarget, '')
+  assert.equal(byId['run-b'].openState, 'missing', '有候选但都不在 = 会话被清理，按钮置灰')
+  assert.equal(byId['run-c'].openState, 'none', '本来就没有会话 = 不出按钮')
+})
+
 test('getDiagnostics: 给出数据文件与原始状态', async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
   const sessionFile = path.join(dataDir, 'sessions', 'c.jsonl')

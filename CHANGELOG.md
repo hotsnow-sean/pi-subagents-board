@@ -183,3 +183,38 @@ P2-a：数据层打通。
 
 其余（P0 workflow Windows 启动、P1′ 的 `name` 落地、P2′ 后端亚秒窗口、P3 默认模型）
 都在 pi-subagents 上游，插件侧无能为力。测试 103 例。
+
+## 0.7.1 — 重绘、打开、标题三处的根因修（实测报告 v12）
+
+**P7：整块重绘的根因不在计时，而在诊断区的心跳。** 卡片里的计时早就占位化了，
+但「诊断」折叠区的 `心跳 3s 前` 每秒都不同 → 整段 HTML 每秒变一次 → `innerHTML`
+整块重建。实测对照：心跳年龄每秒变化时卡片节点 2.5s 后被替换、选区被清空；不变时存活。
+
+- 秒级字段全部占位：`<dd data-heartbeat>`、历史段计时也改 `<span data-timing>`；
+- 页面拆成五个分区（notice / head / banner / cards / diag），各自比对后只写变化的；
+- 卡片按 `data-card=runId` 增量替换：key 序列没变时只换内容真变了的那张。
+  mock 验证：给卡片/顶栏/骨架打标记，2.6s 后标记全在（节点没被替换），计时照走。
+
+**P9：不再固定 1s 空转。** 拉数据按活跃度 1s / 3s / 5s 调整，`document.hidden`
+时完全停（恢复可见立刻拉一次）；UI 心跳单独 1s 跑，拉取变慢不影响计时显示。
+mock 验证：隐藏后 2.5s 内 `getState` 调用数不变（3→3），恢复后 +1。
+
+**P8：打开按钮按存在性置灰。** 根因是 UI 写 `childSessionFile || children.find(...)`，
+有值就短路——而 4 个 workflow 父 run 的 `childSessionFile` 实测全部悬空，真实路径在
+`status.json` 的 `steps[].sessionFile` 里（实测存在）。
+
+- agent 侧按 `childSessionFile → children[].sessionFile → steps[].sessionFile` 排候选；
+- main 侧 `existsCached`（5s 缓存）取第一个真实存在的，给出 `openTarget` / `openState`；
+- `openState=missing` 的按钮置灰并说明「文件已不在磁盘上」，`none` 不出按钮；
+- 提示层改 `position: fixed`，同 `(sessionFile)` 8 秒内只提示一次。
+
+**P6：卡片标题有了完整链路。** `steps[].label`（排除等于 `workflowKey` 的占位符，
+实测单个 step 的 workflow 会退化成 `task-1`）→ sessionName → 子代理 name →
+`agent · runId8`。mode 永不作标题——之前 workflow 父 run 显示成「workflow」，就是
+兜底只写了角色名。
+
+**P1″：resume 徽标指向最初那条。** 连环 resume 时直接来源本身也是续跑，
+徽标改显示根 run，`title` 写明「第 N 次续跑 · 直接来源 X · 最初那条 Y」。
+`resolveRunTitle` 顺带返回 `rootRunId` / `hops`。
+
+测试 106 例（新增 3：label 优先级与占位符过滤、steps 三字段、openTarget 三种结局）。

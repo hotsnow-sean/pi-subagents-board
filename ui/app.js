@@ -10,11 +10,13 @@
  *   - 没有常驻输入坞、没有结果横幅——它们会顶得内容往下跳（U4）。
  *
  * 渲染策略（「位置突变」的总根源）：
- *   1. **计时数字不进 HTML**：卡片里只放空的 `<span data-timing>`，插入 DOM 后由
- *      `tickTimings` 用 textContent 填。否则每秒算出的 HTML 都不同，`lastHtml` 比对
- *      永远不相等，整块 innerHTML 每秒重建一次——选区、焦点、动画全丢。
- *   2. **HTML 没变就不碰 DOM**：`lastHtml` 比对，相等只推计时。
+ *   1. **秒级字段不进 HTML**：卡片里只放空的 `<span data-timing>`，诊断区的心跳
+ *      只放空的 `<dd data-heartbeat>`，插入 DOM 后由 `uiPulse` 用 textContent 填。
+ *      否则每秒算出的 HTML 都不同，整块 `innerHTML` 每秒重建一次——选区、焦点、
+ *      动画全丢，点击落在被替换的节点上也不会触发 click。
+ *   2. **分区 patch + 卡片按 runId 增量**：骨架只建一次，之后只动内容真变了的区块。
  *   3. **编辑插话时暂停重绘**：用户正在打字的那几秒，画面不该动；提交/取消后再同步。
+ *   4. **拉数据与 UI 心跳分开**：拉取按活跃度 1s/3s/5s，隐藏时停；计时仍每秒走。
  *
  * 卡片标题来自子代理会话名（`steps[0].sessionName`）：顶层 `subagent()` 没有 name
  * 参数，同角色并发时只有这个名字能把两张卡分开、也才知道该对谁插话（报告 P1）。
@@ -39,8 +41,6 @@ let busy = false
 const genOpen = new Set()
 /** 诊断折叠区的展开状态：整块重绘会把它拍回去，必须自己记 */
 let diagOpen = false
-/** 上一帧的 HTML：一样就不碰 DOM */
-let lastHtml = ''
 /** 编辑插话时默认不重绘；改表单自身状态（展开/发送中）时放行一次 */
 let paintOnce = false
 
@@ -48,12 +48,17 @@ let paintOnce = false
 let noteDraft = /** @type {any} */ (null)
 /** 停止的二次确认：`{ runId, until }`，3 秒不点自动回退 */
 let stopConfirm = /** @type {any} */ (null)
-/** 顶部浮层提示（绝对定位，不占文档流，所以不会顶内容） */
-let notice = /** @type {{ text: string, tone: string, at: number } | null} */ (null)
+/** 顶部浮层提示（fixed 定位，不占文档流，所以不会顶内容） */
+let notice = /** @type {{ text: string, tone: string, at: number, key: string } | null} */ (null)
 /** 本会话发出去、还在等回执的投递：`[{ id, runId, kind, at }]` */
 const sentNotes = []
 
 const NOTICE_MS = { ok: 3_000, warn: 8_000, error: 8_000, info: 4_000 }
+/**
+ * 同一件事的重复提示在 8 秒内只出现一次（P8）。
+ * 场景：用户连点三下「打开」，三下都失败——三条一样的提示叠在一起没有信息量。
+ */
+const NOTICE_DEDUPE_MS = 8_000
 /**
  * 发出多久还没回执，就从「投递中」改口成「未确认」。
  * 6 秒的口径：worker 500ms 轮询 + 扩展内部最多 3s ack 等待 + RPC 往返。
@@ -62,8 +67,15 @@ const RECEIPT_PATIENCE_MS = 6_000
 /** 回执 chip 的保鲜期：再久就只是历史，留在卡上会让人以为刚刚才发生 */
 const RECEIPT_VISIBLE_MS = 5 * 60_000
 
-function setNotice(text, tone = 'info') {
-  notice = { text, tone, at: Date.now() }
+/**
+ * @param {string} text
+ * @param {string} [tone]
+ * @param {string} [key] 去重键；同键 8 秒内只提示一次
+ */
+function setNotice(text, tone = 'info', key = '') {
+  const now = Date.now()
+  if (key && notice && notice.key === key && now - notice.at < NOTICE_DEDUPE_MS) return
+  notice = { text, tone, at: now, key }
 }
 
 function esc(value) {
@@ -173,17 +185,25 @@ function taskTitle(sessionName) {
  * 链的标题：从链尾往前找第一个说得出的名字。
  *
  * 一条链的每一段都是同一个人，所以上一段的名字对下一段有效——这是 resume 段
- * （sessionName 是复活提示语）唯一的兜底来源。都没有才退回角色名。
+ * （sessionName 是复活提示语）唯一的兜底来源。
+ *
+ * 优先级（报告 P6）：`label`（workflow 给这一步起的名字）> sessionName > 子代理的 name。
+ * 都没有才退回 `角色 · runId8`——**别只写角色名**：workflow 的父 run 角色就叫
+ * `workflow`，只写它等于没写；mode（single/workflow）永远不作标题。
  */
 function titleOf(lineage, segment) {
   const segments = lineage.segments || []
   for (let index = segments.length - 1; index >= 0; index -= 1) {
+    const label = String(segments[index]?.label || '').trim()
+    if (label) return taskTitle(label) || label
     const own = taskTitle(segments[index]?.sessionName)
     if (own) return own
     const child = (segments[index]?.children || []).map((item) => taskTitle(item?.sessionName)).find(Boolean)
     if (child) return child
   }
-  return String(lineage.agent || segment?.agent || '子代理')
+  const agent = String(lineage.agent || segment?.agent || '子代理')
+  const id = shortId(segment?.runId)
+  return id ? `${agent} · ${id}` : agent
 }
 
 /** 段的时间信息：进行中看「从现在倒推」，终态看耗时 */
@@ -370,8 +390,15 @@ function renderActs(segment) {
       }">插话</button>`,
     )
   }
-  const sessionFile = segment.childSessionFile || (segment.children || []).find((child) => child.sessionFile)?.sessionFile
-  if (sessionFile) acts.push(`<button data-open-session="${esc(sessionFile)}" title="打开它的会话（只读预览）">打开</button>`)
+  // 「打开」指向哪份会话、能不能点，由 main 判定（P8）：顶层 childSessionFile 常常
+  // 指向一个不存在的路径，真实的那份在 status.json 的 steps 里。UI 不猜路径。
+  if (segment.openTarget) {
+    acts.push(`<button data-open-session="${esc(segment.openTarget)}" title="打开它的会话（只读预览）">打开</button>`)
+  } else if (segment.openState === 'missing') {
+    acts.push(
+      '<button disabled title="这段会话的文件已经不在磁盘上了（一次性 run 的目录会被清理）">打开</button>',
+    )
+  }
   if (segment.canStop) {
     const confirming = stopConfirm && String(stopConfirm.runId) === String(segment.runId) && Date.now() < stopConfirm.until
     if (confirming) {
@@ -393,12 +420,16 @@ function renderIdent(lineage, segment, title) {
   const turns = Number(segment.activity?.turnCount)
   if (Number.isFinite(turns) && turns > 0) parts.push({ html: `${turns} 回合` })
   if (segment.revivedFrom) {
-    // resume 的卡跟原卡同名，不给个标记就分不清「这是新的那次」
-    parts.push({
-      html: `<span class="revive" title="接着 ${esc(String(segment.revivedFrom))} 继续跑的">↻ 续 ${esc(
-        shortId(segment.revivedFrom),
-      )}</span>`,
-    })
+    // resume 的卡跟原卡同名，不给个标记就分不清「这是新的那次」。
+    // 徽标写**最初那条**的来源（P1″）：连环 resume 时直接来源本身也是续跑，
+    // 写它对不上号——用户要的是「这张卡追到哪去了」。
+    const root = String(segment.reviveRoot || segment.revivedFrom)
+    const hops = Number(segment.reviveHops) || 0
+    const times = hops > 1 ? `第 ${hops} 次续跑` : '续跑'
+    const tip = `${times} · 直接来源 ${String(segment.revivedFrom)}${
+      root !== String(segment.revivedFrom) ? ` · 最初那条 ${root}` : ''
+    }`
+    parts.push({ html: `<span class="revive" title="${esc(tip)}">↻ 续 ${esc(shortId(root))}</span>` })
   }
   if (!parts.length) return ''
   return `<div class="ident">${parts.map((part) => part.html).join('<span class="sep">·</span>')}</div>`
@@ -476,13 +507,15 @@ function renderGen(lineage, segment) {
   const label = earlier.length ? `前 ${earlier.length} 段已折叠 · 共 ${segments.length} 段` : `子代理明细 · ${children.length} 个`
   const lines = []
   earlier.forEach((past, index) => {
-    const text = `第 ${index + 1} 段 · ${stateText(past.state)} · ${timingOf(past, Date.now())}${
-      past.summary ? ` · ${past.summary.slice(0, 60)}` : ''
-    }`
+    // 计时同样走占位：`running` 的旧段每秒都在变，写进 HTML 就等于让整卡重绘
+    const tail = past.summary ? ` · ${esc(past.summary.slice(0, 60))}` : ''
+    const inner = `第 ${index + 1} 段 · ${esc(stateText(past.state))} · <span data-timing="${esc(
+      past.runId,
+    )}"></span>${tail}`
     lines.push(
-      past.childSessionFile
-        ? `<button class="gen-line" data-open-session="${esc(past.childSessionFile)}">${esc(text)}<span class="chev">›</span></button>`
-        : `<div class="gen-line">${esc(text)}</div>`,
+      past.openTarget
+        ? `<button class="gen-line" data-open-session="${esc(past.openTarget)}">${inner}<span class="chev">›</span></button>`
+        : `<div class="gen-line">${inner}</div>`,
     )
   })
   if (children.length > 1) {
@@ -504,13 +537,14 @@ function renderGen(lineage, segment) {
   )}</details>`
 }
 
-function renderCard(lineage, now) {
+function renderCard(lineage) {
   const segments = lineage.segments || []
   const segment = segments[segments.length - 1] || {}
   const state = segment.state || lineage.state || 'unknown'
   const live = ACTIVE_STATES.has(String(state))
   const title = titleOf(lineage, segment)
-  return `<article class="card${live ? ' live' : ''}">
+  // data-card 是增量渲染的锚点：结构没变的卡在下一帧被原样复用（P7）
+  return `<article class="card${live ? ' live' : ''}" data-card="${esc(segment.runId)}">
     <div class="row1">
       <span class="dot ${esc(stateClass(state))}" data-dot="${esc(segment.runId)}"></span>
       <span class="agent" title="${esc(String(segment.sessionName || title))}">${esc(title)}</span>
@@ -535,7 +569,7 @@ function renderBanner(degrade) {
   </div>`
 }
 
-/** 顶部浮层：绝对定位，不占文档流，所以不会顶得内容往下跳 */
+/** 顶部浮层：fixed 定位，不占文档流，所以不会顶得内容往下跳；滚动时也不跟着跑 */
 function renderNotice() {
   if (!notice) return ''
   const ttl = NOTICE_MS[notice.tone] ?? 4_000
@@ -546,85 +580,167 @@ function renderNotice() {
   return `<div class="notice notice-${esc(notice.tone)}">${esc(notice.text)}</div>`
 }
 
-function render() {
-  const now = Date.now()
-  // 编辑插话时不重建：用户正在打字，画面一动就丢焦点，而且卡片位置会跳。
-  // 但「展开表单」「切成发送中」这些是表单自己的状态变化，要放行一次。
-  if (noteDraft && !paintOnce) {
-    tickTimings()
-    return
-  }
-  paintOnce = false
-  if (stopConfirm && Date.now() >= stopConfirm.until) stopConfirm = null
+/* ---------- 渲染：骨架只建一次，之后按分区 patch（P7） ---------- */
 
-  const data = snapshot
-  if (lastError) {
-    const html = `<div class="banner banner-error"><strong>面板读取失败</strong><span>${esc(lastError)}</span></div>`
-    if (html !== lastHtml) el.innerHTML = html
-    lastHtml = html
-    return
-  }
-  if (!data) {
-    const html = '<p class="pad dim">正在读取…</p>'
-    if (html !== lastHtml) {
-      el.innerHTML = html
-      lastHtml = html
-    }
-    return
-  }
+/**
+ * 为什么拆成五个分区：整块 `el.innerHTML = html` 最省事，代价是**每秒一次把
+ * 所有卡片连同用户的选区、焦点、滚动位置一起重建**。诊断区的「心跳 3s 前」就是
+ * 那个每秒都在变的字段——它一变，整块 HTML 就不相等，于是整块重建。
+ *
+ * 现在的规矩：
+ *   1. 秒级字段（心跳、计时、当前工具耗时）一律留空占位，由 `uiPulse` 用
+ *      textContent 填——HTML 里没有任何随时间变化的东西；
+ *   2. 卡片按 runId 增量替换：key 序列没变时只换内容真的变了的那几张；
+ *   3. 顶栏 / 横幅 / 诊断各自比较，互不牵连。
+ */
+let shell = null
 
-  const lineages = data.lineages || []
+function ensureShell() {
+  if (shell) return
+  el.innerHTML = `
+    <div class="slot notice-slot"></div>
+    <div class="slot head-slot"></div>
+    <div class="slot banner-slot"></div>
+    <div class="cards"></div>
+    <div class="slot diag-slot"></div>`
+  shell = {
+    notice: el.querySelector('.notice-slot'),
+    head: el.querySelector('.head-slot'),
+    banner: el.querySelector('.banner-slot'),
+    cards: el.querySelector('.cards'),
+    diag: el.querySelector('.diag-slot'),
+  }
+}
+
+/** 分区写入：内容没变就不碰 DOM。用节点上的 `__html` 记住上次的值 */
+function setSlot(node, html) {
+  if (!node) return false
+  if (node.__html === html) return false
+  node.__html = html
+  node.innerHTML = html
+  return true
+}
+
+/**
+ * 卡片列表：key 序列（runId 及其顺序）没变时，只替换内容变了的卡；
+ * 成员或顺序变了才整组重建——那一刻通常是用户刚派了新 run，不在操作旧卡。
+ * @param {string} html
+ */
+function patchCards(html) {
+  if (!shell?.cards) return
+  if (shell.cards.__html === html) return
+  shell.cards.__html = html
+  const tpl = document.createElement('template')
+  tpl.innerHTML = html
+  const next = Array.from(tpl.content.children)
+  const prev = Array.from(shell.cards.children)
+  const sameOrder =
+    prev.length === next.length &&
+    next.every((node, i) => prev[i].getAttribute('data-card') === node.getAttribute('data-card'))
+  if (!sameOrder) {
+    shell.cards.replaceChildren(...next)
+    return
+  }
+  next.forEach((node, i) => {
+    if (prev[i].outerHTML !== node.outerHTML) prev[i].replaceWith(node)
+  })
+}
+
+function renderHead(data, lineages) {
   const active = Number(data.activeCount) || 0
   const previewing = Boolean(data.parentSessionFile)
   const back = previewing
     ? `<button class="back" data-open-session="${esc(data.parentSessionFile)}">← 主会话</button>`
     : ''
+  return `<div class="head">
+    ${back}
+    <b>子代理</b>
+    <span class="head-sub">· ${previewing ? '子会话预览' : '本会话'}</span>
+    <span class="spacer"></span>
+    <span class="count">${active ? `${active} 个在跑` : `${lineages.length} 个记录`}</span>
+  </div>`
+}
 
-  const body = lineages.length
-    ? lineages.map((lineage) => renderCard(lineage, now)).join('')
-    : data.degrade?.kind === 'ok'
-      ? `<div class="empty"><strong>这个会话还没有子代理运行记录</strong><span>派一个后台子代理，它跑起来就会出现在这里。</span></div>`
-      : ''
+/** 诊断区：**心跳是占位**，由 uiPulse 填。写在这里就会让整块 HTML 每秒变一次 */
+function renderDiag(data) {
+  return `<details class="diag"${diagOpen ? ' open' : ''}>
+    <summary>诊断</summary>
+    <dl>
+      <dt>会话</dt><dd>${esc(data.sessionFile || '—')}</dd>
+      <dt>数据文件</dt><dd>${esc(data.dataFile || '—')}</dd>
+      <dt>数据源</dt><dd>${esc(
+        data.source?.mode === 'push' ? '推送' : data.source?.mode === 'poll' ? '轮询' : '未连接',
+      )}</dd>
+      <dt>心跳</dt><dd data-heartbeat></dd>
+      <dt>能力</dt><dd>${esc((data.source?.capabilities || []).join(', ') || '—')}</dd>
+      <dt>干预</dt><dd>${esc(
+        data.source?.supports
+          ? `插话 ${data.source.supports.steer ? '可用' : '不支持'} · 停止 ${data.source.supports.stop ? '可用' : '不支持'}`
+          : '—（扩展未公告）',
+      )}</dd>
+      <dt>事件</dt><dd>${esc((data.source?.events || []).join(', ') || '—')}</dd>
+      <dt>最近错误</dt><dd>${esc(data.source?.lastError || '—')}</dd>
+    </dl>
+  </details>`
+}
 
-  const html = `
-    ${renderNotice()}
-    <div class="head">
-      ${back}
-      <b>子代理</b>
-      <span class="head-sub">· ${previewing ? '子会话预览' : '本会话'}</span>
-      <span class="spacer"></span>
-      <span class="count">${active ? `${active} 个在跑` : `${lineages.length} 个记录`}</span>
-    </div>
-    ${renderBanner(data.degrade)}
-    ${body}
-    <details class="diag"${diagOpen ? ' open' : ''}>
-      <summary>诊断</summary>
-      <dl>
-        <dt>会话</dt><dd>${esc(data.sessionFile || '—')}</dd>
-        <dt>数据文件</dt><dd>${esc(data.dataFile || '—')}</dd>
-        <dt>数据源</dt><dd>${esc(
-          data.source?.mode === 'push' ? '推送' : data.source?.mode === 'poll' ? '轮询' : '未连接',
-        )}</dd>
-        <dt>心跳</dt><dd>${data.liveness?.ageMs == null ? '—' : esc(fmtAge(data.liveness.ageMs))}</dd>
-        <dt>能力</dt><dd>${esc((data.source?.capabilities || []).join(', ') || '—')}</dd>
-        <dt>干预</dt><dd>${esc(
-          data.source?.supports
-            ? `插话 ${data.source.supports.steer ? '可用' : '不支持'} · 停止 ${data.source.supports.stop ? '可用' : '不支持'}`
-            : '—（扩展未公告）',
-        )}</dd>
-        <dt>事件</dt><dd>${esc((data.source?.events || []).join(', ') || '—')}</dd>
-        <dt>最近错误</dt><dd>${esc(data.source?.lastError || '—')}</dd>
-      </dl>
-    </details>
-  `
-  if (html !== lastHtml) {
-    const scrollTop = el.scrollTop
-    el.innerHTML = html
-    el.scrollTop = scrollTop
-    lastHtml = html
+function render() {
+  // 编辑插话时不重建：用户正在打字，画面一动就丢焦点，而且卡片位置会跳。
+  // 但「展开表单」「切成发送中」这些是表单自己的状态变化，要放行一次。
+  if (noteDraft && !paintOnce) {
+    uiPulse()
+    return
   }
-  // 结构没变也要推一次：新插入的计时占位是空的
+  paintOnce = false
+  if (stopConfirm && Date.now() >= stopConfirm.until) stopConfirm = null
+  ensureShell()
+  setSlot(shell.notice, renderNotice())
+
+  const data = snapshot
+  if (lastError) {
+    setSlot(shell.head, '')
+    setSlot(shell.banner, `<div class="banner banner-error"><strong>面板读取失败</strong><span>${esc(lastError)}</span></div>`)
+    patchCards('')
+    setSlot(shell.diag, '')
+    return
+  }
+  if (!data) {
+    setSlot(shell.head, '')
+    setSlot(shell.banner, '<p class="pad dim">正在读取…</p>')
+    patchCards('')
+    setSlot(shell.diag, '')
+    return
+  }
+
+  const lineages = data.lineages || []
+  setSlot(shell.head, renderHead(data, lineages))
+  setSlot(shell.banner, renderBanner(data.degrade))
+  patchCards(
+    lineages.length
+      ? lineages.map((lineage) => renderCard(lineage)).join('')
+      : data.degrade?.kind === 'ok'
+        ? '<div class="empty"><strong>这个会话还没有子代理运行记录</strong><span>派一个后台子代理，它跑起来就会出现在这里。</span></div>'
+        : '',
+  )
+  setSlot(shell.diag, renderDiag(data))
+  // 新插入的占位是空的，立刻推一次
+  uiPulse()
+}
+
+/**
+ * 每秒一次的纯 UI 心跳：只改文本，不发请求、不重建结构。
+ * 拉数据的节奏是另一回事（见 pollLoop）——诊断/计时不该跟着它一起变慢。
+ */
+function uiPulse() {
   tickTimings()
+  const heartbeat = el.querySelector('[data-heartbeat]')
+  if (heartbeat) {
+    const age = snapshot?.liveness?.ageMs
+    const next = age == null ? '—' : fmtAge(age)
+    if (heartbeat.textContent !== next) heartbeat.textContent = next
+  }
+  // 提示的过期由它自己判定（返回空串），也只影响这一个分区
+  if (shell?.notice) setSlot(shell.notice, renderNotice())
 }
 
 /* ---------- 操作 ---------- */
@@ -747,14 +863,15 @@ async function confirmStop(runId) {
  * 走宿主 `sessions.activate`：目标在当前工作区侧栏就正常激活——「返回主会话」
  * 时用户拿到的是可写对话；子会话不在侧栏，退化为只读预览（观测层不指挥会话）。
  * 失败是常态（一次性 run 的会话会被清理），所以文案说清原因，而不是静默。
+ * 同一份文件连点多次只提示一次（P8）。
  * @param {string} sessionFile
  */
 async function openSession(sessionFile) {
   try {
     const result = await bridge.invoke('openSession', { sessionFile })
-    if (!result?.ok) setNotice('会话文件已不存在，可能已被清理', 'warn')
+    if (!result?.ok) setNotice('会话文件已不存在，可能已被清理', 'warn', `open:${sessionFile}`)
   } catch (error) {
-    setNotice(`打开失败：${error instanceof Error ? error.message : String(error)}`, 'error')
+    setNotice(`打开失败：${error instanceof Error ? error.message : String(error)}`, 'error', `open:${sessionFile}`)
   }
   render()
 }
@@ -855,22 +972,78 @@ async function tick() {
 bridge.on('context', (next) => {
   context = next || {}
   snapshot = null
-  lastHtml = ''
-  // 换会话了，正在编辑的插话指向的 run 已经不在这个会话里——留着只会发错地方
+  // 换会话了：骨架留着，五个分区的内容全要重来
+  shell = null
+  el.innerHTML = ''
+  lastError = ''
+  // 正在编辑的插话指向的 run 已经不在这个会话里——留着只会发错地方
   noteDraft = null
   stopConfirm = null
   sentNotes.length = 0
   genOpen.clear()
   void tick()
 })
+
+/* ---------- 两条独立的时钟（P9） ---------- */
+
+/**
+ * 拉数据的节奏按「现在值不值得快」决定，而不是固定 1 秒：
+ *   - 有 run 在跑 → 1s（用户正在看它动）
+ *   - 静态但有数据 → 3s（只有终态，变了也是别的会话在动）
+ *   - 数据陈旧（worker 换代/退出）→ 5s（再快也是同一份死数据）
+ *   - 读失败 → 5s（别把失败重试打成忙等）
+ * 面板不可见时完全不拉——留着 1s 一次的空转是白烧 CPU。
+ */
+function pollDelay() {
+  if (lastError) return 5_000
+  if (!snapshot) return 1_000
+  if (Number(snapshot.activeCount) > 0) return 1_000
+  if (snapshot.liveness && snapshot.liveness.alive === false) return 5_000
+  return 3_000
+}
+
+/** @type {any} */
+let pollTimer = null
+/** @type {any} */
+let pulseTimer = null
+let disposed = false
+
+function schedulePoll(delay = pollDelay()) {
+  if (disposed) return
+  if (pollTimer) clearTimeout(pollTimer)
+  pollTimer = setTimeout(async () => {
+    pollTimer = null
+    if (disposed) return
+    if (!document.hidden) await tick()
+    schedulePoll()
+  }, delay)
+}
+
+// UI 心跳与拉数据分开：拉取降到 3s/5s 时，计时和「未确认」的措辞仍要每秒往前走
+pulseTimer = setInterval(() => {
+  if (disposed || document.hidden) return
+  uiPulse()
+}, 1000)
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    if (pollTimer) {
+      clearTimeout(pollTimer)
+      pollTimer = null
+    }
+    return
+  }
+  // 回来时立刻拉一次，别让用户盯着上次的快照
+  if (!disposed) void tick().then(() => schedulePoll())
+})
+
 bridge.on('dispose', () => {
-  if (timer) clearInterval(timer)
+  disposed = true
+  if (pollTimer) clearTimeout(pollTimer)
+  if (pulseTimer) clearInterval(pulseTimer)
+  pollTimer = null
+  pulseTimer = null
   noteDraft = null
 })
 
-let timer = null
-// 1s 一次：拿不到新数据时也要让计时和「未确认」的措辞往前走
-timer = setInterval(() => {
-  if (!busy) void tick()
-}, 1000)
-void tick()
+void tick().then(() => schedulePoll())
