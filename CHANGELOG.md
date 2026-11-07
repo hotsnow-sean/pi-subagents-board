@@ -13,6 +13,8 @@ P2-c：干预（steer / stop）。
   mode 可选「立刻插话 / 本轮结束后再说」。
 - **停止**：二次确认，文案写明 stopped 不能 resume；回执只代表受理（`state: stopping`），
   终态靠 status 收敛。
+- **`stopping` 自己是一个状态**：stop 受理后 status 可能报 `stopping`，归一成 unknown 会让用户
+  点了停止却看到「未知」，所以加进已知状态并单独配色。
 - **置灰而不是点了报错**：`canSteer` / `canStop` 由数据层按段状态 + `ping.capabilities`
   计算，终态段、老版本扩展都不出现按钮；前台 run 不在 `status` 里，本来就不会有按钮。
 - **干预坞**：输入框放在 body 下独立的 `#dock`（不参与每秒重绘），否则打一个字就被重建。

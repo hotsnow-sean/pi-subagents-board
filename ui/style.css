@@ -115,6 +115,7 @@ body { display: flex; flex-direction: column; }
 .dot-complete { background: #16a34a; }
 .dot-failed { background: var(--danger); }
 .dot-stopped, .dot-paused { background: #9ca3af; }
+.dot-stopping { background: var(--danger); opacity: .55; }
 
 .pill {
   font-size: 11px;
@@ -128,6 +129,7 @@ body { display: flex; flex-direction: column; }
 .pill-complete { color: #15803d; border-color: #bbf7d0; }
 .pill-failed { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, var(--border)); }
 .pill-queued { color: #b45309; border-color: #fde68a; }
+.pill-stopping { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 35%, var(--border)); }
 
 .segment { padding-top: 6px; }
 .segment-head {

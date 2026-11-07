@@ -12,6 +12,8 @@ function fresh() {
 test('normalizeState: 认得的原样返回，认不得的按 success/stopped 兜底', () => {
   assert.equal(normalizeState('running'), 'running')
   assert.equal(normalizeState('COMPLETE'), 'complete')
+  // stop 受理后的中间态：必须原样保留，否则用户点了停止却看到「未知」
+  assert.equal(normalizeState('stopping'), 'stopping')
   assert.equal(normalizeState('weird', true), 'complete')
   assert.equal(normalizeState('weird', false), 'failed')
   assert.equal(normalizeState(undefined, undefined, true), 'stopped')

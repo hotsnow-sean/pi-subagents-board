@@ -81,6 +81,7 @@ function fmtAge(ms) {
 const STATE_TEXT = {
   running: '进行中',
   queued: '排队中',
+  stopping: '停止中',
   complete: '已完成',
   failed: '失败',
   partial: '部分完成',
