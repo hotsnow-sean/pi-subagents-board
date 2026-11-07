@@ -142,24 +142,48 @@ function stateText(state) {
 /**
  * 会话名 → 卡片标题。
  * `"worker: 你是测试用子代理 A。工作目录: C:/…"` → `"你是测试用子代理 A"`
- * 只能做启发式：冒号前的角色名去掉、`工作目录:` 之后是噪音、句末标点去掉。
+ *
+ * 三件事（都来自实测报告）：
+ *   1. 去掉冒号前的角色名、`工作目录:` 之后是噪音、句末标点。
+ *   2. **`【…】` 优先**：任务首行常写成「【名字】说明」，而上游把 sessionName 截到
+ *      ~48 字符——方括号里的名字通常完整，路径却常把句尾啃掉（报告 P1′）。
+ *   3. **复活提示语不是标题**：resume 出来的 run 的 sessionName 是
+ *      `worker: You are reviving a previous subagent conversation. Origin…`，
+ *      直接显示就是一团模板废话（报告 P1″）——返回空串，让上层回退到原 run 的标题。
  */
+const REVIVE_NOISE = /reviving a previous subagent conversation/i
+
 function taskTitle(sessionName) {
   let text = String(sessionName || '').trim()
-  if (!text) return ''
+  if (!text || REVIVE_NOISE.test(text)) return ''
   text = text.replace(/^[\w.\-]{1,32}\s*[:：]\s*/, '')
   text = text.split(/工作目录\s*[:：]/)[0]
-  text = text.replace(/\s+/g, ' ').trim().replace(/[。．.；;,，\s]+$/, '')
+  text = text.replace(/\s+/g, ' ').trim().replace(/[\s.。．；;,，·]+$/, '')
+  if (!text) return ''
+  // 方括号段提到最前：`写个脚本【名字】…` 这种把名字写在中间的首行也不会被截掉
+  const tagged = /【[^】]{1,40}】/.exec(text)
+  if (tagged) {
+    const rest = text.replace(tagged[0], '').replace(/^[\s:：·\-—,，]+/, '').trim()
+    text = rest ? `${tagged[0]} ${rest}` : tagged[0]
+  }
   return text.length > 42 ? `${text.slice(0, 42)}…` : text
 }
 
+/**
+ * 链的标题：从链尾往前找第一个说得出的名字。
+ *
+ * 一条链的每一段都是同一个人，所以上一段的名字对下一段有效——这是 resume 段
+ * （sessionName 是复活提示语）唯一的兜底来源。都没有才退回角色名。
+ */
 function titleOf(lineage, segment) {
-  const children = segment.children || []
-  const fromChild = children.map((child) => child?.sessionName).find((name) => String(name || '').trim())
-  const own = taskTitle(segment.sessionName) || taskTitle(fromChild)
-  if (own) return own
-  // 没有会话名（中途接入的段、或被脱敏的 run）：退回角色名，至少不是空白
-  return String(lineage.agent || segment.agent || '子代理')
+  const segments = lineage.segments || []
+  for (let index = segments.length - 1; index >= 0; index -= 1) {
+    const own = taskTitle(segments[index]?.sessionName)
+    if (own) return own
+    const child = (segments[index]?.children || []).map((item) => taskTitle(item?.sessionName)).find(Boolean)
+    if (child) return child
+  }
+  return String(lineage.agent || segment?.agent || '子代理')
 }
 
 /** 段的时间信息：进行中看「从现在倒推」，终态看耗时 */
@@ -197,6 +221,36 @@ function toolText(segment, now) {
   return age ? `${child.currentTool} ${age}` : String(child.currentTool)
 }
 
+/**
+ * 完成态闸门（P2′ 的应修点 2）。
+ *
+ * 竞态是这么发生的：按钮点开时 run 还在跑，用户打字的十几秒里它结束了，
+ * 提交就撞进终态——扩展会拒，回执还会说得很晚。数据层的 `canSteer` 只决定
+ * 「按钮出不出现」，管不到这段已经在打的草稿。
+ *
+ * 所以这里每秒核对一次：段一旦不是活跃态，就地说明并禁用发送，**草稿留在框里**
+ * （用户可能想复制去 resume）。只改文本和 disabled，不动结构——textarea 的焦点
+ * 不能丢，否则等于把人正在写的字打断。
+ */
+function updateDraftGate() {
+  if (!noteDraft) return
+  const segment = findSegment(noteDraft.runId)
+  const active = Boolean(segment) && ACTIVE_STATES.has(String(segment.state))
+  const gate = el.querySelector('[data-draft-gate]')
+  if (gate) {
+    const text = active ? '' : '它已经结束了，这一条发不出去（草稿留着，可以复制走）'
+    if (gate.textContent !== text) gate.textContent = text
+    gate.hidden = !text
+  }
+  const send = /** @type {HTMLButtonElement | null} */ (el.querySelector('[data-note-send]'))
+  if (send) {
+    const disabled = Boolean(noteDraft.busy) || !active
+    if (send.disabled !== disabled) send.disabled = disabled
+    const label = noteDraft.busy ? '发送中…' : active ? '发送' : '已结束'
+    if (send.textContent !== label) send.textContent = label
+  }
+}
+
 /** 每秒只改这几个数字和标签，不动结构 */
 function tickTimings() {
   const now = Date.now()
@@ -212,6 +266,22 @@ function tickTimings() {
     // 空的时候整块收掉：否则 flex gap 会留一个空档
     node.style.display = next ? '' : 'none'
   }
+  // 状态文字与点：结构不变，只换字和类。打字期间 run 结束时尤其重要——
+  // 不重建 DOM（保焦点），但卡面不能还挂着「运行中」骗人
+  for (const node of el.querySelectorAll('[data-state]')) {
+    const segment = findSegment(node.getAttribute('data-state'))
+    const state = segment?.state || 'unknown'
+    const text = stateText(state)
+    if (node.textContent !== text) node.textContent = text
+    const cls = `state ${stateClass(state)}`
+    if (node.className !== cls) node.className = cls
+  }
+  for (const node of el.querySelectorAll('[data-dot]')) {
+    const segment = findSegment(node.getAttribute('data-dot'))
+    const cls = `dot ${stateClass(segment?.state)}`
+    if (node.className !== cls) node.className = cls
+  }
+  updateDraftGate()
 }
 
 /* ---------- 插话（A 方案：卡片内联） ---------- */
@@ -228,7 +298,7 @@ function mailFor(runId) {
 }
 
 /** 回执文案：四种事实，全部来自扩展给的结果，不猜 */
-function describeMail(mail) {
+function describeMail(mail, segment) {
   if (!mail) return null
   const kind = mail.kind === 'stop' ? 'stop' : 'note'
   if (!mail.confirmed) {
@@ -245,16 +315,23 @@ function describeMail(mail) {
     }
   }
   if (mail.state === 'expired') return { text: '这条没投出去：已经过期了', tone: 'warn' }
-  if (!mail.ok) return { text: mail.error || '投递失败', tone: 'bad' }
+  if (!mail.ok) return { text: mail.error || '这条没投进去', tone: 'bad' }
   if (kind === 'stop') return { text: `停止已受理 · ${fmtClock(mail.at)}`, tone: 'read' }
   if (mail.state === 'delivered') return { text: `已插进它这一轮 · ${fmtClock(mail.at)}`, tone: 'read' }
+  // 停在 queued：扩展受理了，但还没走到回合边界。它要是先结束了，这条就永远进不去——
+  // 别让卡片一直说「等它这一步结束」，那是在骗人（P2′）
+  if (segment && !ACTIVE_STATES.has(String(segment.state))) {
+    return { text: '已排队，但它先结束了 · 这条可能没进去', tone: 'warn' }
+  }
   return { text: `已排队，等它这一步结束 · ${fmtClock(mail.at)}`, tone: 'sent' }
 }
 
+const CHIP_ICON = { read: '✓', bad: '✕', warn: '!', sent: '↑' }
+
 function renderMailChip(segment) {
-  const described = describeMail(mailFor(segment.runId))
+  const described = describeMail(mailFor(segment.runId), segment)
   if (!described) return ''
-  return `<div class="chip chip-${esc(described.tone)}"><span class="chip-ico">${described.tone === 'read' ? '✓' : '↑'}</span>${esc(
+  return `<div class="chip chip-${esc(described.tone)}"><span class="chip-ico">${CHIP_ICON[described.tone] || '·'}</span>${esc(
     described.text,
   )}</div>`
 }
@@ -268,6 +345,7 @@ function renderNoteForm(segment) {
   const busyAttr = noteDraft.busy ? ' disabled' : ''
   return `<div class="inline">
     <div class="hint">直接插进 <b>${esc(noteDraft.agent || '这个子代理')}</b> 当前这一轮 · Enter 发送 · Shift+Enter 换行 · Esc 收起</div>
+    <p class="gate" data-draft-gate hidden></p>
     <textarea data-note-input rows="3" placeholder="例如：先别改测试，把 JSON 输出的字段名定下来"${busyAttr}>${esc(noteDraft.text)}</textarea>
     <div class="compose-acts">
       <button data-note-cancel${busyAttr}>取消</button>
@@ -318,6 +396,25 @@ function renderIdent(lineage, segment, title) {
   return `<div class="ident">${parts.map((part) => part.html).join('<span class="sep">·</span>')}</div>`
 }
 
+/**
+ * 插话投递计数（报告 P2′ 的建议 3）：`steering.requested / delivered / failed`。
+ *
+ * 比那条 5 分钟就隐掉的 chip 更耐久：chip 说的是「刚才那条」，这里说的是「这个 run
+ * 一共被插过几次、几次没投进」。数据来自 run 的 status.json（RPC status 不带）。
+ */
+function steeringText(steering) {
+  if (!steering) return null
+  const requested = Number(steering.requested) || 0
+  if (!requested) return null
+  const delivered = Number(steering.delivered) || 0
+  const failed = Number(steering.failed) || 0
+  const waiting = (Number(steering.pending) || 0) + (Number(steering.scheduled) || 0)
+  const tip = `插话 ${requested} 次 · 送达 ${delivered} · 失败 ${failed} · 待投 ${waiting}`
+  if (failed > 0) return { text: `插话 ${requested} · ${failed} 没投进`, bad: true, tip }
+  if (waiting > 0) return { text: `插话 ${requested} · 待投 ${waiting}`, bad: false, tip }
+  return { text: `插话 ${requested} 次`, bad: false, tip }
+}
+
 function renderMeta(segment) {
   const items = []
   const childCount = (segment.children || []).length
@@ -326,6 +423,8 @@ function renderMeta(segment) {
   if (segment.state === 'running' && (segment.children || []).some((child) => child.currentTool)) {
     items.push(`<span class="tool" data-tool="${esc(segment.runId)}"></span>`)
   }
+  const steer = steeringText(segment.steering)
+  if (steer) items.push(`<span class="${steer.bad ? 'bad' : ''}" title="${esc(steer.tip)}">${esc(steer.text)}</span>`)
   const tokens = fmtTokens(segment.tokens?.total)
   if (tokens) items.push(`<span>${esc(tokens)}</span>`)
   if (Number.isFinite(segment.costUsd) && segment.costUsd > 0) items.push(`<span>$${segment.costUsd.toFixed(3)}</span>`)
@@ -390,9 +489,9 @@ function renderCard(lineage, now) {
   const title = titleOf(lineage, segment)
   return `<article class="card${live ? ' live' : ''}">
     <div class="row1">
-      <span class="dot ${esc(stateClass(state))}"></span>
+      <span class="dot ${esc(stateClass(state))}" data-dot="${esc(segment.runId)}"></span>
       <span class="agent" title="${esc(String(segment.sessionName || title))}">${esc(title)}</span>
-      <span class="state ${esc(stateClass(state))}">${esc(stateText(state))}</span>
+      <span class="state ${esc(stateClass(state))}" data-state="${esc(segment.runId)}">${esc(stateText(state))}</span>
       ${timingSpan(segment)}
     </div>
     ${renderIdent(lineage, segment, title)}
@@ -543,6 +642,15 @@ async function submitNote() {
   const text = String(noteDraft.text || '').trim()
   if (!text) {
     noteDraft.error = '说点什么再发'
+    paintOnce = true
+    render()
+    return
+  }
+  // 完成态闸门（P2′）：表单展开之后它结束了，就别投——扩展必然拒，用户还要再猜一次。
+  // 草稿不动，用户能复制去 resume。
+  const target = findSegment(noteDraft.runId)
+  if (!target || !ACTIVE_STATES.has(String(target.state))) {
+    noteDraft.error = '它已经结束了，这条没投出去（草稿留着）'
     paintOnce = true
     render()
     return

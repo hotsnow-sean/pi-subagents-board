@@ -25,9 +25,10 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
-import { applyComplete, applyStarted, createState, mergeStatus } from './lib/lineage.mjs'
+import { applyComplete, applyStarted, createState, isActiveState, mergeStatus } from './lib/lineage.mjs'
 import { INBOX_DIR, RECEIPT_DIR, isFresh, parseNoteFileName } from './lib/note-queue.mjs'
 import { ensureLiveDir, liveFileOf, writeJsonAtomic } from './lib/live-store.mjs'
+import { readRunSnapshot, describeSteerFailure } from './lib/run-snapshot.mjs'
 import { childSessionFile, sessionKeyOf } from './lib/session-key.mjs'
 
 const RPC_VERSION = 1
@@ -260,6 +261,49 @@ export default function subagentsBoard(pi, ctx) {
     if (typeof dirtyTimer.unref === 'function') dirtyTimer.unref()
   }
 
+  /**
+   * 用 run 自己的 status.json 补齐 RPC 不给的两样东西：**会话名（卡片标题）**与
+   * **steering 计数**（P1″ / P2′，见 lib/run-snapshot.mjs 的头注释）。
+   *
+   * 只在活跃段上做：终态段的数据不会再变，读它只是白花 IO；而「刚结束那一刻插话
+   * 失败」的回执核对在 main 侧做（那边也能读同一个文件，且不受 worker 换代影响）。
+   *
+   * 值没变就不写回——`lastHtml` 比对靠字段稳定，每轮都赋一个新对象会让面板重绘。
+   */
+  function enrichFromRunDirs() {
+    let changed = false
+    for (const lineage of state.lineages ?? []) {
+      for (const segment of lineage.segments ?? []) {
+        if (!segment.asyncDir) continue
+        if (!isActiveState(segment.state) && segment.state !== 'stopping') continue
+        const snap = readRunSnapshot(segment.asyncDir)
+        if (!snap) continue
+
+        const first = snap.steps?.[0]
+        const name = String(first?.sessionName ?? '').trim()
+        if (name && name !== segment.sessionName) {
+          segment.sessionName = name
+          changed = true
+        }
+        if (snap.steering && JSON.stringify(snap.steering) !== JSON.stringify(segment.steering)) {
+          segment.steering = snap.steering
+          changed = true
+        }
+        // 多 child（workflow / 并行）：status 的 children 不带 sessionName，按 index 从 steps 补
+        for (const child of segment.children ?? []) {
+          const step = snap.steps?.find((/** @type {any} */ item) => item.index === (Number(child.index) || 0))
+          if (!step) continue
+          if (step.sessionName && !child.sessionName) {
+            child.sessionName = step.sessionName
+            changed = true
+          }
+          if (step.steering) child.steering = step.steering
+        }
+      }
+    }
+    if (changed) flush()
+  }
+
   /** 读一次 status 并并进状态；连续失败会切到轮询模式 */
   async function readStatus(/** @type {string} */ why) {
     if (stale || disposed) return null
@@ -269,6 +313,7 @@ export default function subagentsBoard(pi, ctx) {
       state.source.lastReplyAt = Date.now()
       state.source.lastError = null
       mergeStatus(state, reply.data, Date.now())
+      enrichFromRunDirs()
       flush()
       return reply
     }
@@ -466,14 +511,24 @@ export default function subagentsBoard(pi, ctx) {
       // 两种形状都认（RPC 回的是 { text, details:{ steering } }，老版本可能直给收据本体）
       const steering = reply.data?.details?.steering ?? reply.data ?? null
       const upstream = String(steering?.state || 'queued')
-      writeReceipt(id, note, { ok: true, state: upstream === 'delivered' ? 'delivered' : 'queued', upstream })
+      writeReceipt(id, note, {
+        ok: true,
+        state: upstream === 'delivered' ? 'delivered' : 'queued',
+        upstream,
+        // 受理时多半只是 queued：真正的送达/失败要等扩展写进 status.json 的 steering.recent。
+        // 把 requestId 落进回执，main 每次 getState 都会拿它去核对（P2′ 的「静默丢失」）。
+        requestId: String(steering?.requestId ?? ''),
+      })
       // status 里也记了 steering，立刻读一次让卡片上的转向提示跟上，不等心跳
       void readStatus('after-steer')
     } else {
       writeReceipt(id, note, {
         ok: false,
         state: 'failed',
-        error: reply.error ?? { code: 'failed', message: '扩展拒绝了这次投递' },
+        error: {
+          code: reply.error?.code ?? 'failed',
+          message: reply.timedOut ? '没等到扩展的确认，这条可能没进去' : describeSteerFailure(reply.error?.message),
+        },
       })
     }
     ctx.log(`steer ${runId}: ${reply.ok ? 'accepted' : 'failed'}`)

@@ -38,6 +38,7 @@ const { listLineages, activeCount } = await imp('lineage')
 const { describeDegrade } = await imp('degrade')
 const { buildInboxItem, pruneLedger, seedLedger, selectNewCompletions } = await imp('inbox-watch')
 const { INBOX_DIR, NOTE_TTL_MS, RECEIPT_DIR, buildNote, pruneMail } = await imp('note-queue')
+const { readRunSnapshot, steeringEntry, describeSteerFailure } = await imp('run-snapshot')
 
 /** 面板 id：与 manifest `panels[].id` 一致，信箱条目的落点 */
 const PANEL_ID = 'fleet'
@@ -118,7 +119,7 @@ function stateFor(sessionFile) {
     lineages,
     activeCount: state ? activeCount(state) : 0,
     /** 最近的留言回执（按 runId 供 UI 匹配）。面板不给「已读」——我们只知道投没投出去 */
-    mail: readMail(rt.ctx, state?.sessionKey ?? sessionKey),
+    mail: readMail(rt.ctx, state?.sessionKey ?? sessionKey, state),
     now: Date.now(),
     /** 数据文件路径：诊断折叠区显示，用户排查「为什么没数据」时最有用 */
     dataFile: latest?.file ?? '',
@@ -183,14 +184,39 @@ function postNote(ctx, input) {
 }
 
 /**
+ * runId → 运行目录（含 status.json）。回执核对要用它读 steering 的最终结果。
+ * 目录来自 live 状态里 `async-started` 事件带下来的 asyncDir。
+ * @param {any} state
+ */
+function runDirsOf(state) {
+  /** @type {Map<string, string>} */
+  const map = new Map()
+  for (const lineage of state?.lineages ?? []) {
+    for (const segment of lineage.segments ?? []) {
+      if (segment.runId && segment.asyncDir) map.set(String(segment.runId), String(segment.asyncDir))
+    }
+  }
+  return map
+}
+
+/**
  * 读最近的留言回执。
  *
  * receipts 目录是全局的（一个 agent 只有一个收件箱身份，但多个会话共用数据目录），
  * 用 sessionKey 过滤——receipt 里带了这个字段（agent 写回执时从 note 抄过来）。
+ *
+ * **回执会在读的时候被「事后核对」一次**（P2′）。原因：扩展的 steer RPC 只回受理时的
+ * 状态（多半是 `queued`），真正的失败——典型是「run 在你发出去的 66 毫秒后结束了」——
+ * 只写进 run 自己的 status.json，并且只推给父会话。面板要是原样显示那张 queued 回执，
+ * 就等于**静默丢失一条插话**：用户以为进去了，其实一个字都没落地。
+ * 所以这里拿回执里的 `requestId` 去 status.json 的 `steering.recent` 里对一次，
+ * 拿到 delivered / failed 就改口径。读不到就维持原样（说「已排队」，不编结果）。
+ *
  * @param {any} ctx
  * @param {string} sessionKey
+ * @param {any} state
  */
-function readMail(ctx, sessionKey) {
+function readMail(ctx, sessionKey, state) {
   const dir = path.join(ctx.dataDir, RECEIPT_DIR)
   let names = []
   try {
@@ -198,6 +224,7 @@ function readMail(ctx, sessionKey) {
   } catch {
     return []
   }
+  const runDirs = runDirsOf(state)
   const items = []
   for (const name of names) {
     if (!name.endsWith('.json')) continue
@@ -205,7 +232,8 @@ function readMail(ctx, sessionKey) {
       const raw = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'))
       if (!raw || typeof raw !== 'object') continue
       if (sessionKey && String(raw.sessionKey ?? '') !== sessionKey) continue
-      items.push({
+      /** @type {any} */
+      const item = {
         id: String(raw.id ?? ''),
         kind: raw.kind === 'stop' ? 'stop' : 'note',
         runId: String(raw.runId ?? ''),
@@ -213,7 +241,20 @@ function readMail(ctx, sessionKey) {
         ok: raw.ok === true,
         at: Number(raw.at) || 0,
         error: raw.error?.message ? String(raw.error.message) : '',
-      })
+        requestId: String(raw.requestId ?? ''),
+      }
+      if (item.kind === 'note' && item.ok && item.state !== 'delivered' && item.requestId) {
+        const asyncDir = runDirs.get(item.runId)
+        const entry = asyncDir ? steeringEntry(readRunSnapshot(asyncDir)?.steering, item.requestId) : null
+        if (entry?.state === 'delivered') {
+          item.state = 'delivered'
+        } else if (entry?.state === 'failed') {
+          item.state = 'failed'
+          item.ok = false
+          item.error = describeSteerFailure(entry.reason)
+        }
+      }
+      items.push(item)
     } catch {
       /* 半份 JSON：下一轮再看 */
     }

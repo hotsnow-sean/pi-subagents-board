@@ -198,6 +198,8 @@ html, body {
   flex-wrap: wrap;
 }
 .meta .tool { color: var(--muted); font-family: var(--mono); font-size: 10.5px; }
+/* 插话计数里有失败时整条变红：这是「有一条真的没投进去」，不是装饰 */
+.meta .bad { color: var(--bad); }
 
 /* ---------- 操作区 ---------- */
 .acts { display: flex; gap: 6px; margin-top: 9px; flex-wrap: wrap; }
@@ -230,6 +232,9 @@ html, body {
 }
 .inline .hint { font-size: 11px; color: var(--dim); margin-bottom: 6px; }
 .inline .hint b { color: var(--muted); font-weight: 600; }
+/* 完成态闸门：run 在打字期间结束时的说明。占据一行但只在需要时出现 */
+.inline .gate { margin: 0 0 6px; font-size: 11px; color: var(--warn); }
+.inline .gate[hidden] { display: none; }
 .inline textarea {
   width: 100%;
   background: var(--surface);

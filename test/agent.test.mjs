@@ -319,6 +319,36 @@ test('agent: 已有回执的留言不重复投（换代/重启后幂等），别
   assert.equal(fs.existsSync(file), true, '留言不可变，投完也不删（幂等靠回执判断）')
   assert.equal(fs.existsSync(path.join(foreignDir, 'x1.json')), true)
 })
+test('agent: 运行中从 run 的 status.json 补标题与 steering 计数（RPC status 不带这两样）', async () => {
+  const { dataDir, harness } = await boot()
+  await sleep(400)
+  // run 自己的运行目录：sessionName 在启动 5–15 秒后就落进来了（实测报告 P1″）
+  const asyncDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-async-'))
+  fs.writeFileSync(
+    path.join(asyncDir, 'status.json'),
+    JSON.stringify({
+      runId: 'run-t',
+      state: 'running',
+      steering: { requested: 1, pending: 1, delivered: 0, failed: 0, recent: [{ id: 'rq', targets: [{ index: 0, state: 'pending' }] }] },
+      steps: [{ agent: 'delegate', sessionName: 'delegate: 【实时标题探测】工作目录: C:/w', status: 'running' }],
+    }),
+  )
+  harness.emit('subagent:async-started', {
+    id: 'run-t',
+    agent: 'delegate',
+    cwd: 'C:/w',
+    asyncDir,
+    sessionId: 'C:/sessions/parent.jsonl',
+  })
+
+  const segmentOf = () => readState(dataDir)?.lineages?.[0]?.segments?.[0]
+  assert.equal(await waitFor(() => Boolean(segmentOf()?.sessionName)), true, '下一次 status 之后标题就该有值')
+  const segment = segmentOf()
+  assert.equal(segment.sessionName, 'delegate: 【实时标题探测】工作目录: C:/w')
+  assert.equal(segment.steering?.requested, 1, '插话计数也要落进 live 状态，卡片才有数')
+  assert.equal(segment.steering?.pending, 1)
+})
+
 test('agent: 没有 pi.events 时立刻落一份说明原因的状态', async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-agent-'))
   const { default: factory } = await import(entry)

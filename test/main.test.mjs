@@ -385,6 +385,63 @@ test('getState: 带回本会话最近的回执（倒序），别的会话不混�
   assert.equal(state.mail[0].state, 'stopping')
 })
 
+test('getState: 排队回执会被事后核对——扩展说失败了就必须显示失败（P2′ 的「静默丢失」）', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
+  const sessionFile = path.join(dataDir, 'sessions', 'rec.jsonl')
+  const sessionKey = sessionKeyOf(sessionFile)
+  const asyncDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-run-'))
+  const startedAt = Date.now() - 5_000
+
+  // run 自己的 status.json：steering 说「受理了但没投出去」
+  fs.writeFileSync(
+    path.join(asyncDir, 'status.json'),
+    JSON.stringify({
+      runId: 'run-1',
+      state: 'complete',
+      steering: {
+        requested: 2,
+        delivered: 1,
+        failed: 1,
+        recent: [
+          { id: 'req-ok', targets: [{ index: 0, state: 'delivered', deliveredAt: startedAt + 1_000 }] },
+          { id: 'req-dead', targets: [{ index: 0, state: 'failed', reason: 'run became complete before steering request was consumed' }] },
+        ],
+      },
+      steps: [{ agent: 'worker', sessionName: 'worker: 【核对】工作目录: C:/w', status: 'complete' }],
+    }),
+  )
+
+  const state = createState({ sessionKey, sessionFile, pid: 55, startedAt })
+  applyStarted(state, { id: 'run-1', agent: 'worker', cwd: 'C:/w', asyncDir }, startedAt + 100)
+  state.source.rpc = true
+  state.source.mode = 'push'
+  state.source.supports = { steer: true, stop: true }
+  state.updatedAt = Date.now()
+  ensureLiveDir(dataDir)
+  writeJsonAtomic(liveFileOf(dataDir, { sessionKey, pid: 55, startedAt }), state)
+
+  // agent 写下的回执只有「受理时」的状态（queued），requestId 是核对的钥匙
+  const receipts = path.join(dataDir, 'receipts')
+  fs.mkdirSync(receipts, { recursive: true })
+  const writeReceipt = (id, body) => fs.writeFileSync(path.join(receipts, `${id}.json`), JSON.stringify({ id, ...body }))
+  writeReceipt('dead', { at: 3_000, sessionKey, kind: 'note', runId: 'run-1', state: 'queued', ok: true, requestId: 'req-dead' })
+  writeReceipt('ok', { at: 2_000, sessionKey, kind: 'note', runId: 'run-1', state: 'queued', ok: true, requestId: 'req-ok' })
+  writeReceipt('keyless', { at: 1_000, sessionKey, kind: 'note', runId: 'run-1', state: 'queued', ok: true })
+
+  const mod = await loadMain()
+  const api = await mod.activate(fakeCtx(dataDir))
+  const mail = (await api.invoke('getState', { sessionFile })).mail
+  const byId = Object.fromEntries(mail.map((item) => [item.id, item]))
+
+  assert.equal(byId.dead.state, 'failed', '事后核对发现失败，就不能继续挂着「已排队」')
+  assert.equal(byId.dead.ok, false)
+  assert.match(byId.dead.error, /刚好在这一刻结束了/, '失败原因要说人话')
+
+  assert.equal(byId.ok.state, 'delivered', '核对到送达就升级成 delivered')
+
+  assert.equal(byId.keyless.state, 'queued', '没有 requestId 就无从核对，保持原样（不猜）')
+})
+
 test('activate: 清理隔夜的留言与回执（昨天留的言不该在开机时突然起一轮）', async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
   const inboxDir = path.join(dataDir, 'inbox', 'abcdef123456')
