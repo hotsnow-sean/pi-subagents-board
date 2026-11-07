@@ -3,17 +3,21 @@
  *
  * 观测 + 两件事：插话（对某个 run 发一次 steer）、停止一个 run。
  *
- * 交互形态定为「A · 卡片内联」：
- *   - 插话入口在卡片上，点了就地展开一个小表单，提交后收起、原地留一行回执。
- *     没有常驻输入坞 —— 那玩意儿既占版面，又永远说不清「我现在说的是谁」。
- *   - 停止不占输入区：按钮就地变「确认停止」，3 秒不点自动退回。
- *   - 不再有绿色/结果横幅：它会顶得内容往下跳（U4）。
+ * 版式按 `docs/proto-mailbox-ui.html` 的 **A 方案**落地（用户验收过的那一版）：
+ *   - 卡面只留「标题 · 状态 · 计时 / 身份 / 摘要 / 元信息 / 操作」，代际链折成一行。
+ *   - 插话入口在卡片上，点了就地展开，**同一个按钮再点一次收起**（测试报告 P2）。
+ *   - 停止不占输入区：按钮就地变「确认停止？」，3 秒不点自动退回。
+ *   - 没有常驻输入坞、没有结果横幅——它们会顶得内容往下跳（U4）。
  *
- * 渲染策略（这是「位置突变」的总根源）：
- *   1. **计时数字单独更新**：卡片 HTML 里只放 `<span data-timing>`，每秒用 textContent
- *      改那一个数字，不重建 DOM。否则整块 innerHTML 每秒重来一次，选区、焦点、动画全丢。
- *   2. **HTML 没变就不碰 DOM**：`lastHtml` 比对，相等直接返回。
+ * 渲染策略（「位置突变」的总根源）：
+ *   1. **计时数字不进 HTML**：卡片里只放空的 `<span data-timing>`，插入 DOM 后由
+ *      `tickTimings` 用 textContent 填。否则每秒算出的 HTML 都不同，`lastHtml` 比对
+ *      永远不相等，整块 innerHTML 每秒重建一次——选区、焦点、动画全丢。
+ *   2. **HTML 没变就不碰 DOM**：`lastHtml` 比对，相等只推计时。
  *   3. **编辑插话时暂停重绘**：用户正在打字的那几秒，画面不该动；提交/取消后再同步。
+ *
+ * 卡片标题来自子代理会话名（`steps[0].sessionName`）：顶层 `subagent()` 没有 name
+ * 参数，同角色并发时只有这个名字能把两张卡分开、也才知道该对谁插话（报告 P1）。
  */
 
 const bridge = window.pi || {
@@ -31,8 +35,8 @@ let snapshot = null
 /** 最后一次失败原因（invoke 抛错 / 桥超时） */
 let lastError = ''
 let busy = false
-/** 用户手动展开的链（按 lineageRoot 记），重绘后恢复 */
-const expanded = new Set()
+/** 用户展开的代际链（按 lineageRoot 记），重绘后恢复 */
+const genOpen = new Set()
 /** 诊断折叠区的展开状态：整块重绘会把它拍回去，必须自己记 */
 let diagOpen = false
 /** 上一帧的 HTML：一样就不碰 DOM */
@@ -55,6 +59,8 @@ const NOTICE_MS = { ok: 3_000, warn: 8_000, error: 8_000, info: 4_000 }
  * 6 秒的口径：worker 500ms 轮询 + 扩展内部最多 3s ack 等待 + RPC 往返。
  */
 const RECEIPT_PATIENCE_MS = 6_000
+/** 回执 chip 的保鲜期：再久就只是历史，留在卡上会让人以为刚刚才发生 */
+const RECEIPT_VISIBLE_MS = 5 * 60_000
 
 function setNotice(text, tone = 'info') {
   notice = { text, tone, at: Date.now() }
@@ -84,6 +90,21 @@ function fmtClock(at) {
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
 
+/** 18.4k 这种口径：卡片上没地方写 18432 */
+function fmtTokens(total) {
+  const n = Number(total) || 0
+  if (!n) return ''
+  if (n < 1_000) return `${n} tok`
+  if (n < 10_000) return `${(n / 1_000).toFixed(1)}k tok`
+  return `${Math.round(n / 1_000)}k tok`
+}
+
+/** run id 前 8 位：插话 / 停止都要认这个 id，只写角色名对不上号（P1） */
+function shortId(runId) {
+  const id = String(runId || '')
+  return id.length > 8 ? id.slice(0, 8) : id
+}
+
 const STATE_TEXT = {
   running: '运行中',
   complete: '已完成',
@@ -91,16 +112,54 @@ const STATE_TEXT = {
   error: '出错',
   stopped: '已停止',
   stopping: '正在停止',
+  partial: '部分完成',
   timeout: '超时',
   cancelled: '已取消',
   queued: '排队中',
   pending: '等待中',
+  paused: '已暂停',
+  rejected: '被拒绝',
   unknown: '状态未知',
 }
 
-function statePill(state) {
+const ACTIVE_STATES = new Set(['running', 'queued'])
+
+/** 点 / 文字的颜色跟着状态走：卡片上不再挂胶囊标签（原型 A 的做法） */
+function stateClass(state) {
   const key = String(state || 'unknown')
-  return `<span class="pill pill-${esc(key)}">${esc(STATE_TEXT[key] || key)}</span>`
+  if (ACTIVE_STATES.has(key)) return 'live'
+  if (key === 'failed' || key === 'error' || key === 'timeout' || key === 'rejected') return 'bad'
+  if (key === 'stopping') return 'stopping'
+  if (key === 'queued' || key === 'pending') return 'warn'
+  return 'done'
+}
+
+function stateText(state) {
+  const key = String(state || 'unknown')
+  return STATE_TEXT[key] || key
+}
+
+/**
+ * 会话名 → 卡片标题。
+ * `"worker: 你是测试用子代理 A。工作目录: C:/…"` → `"你是测试用子代理 A"`
+ * 只能做启发式：冒号前的角色名去掉、`工作目录:` 之后是噪音、句末标点去掉。
+ */
+function taskTitle(sessionName) {
+  let text = String(sessionName || '').trim()
+  if (!text) return ''
+  text = text.replace(/^[\w.\-]{1,32}\s*[:：]\s*/, '')
+  text = text.split(/工作目录\s*[:：]/)[0]
+  text = text.replace(/\s+/g, ' ').trim().replace(/[。．.；;,，\s]+$/, '')
+  return text.length > 42 ? `${text.slice(0, 42)}…` : text
+}
+
+function titleOf(lineage, segment) {
+  const children = segment.children || []
+  const fromChild = children.map((child) => child?.sessionName).find((name) => String(name || '').trim())
+  const own = taskTitle(segment.sessionName) || taskTitle(fromChild)
+  if (own) return own
+  // 没有会话名（中途接入的段、或被脱敏的 run）：退回角色名，至少不是空白
+  return String(lineage.agent || segment.agent || '子代理')
 }
 
 /** 段的时间信息：进行中看「从现在倒推」，终态看耗时 */
@@ -113,12 +172,11 @@ function timingOf(segment, now) {
 }
 
 /**
- * 计时占位：内容先渲染一次，之后由 `tickTimings` 单独改 textContent。
- * key 用 runId —— 同一段在页面上的身份就是它。
+ * 计时占位：**内容留空**，插入 DOM 后由 `tickTimings` 用 textContent 填。
+ * 这样 `lastHtml` 不含随时间变化的东西，结构没变就永远不重绘。
  */
-function timingSpan(segment, now) {
-  const id = String(segment.runId || '')
-  return `<span class="muted timing" data-timing="${esc(id)}">${esc(timingOf(segment, now))}</span>`
+function timingSpan(segment) {
+  return `<span class="timer" data-timing="${esc(segment.runId)}"></span>`
 }
 
 function findSegment(runId) {
@@ -130,7 +188,16 @@ function findSegment(runId) {
   return null
 }
 
-/** 每秒只改这几个数字，不动结构 */
+/** 「它正在跑什么」：status 独有字段，卡片上显示成 `bash 2.3s` */
+function toolText(segment, now) {
+  const child = (segment.children || []).find((item) => item.currentTool)
+  if (!child) return ''
+  const started = Number(child.currentToolStartedAt) || 0
+  const age = started ? fmtDuration(now - started) : ''
+  return age ? `${child.currentTool} ${age}` : String(child.currentTool)
+}
+
+/** 每秒只改这几个数字和标签，不动结构 */
 function tickTimings() {
   const now = Date.now()
   for (const node of el.querySelectorAll('[data-timing]')) {
@@ -138,31 +205,13 @@ function tickTimings() {
     const next = segment ? timingOf(segment, now) : ''
     if (node.textContent !== next) node.textContent = next
   }
-}
-
-function renderChildren(segment, now) {
-  const children = segment.children || []
-  if (!children.length) {
-    // 没有 children 明细（status 中途接入的段）：只要能推导出子会话路径，就给一个卡级入口
-    return segment.childSessionFile
-      ? `<button class="open-session" data-open-session="${esc(segment.childSessionFile)}">打开子会话 <span class="chev">›</span></button>`
-      : ''
+  for (const node of el.querySelectorAll('[data-tool]')) {
+    const segment = findSegment(node.getAttribute('data-tool'))
+    const next = segment ? toolText(segment, now) : ''
+    if (node.textContent !== next) node.textContent = next
+    // 空的时候整块收掉：否则 flex gap 会留一个空档
+    node.style.display = next ? '' : 'none'
   }
-  return `<ul class="children">${children
-    .map((child) => {
-      const inner = `
-        <span class="dot dot-${esc(child.state || 'unknown')}"></span>
-        <span class="child-agent">${esc(child.agent || '子代理')}</span>
-        ${child.model ? `<span class="muted">${esc(child.model)}</span>` : ''}
-        ${child.thinking ? `<span class="muted">thinking·${esc(child.thinking)}</span>` : ''}
-        <span class="muted">${esc(STATE_TEXT[child.state] || child.state || '')}</span>
-        ${child.lastActivityAt ? `<span class="muted">${esc(fmtAge(now - child.lastActivityAt))}</span>` : ''}`
-      // 有子会话路径才能点：路径来自 async-complete 的 results，后台 run 派发即返回时可能没有
-      return child.sessionFile
-        ? `<li><button class="child-btn" data-open-session="${esc(child.sessionFile)}" title="只读预览这段子会话">${inner}<span class="chev">›</span></button></li>`
-        : `<li>${inner}</li>`
-    })
-    .join('')}</ul>`
 }
 
 /* ---------- 插话（A 方案：卡片内联） ---------- */
@@ -172,9 +221,10 @@ function mailFor(runId) {
   const id = String(runId ?? '')
   if (!id) return null
   const confirmed = (snapshot?.mail || []).find((item) => String(item.runId) === id)
-  if (confirmed) return { confirmed: true, ...confirmed }
+  if (confirmed && Date.now() - Number(confirmed.at || 0) < RECEIPT_VISIBLE_MS) return { confirmed: true, ...confirmed }
   const pending = sentNotes.filter((item) => item.runId === id).sort((a, b) => b.at - a.at)[0]
-  return pending ? { confirmed: false, ...pending } : null
+  if (pending && Date.now() - pending.at < RECEIPT_VISIBLE_MS) return { confirmed: false, ...pending }
+  return null
 }
 
 /** 回执文案：四种事实，全部来自扩展给的结果，不猜 */
@@ -184,27 +234,29 @@ function describeMail(mail) {
   if (!mail.confirmed) {
     const age = Date.now() - Number(mail.at || 0)
     if (age < RECEIPT_PATIENCE_MS) {
-      return { text: kind === 'stop' ? '停止请求已发出…' : '正在投递给子代理…', tone: 'waiting' }
+      return { text: kind === 'stop' ? '停止请求已发出…' : '正插进去…', tone: 'sent' }
     }
     return {
       text:
         kind === 'stop'
-          ? '停止请求已发出，但没等到确认（父会话进程可能不在）'
-          : '已发出，但没等到确认（父会话进程可能不在）',
+          ? '停止请求已发出，没等到确认（父会话进程可能不在）'
+          : '已发出，没等到确认（父会话进程可能不在）',
       tone: 'warn',
     }
   }
   if (mail.state === 'expired') return { text: '这条没投出去：已经过期了', tone: 'warn' }
-  if (!mail.ok) return { text: mail.error || '投递失败', tone: 'error' }
-  if (kind === 'stop') return { text: `已受理停止 · ${fmtClock(mail.at)}`, tone: 'ok' }
-  if (mail.state === 'delivered') return { text: `已插进子代理这一轮 · ${fmtClock(mail.at)}`, tone: 'ok' }
-  return { text: `已排队，等它这一步结束 · ${fmtClock(mail.at)}`, tone: 'ok' }
+  if (!mail.ok) return { text: mail.error || '投递失败', tone: 'bad' }
+  if (kind === 'stop') return { text: `停止已受理 · ${fmtClock(mail.at)}`, tone: 'read' }
+  if (mail.state === 'delivered') return { text: `已插进它这一轮 · ${fmtClock(mail.at)}`, tone: 'read' }
+  return { text: `已排队，等它这一步结束 · ${fmtClock(mail.at)}`, tone: 'sent' }
 }
 
-function renderMailLine(segment) {
+function renderMailChip(segment) {
   const described = describeMail(mailFor(segment.runId))
   if (!described) return ''
-  return `<p class="mail-line mail-${esc(described.tone)}">${esc(described.text)}</p>`
+  return `<div class="chip chip-${esc(described.tone)}"><span class="chip-ico">${described.tone === 'read' ? '✓' : '↑'}</span>${esc(
+    described.text,
+  )}</div>`
 }
 
 /**
@@ -214,15 +266,14 @@ function renderMailLine(segment) {
 function renderNoteForm(segment) {
   if (!noteDraft || String(noteDraft.runId) !== String(segment.runId)) return ''
   const busyAttr = noteDraft.busy ? ' disabled' : ''
-  return `<div class="note-form">
-    <textarea data-note-input rows="2" placeholder="对 ${esc(noteDraft.agent || '这个子代理')} 说一句（Enter 发送，Shift+Enter 换行）"${busyAttr}>${esc(noteDraft.text)}</textarea>
-    <div class="note-row">
-      <span class="note-hint">插进它当前这一轮</span>
-      <span class="spacer"></span>
-      <button class="act" data-note-cancel${busyAttr}>取消</button>
-      <button class="act act-primary" data-note-send${busyAttr}>${noteDraft.busy ? '发送中…' : '发送'}</button>
+  return `<div class="inline">
+    <div class="hint">直接插进 <b>${esc(noteDraft.agent || '这个子代理')}</b> 当前这一轮 · Enter 发送 · Shift+Enter 换行 · Esc 收起</div>
+    <textarea data-note-input rows="3" placeholder="例如：先别改测试，把 JSON 输出的字段名定下来"${busyAttr}>${esc(noteDraft.text)}</textarea>
+    <div class="compose-acts">
+      <button data-note-cancel${busyAttr}>取消</button>
+      <button class="send" data-note-send${busyAttr}>${noteDraft.busy ? '发送中…' : '发送'}</button>
     </div>
-    ${noteDraft.error ? `<p class="mail-line mail-error">${esc(noteDraft.error)}</p>` : ''}
+    ${noteDraft.error ? `<p class="form-error">${esc(noteDraft.error)}</p>` : ''}
   </div>`
 }
 
@@ -230,71 +281,127 @@ function renderNoteForm(segment) {
  * 干预入口。**只在 canSteer / canStop 为真时出现**——这两个字段是数据层算的，
  * 前台 run（没有 async id）和已终态段不会出现按钮，用户不会先点再被报错。
  */
-function renderActions(segment) {
+function renderActs(segment) {
   const runId = esc(segment.runId)
   const acts = []
   if (segment.canSteer) {
-    acts.push(`<button class="act" data-note="${runId}">插话…</button>`)
+    const open = noteDraft && String(noteDraft.runId) === String(segment.runId)
+    acts.push(
+      `<button class="primary${open ? ' on' : ''}" data-note="${runId}" aria-expanded="${open ? 'true' : 'false'}" title="${
+        open ? '再点一次收起' : '给它当前这一轮插一句话'
+      }">插话</button>`,
+    )
   }
+  const sessionFile = segment.childSessionFile || (segment.children || []).find((child) => child.sessionFile)?.sessionFile
+  if (sessionFile) acts.push(`<button data-open-session="${esc(sessionFile)}" title="打开它的会话（只读预览）">打开</button>`)
   if (segment.canStop) {
     const confirming = stopConfirm && String(stopConfirm.runId) === String(segment.runId) && Date.now() < stopConfirm.until
     if (confirming) {
-      acts.push(`<button class="act act-danger" data-stop-confirm="${runId}">确认停止</button>`)
-      acts.push('<button class="act" data-stop-cancel>取消</button>')
+      acts.push(`<button class="confirm" data-stop-confirm="${runId}">确认停止？</button>`)
+      acts.push(`<button data-stop-cancel>取消</button>`)
     } else {
-      acts.push(`<button class="act act-danger" data-stop="${runId}">停止</button>`)
+      acts.push(`<button class="danger" data-stop="${runId}">停止</button>`)
     }
   }
-  return acts.length ? `<div class="actions">${acts.join('')}</div>` : ''
+  return acts.length ? `<div class="acts">${acts.join('')}</div>` : ''
 }
 
-function renderSegment(segment, now, isLast) {
-  const summary = segment.summary
-    ? `<p class="summary">${esc(segment.summary.slice(0, 240))}${segment.summary.length > 240 ? '…' : ''}</p>`
-    : ''
-  const tokens = segment.tokens?.total ? `<span class="muted">${esc(segment.tokens.total)} tok</span>` : ''
-  const cost = Number.isFinite(segment.costUsd) ? `<span class="muted">$${segment.costUsd.toFixed(4)}</span>` : ''
-  return `<div class="segment ${isLast ? 'segment-last' : ''}">
-    <div class="segment-head">
-      ${statePill(segment.state)}
-      ${timingSpan(segment, now)}
-      ${tokens}
-      ${cost}
-      ${segment.origin === 'status' ? '<span class="muted" title="插件在这个 run 开始之后才起来，只看到它的当前状态">中途接入</span>' : ''}
-    </div>
-    ${renderChildren(segment, now)}
-    ${summary}
-    ${renderActions(segment)}
-    ${renderNoteForm(segment)}
-    ${renderMailLine(segment)}
-  </div>`
+/** 身份行：角色名 · run id 尾号 · 回合数。同角色并发时靠这一行分人 */
+function renderIdent(lineage, segment, title) {
+  const parts = []
+  const agent = String(lineage.agent || segment.agent || '')
+  if (agent && agent !== title) parts.push({ html: `<span class="who">${esc(agent)}</span>` })
+  if (segment.runId) parts.push({ html: `<code>${esc(shortId(segment.runId))}</code>` })
+  const turns = Number(segment.activity?.turnCount)
+  if (Number.isFinite(turns) && turns > 0) parts.push({ html: `${turns} 回合` })
+  if (!parts.length) return ''
+  return `<div class="ident">${parts.map((part) => part.html).join('<span class="sep">·</span>')}</div>`
 }
 
-function renderLineage(lineage, now) {
+function renderMeta(segment) {
+  const items = []
+  const childCount = (segment.children || []).length
+  if (childCount > 1) items.push(`<span>${childCount} 个子代理</span>`)
+  // 「它正在跑什么」——占位留空，内容由 tickTimings 填，免得每秒重算 HTML
+  if (segment.state === 'running' && (segment.children || []).some((child) => child.currentTool)) {
+    items.push(`<span class="tool" data-tool="${esc(segment.runId)}"></span>`)
+  }
+  const tokens = fmtTokens(segment.tokens?.total)
+  if (tokens) items.push(`<span>${esc(tokens)}</span>`)
+  if (Number.isFinite(segment.costUsd) && segment.costUsd > 0) items.push(`<span>$${segment.costUsd.toFixed(3)}</span>`)
+  if (!items.length) return ''
+  return `<div class="meta">${items.join('')}</div>`
+}
+
+/** 摘要：终态读 summary，失败且没摘要时读 error（红的，别让人以为只是普通说明） */
+function renderSummary(segment) {
+  const text = String(segment.summary || segment.error || '').trim()
+  if (!text) return ''
+  const bad = !segment.summary && Boolean(segment.error)
+  return `<p class="summary${bad ? ' bad' : ''}" title="${esc(text)}">${esc(text)}</p>`
+}
+
+/**
+ * 代际链 + 子代理明细：折成一行，点开才看。
+ * 默认收起——卡面只留「现在」，历史不该抢位置。
+ */
+function renderGen(lineage, segment) {
   const segments = lineage.segments || []
-  const last = segments[segments.length - 1] || {}
-  const isOpen = expanded.has(lineage.lineageRoot)
   const earlier = segments.slice(0, -1)
-  const reviveLine =
-    earlier.length > 0
-      ? `<button class="link" data-open="${esc(lineage.lineageRoot)}">已从第 ${earlier.length} 段继续 · 累计 ${esc(
-          fmtDuration(segments.reduce((sum, s) => sum + (s.durationMs || 0), 0)),
-        )}</button>`
-      : ''
-  const history = isOpen && earlier.length
-    ? `<div class="history">${earlier.map((segment) => renderSegment(segment, now, false)).join('')}</div>`
-    : ''
+  const children = segment.children || []
+  if (!earlier.length && children.length < 2) return ''
+  const open = genOpen.has(lineage.lineageRoot)
+  const label = earlier.length ? `前 ${earlier.length} 段已折叠 · 共 ${segments.length} 段` : `子代理明细 · ${children.length} 个`
+  const lines = []
+  earlier.forEach((past, index) => {
+    const text = `第 ${index + 1} 段 · ${stateText(past.state)} · ${timingOf(past, Date.now())}${
+      past.summary ? ` · ${past.summary.slice(0, 60)}` : ''
+    }`
+    lines.push(
+      past.childSessionFile
+        ? `<button class="gen-line" data-open-session="${esc(past.childSessionFile)}">${esc(text)}<span class="chev">›</span></button>`
+        : `<div class="gen-line">${esc(text)}</div>`,
+    )
+  })
+  if (children.length > 1) {
+    children.forEach((child, index) => {
+      const inner = `<span class="dot ${esc(stateClass(child.state))}"></span><span class="gen-agent">${esc(
+        child.agent || `子代理 ${index + 1}`,
+      )}</span>${child.model ? `<span class="gen-dim">${esc(child.model)}</span>` : ''}${
+        child.thinking ? `<span class="gen-dim">thinking·${esc(child.thinking)}</span>` : ''
+      }<span class="gen-dim">${esc(stateText(child.state))}</span>`
+      lines.push(
+        child.sessionFile
+          ? `<button class="gen-line" data-open-session="${esc(child.sessionFile)}">${inner}<span class="chev">›</span></button>`
+          : `<div class="gen-line">${inner}</div>`,
+      )
+    })
+  }
+  return `<details class="gen" data-gen="${esc(lineage.lineageRoot)}"${open ? ' open' : ''}><summary>${esc(label)}</summary>${lines.join(
+    '',
+  )}</details>`
+}
 
-  return `<article class="card card-${esc(lineage.state || 'unknown')}">
-    <header class="card-head">
-      <span class="dot dot-${esc(lineage.state || 'unknown')}"></span>
-      <span class="agent">${esc(lineage.agent || '子代理')}</span>
-      ${statePill(lineage.state)}
-    </header>
-    ${renderSegment(last, now, true)}
-    ${reviveLine}
-    ${history}
-    ${lineage.cwd ? `<p class="path" title="${esc(lineage.cwd)}">${esc(lineage.cwd)}</p>` : ''}
+function renderCard(lineage, now) {
+  const segments = lineage.segments || []
+  const segment = segments[segments.length - 1] || {}
+  const state = segment.state || lineage.state || 'unknown'
+  const live = ACTIVE_STATES.has(String(state))
+  const title = titleOf(lineage, segment)
+  return `<article class="card${live ? ' live' : ''}">
+    <div class="row1">
+      <span class="dot ${esc(stateClass(state))}"></span>
+      <span class="agent" title="${esc(String(segment.sessionName || title))}">${esc(title)}</span>
+      <span class="state ${esc(stateClass(state))}">${esc(stateText(state))}</span>
+      ${timingSpan(segment)}
+    </div>
+    ${renderIdent(lineage, segment, title)}
+    ${renderSummary(segment)}
+    ${renderMeta(segment)}
+    ${renderActs(segment)}
+    ${renderNoteForm(segment)}
+    ${renderMailChip(segment)}
+    ${renderGen(lineage, segment)}
   </article>`
 }
 
@@ -302,7 +409,7 @@ function renderBanner(degrade) {
   if (!degrade || degrade.kind === 'ok') return ''
   return `<div class="banner banner-${esc(degrade.tone || 'info')}">
     <strong>${esc(degrade.title)}</strong>
-    <p>${esc(degrade.detail)}</p>
+    <span>${esc(degrade.detail)}</span>
   </div>`
 }
 
@@ -326,49 +433,46 @@ function render() {
     return
   }
   paintOnce = false
-  if (stopConfirm && Date.now() >= stopConfirm.until) {
-    stopConfirm = null
-  }
+  if (stopConfirm && Date.now() >= stopConfirm.until) stopConfirm = null
 
   const data = snapshot
   if (lastError) {
-    const html = `<div class="banner banner-error"><strong>面板读取失败</strong><p>${esc(lastError)}</p></div>`
+    const html = `<div class="banner banner-error"><strong>面板读取失败</strong><span>${esc(lastError)}</span></div>`
     if (html !== lastHtml) el.innerHTML = html
     lastHtml = html
     return
   }
   if (!data) {
-    if (lastHtml !== '<p class="muted pad">正在读取…</p>') {
-      el.innerHTML = '<p class="muted pad">正在读取…</p>'
-      lastHtml = '<p class="muted pad">正在读取…</p>'
+    const html = '<p class="pad dim">正在读取…</p>'
+    if (html !== lastHtml) {
+      el.innerHTML = html
+      lastHtml = html
     }
     return
   }
 
   const lineages = data.lineages || []
   const active = Number(data.activeCount) || 0
-  const modeText =
-    data.source?.mode === 'push' ? '推送' : data.source?.mode === 'poll' ? '轮询' : data.source ? '未连接' : '—'
-  // 当前视图是子会话的只读预览：给一条一眼能找到的回去路（宿主会正常激活主会话，可写）
-  const back = data.parentSessionFile
-    ? `<button class="back-link" data-open-session="${esc(data.parentSessionFile)}">← 返回主会话</button>`
+  const previewing = Boolean(data.parentSessionFile)
+  const back = previewing
+    ? `<button class="back" data-open-session="${esc(data.parentSessionFile)}">← 主会话</button>`
     : ''
 
   const body = lineages.length
-    ? lineages.map((lineage) => renderLineage(lineage, now)).join('')
+    ? lineages.map((lineage) => renderCard(lineage, now)).join('')
     : data.degrade?.kind === 'ok'
-      ? '<p class="muted pad">这个会话最近没有子代理运行。</p>'
+      ? `<div class="empty"><strong>这个会话还没有子代理运行记录</strong><span>派一个后台子代理，它跑起来就会出现在这里。</span></div>`
       : ''
 
   const html = `
     ${renderNotice()}
     <div class="head">
-      <span class="title">子代理</span>
-      ${active ? `<span class="count">${active} 个在跑</span>` : ''}
+      ${back}
+      <b>子代理</b>
+      <span class="head-sub">· ${previewing ? '子会话预览' : '本会话'}</span>
       <span class="spacer"></span>
-      <span class="muted" title="数据源">${esc(modeText)}</span>
+      <span class="count">${active ? `${active} 个在跑` : `${lineages.length} 个记录`}</span>
     </div>
-    ${back}
     ${renderBanner(data.degrade)}
     ${body}
     <details class="diag"${diagOpen ? ' open' : ''}>
@@ -376,6 +480,9 @@ function render() {
       <dl>
         <dt>会话</dt><dd>${esc(data.sessionFile || '—')}</dd>
         <dt>数据文件</dt><dd>${esc(data.dataFile || '—')}</dd>
+        <dt>数据源</dt><dd>${esc(
+          data.source?.mode === 'push' ? '推送' : data.source?.mode === 'poll' ? '轮询' : '未连接',
+        )}</dd>
         <dt>心跳</dt><dd>${data.liveness?.ageMs == null ? '—' : esc(fmtAge(data.liveness.ageMs))}</dd>
         <dt>能力</dt><dd>${esc((data.source?.capabilities || []).join(', ') || '—')}</dd>
         <dt>干预</dt><dd>${esc(
@@ -393,15 +500,22 @@ function render() {
     el.innerHTML = html
     el.scrollTop = scrollTop
     lastHtml = html
-  } else {
-    // 结构没变，只把计时数字推到当前值
-    tickTimings()
   }
+  // 结构没变也要推一次：新插入的计时占位是空的
+  tickTimings()
 }
 
 /* ---------- 操作 ---------- */
 
-function openNote(runId) {
+/** 插话入口：**toggle**——同一个按钮再点一次收起，误触不会留下一个常驻框（P2） */
+function toggleNote(runId) {
+  if (noteDraft && String(noteDraft.runId) === String(runId)) {
+    const dropped = String(noteDraft.text || '').trim().length > 0
+    noteDraft = null
+    if (dropped) setNotice('已收起，没发出去的内容没有保留', 'info')
+    render()
+    return
+  }
   const segment = findSegment(runId)
   noteDraft = {
     runId: String(runId),
@@ -417,8 +531,10 @@ function openNote(runId) {
   if (input) input.focus()
 }
 
-function closeNote() {
+function closeNote({ quiet = false } = {}) {
+  const dropped = Boolean(noteDraft && String(noteDraft.text || '').trim())
   noteDraft = null
+  if (dropped && !quiet) setNotice('已收起，没发出去的内容没有保留', 'info')
   render()
 }
 
@@ -513,13 +629,19 @@ async function openSession(sessionFile) {
 }
 
 // 事件委托，挂一次就够——innerHTML 重建不带走 el 自己的监听器。
-// toggle 不冒泡但捕获阶段能到达：details 每次重建后状态由 diagOpen 恢复，
-// 用户点击 summary → 浏览器切 open → toggle 事件更新 diagOpen → 下一帧重绘不丢。
+// toggle 不冒泡但捕获阶段能到达：details 每次重建后状态由 genOpen / diagOpen 恢复，
+// 用户点击 summary → 浏览器切 open → toggle 更新状态 → 下一帧重绘不丢。
 el.addEventListener(
   'toggle',
   (/** @type {Event} */ event) => {
     const target = /** @type {HTMLElement} */ (event.target)
-    if (target instanceof HTMLDetailsElement && target.classList.contains('diag')) diagOpen = target.open
+    if (!(target instanceof HTMLDetailsElement)) return
+    if (target.classList.contains('diag')) diagOpen = target.open
+    const root = target.getAttribute('data-gen')
+    if (root) {
+      if (target.open) genOpen.add(root)
+      else genOpen.delete(root)
+    }
   },
   true,
 )
@@ -555,7 +677,7 @@ el.addEventListener('click', (/** @type {MouseEvent} */ event) => {
   const noteButton = /** @type {HTMLElement | null} */ (target.closest('[data-note]'))
   if (noteButton) {
     const runId = noteButton.getAttribute('data-note')
-    if (runId) openNote(runId)
+    if (runId) toggleNote(runId)
     return
   }
   if (target.closest('[data-stop-cancel]')) {
@@ -581,15 +703,7 @@ el.addEventListener('click', (/** @type {MouseEvent} */ event) => {
   if (sessionButton) {
     const file = sessionButton.getAttribute('data-open-session')
     if (file) void openSession(file)
-    return
   }
-  const button = /** @type {HTMLElement | null} */ (target.closest('[data-open]'))
-  if (!button) return
-  const root = button.getAttribute('data-open')
-  if (!root) return
-  if (expanded.has(root)) expanded.delete(root)
-  else expanded.add(root)
-  render()
 })
 
 async function tick() {
@@ -615,6 +729,7 @@ bridge.on('context', (next) => {
   noteDraft = null
   stopConfirm = null
   sentNotes.length = 0
+  genOpen.clear()
   void tick()
 })
 bridge.on('dispose', () => {

@@ -392,3 +392,68 @@ test('activeCount: 数的是活跃段，不是链', () => {
   applyComplete(state, { id: 'a', state: 'complete', success: true, timestamp: BASE + 200 }, BASE + 200)
   assert.equal(activeCount(state), 1)
 })
+
+/* ---------- sessionName：同角色并发时唯一能区分实例的字段（实测报告 P1） ---------- */
+
+test('sessionName: async-complete 的 results[].sessionName 落到 children', () => {
+  const state = fresh()
+  applyComplete(
+    state,
+    {
+      id: 'run-1',
+      agent: 'worker',
+      success: true,
+      state: 'complete',
+      timestamp: BASE,
+      durationMs: 1_000,
+      results: [{ agent: 'worker', sessionName: 'worker: 写词频 CLI', sessionFile: 'C:/child.jsonl', status: 'complete' }],
+    },
+    BASE,
+  )
+  const segment = state.lineages[0].segments[0]
+  assert.equal(segment.children[0].sessionName, 'worker: 写词频 CLI')
+})
+
+test('sessionName: status children 带上来，还捎上 currentTool', () => {
+  const state = fresh()
+  mergeStatus(
+    state,
+    {
+      asyncSnapshot: {
+        runs: [
+          {
+            id: 'run-1',
+            state: 'running',
+            startedAt: BASE,
+            children: [
+              {
+                agent: 'worker',
+                sessionName: 'worker: 你是测试用子代理 A',
+                model: 'deepseek/deepseek-flash',
+                thinking: 'high',
+                state: 'running',
+                currentTool: 'bash',
+                currentToolStartedAt: BASE - 1_200,
+              },
+            ],
+          },
+        ],
+      },
+    },
+    BASE + 1_000,
+  )
+  const child = state.lineages[0].segments[0].children[0]
+  assert.equal(child.sessionName, 'worker: 你是测试用子代理 A')
+  assert.equal(child.currentTool, 'bash')
+  assert.equal(child.currentToolStartedAt, BASE - 1_200)
+})
+
+test('sessionName: started 给的名字被 complete 覆盖，没给不清掉', () => {
+  const state = fresh()
+  applyStarted(state, { id: 'run-1', agent: 'worker', sessionName: 'worker: 初版任务' }, BASE)
+  assert.equal(state.lineages[0].segments[0].sessionName, 'worker: 初版任务')
+  applyComplete(state, { id: 'run-1', success: true, state: 'complete', timestamp: BASE + 1_000, sessionName: 'worker: 改过名' }, BASE + 1_000)
+  assert.equal(state.lineages[0].segments[0].sessionName, 'worker: 改过名')
+  applyComplete(state, { id: 'run-1', success: true, state: 'complete', timestamp: BASE + 2_000 }, BASE + 2_000)
+  assert.equal(state.lineages[0].segments[0].sessionName, 'worker: 改过名')
+})
