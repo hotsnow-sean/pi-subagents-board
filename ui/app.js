@@ -32,6 +32,27 @@ const expanded = new Set()
 let diagOpen = false
 /** 最近一次「打开子会话」的结果；同样要活过重绘 */
 let actionResult = /** @type {{ text: string, tone: string } | null} */ (null)
+let actionTimer = /** @type {any} */ (null)
+
+/**
+ * 写动作结果。成功类给 autoHideMs 就自动消失——横幅常驻的话，用户点完一次，
+ * 往后每秒重绘都带着一条过时的「已打开」，比没有更吵（实测反馈）。
+ * 失败/警告常驻：错误信息需要时间读。
+ */
+function setActionResult(result, autoHideMs = 0) {
+  actionResult = result
+  if (actionTimer) {
+    clearTimeout(actionTimer)
+    actionTimer = null
+  }
+  if (result && autoHideMs > 0) {
+    actionTimer = setTimeout(() => {
+      actionResult = null
+      actionTimer = null
+      render()
+    }, autoHideMs)
+  }
+}
 
 function esc(value) {
   return String(value ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c])
@@ -169,23 +190,22 @@ function renderActionResult() {
 }
 
 /**
- * 打开子会话（只读预览）。
+ * 打开一段会话（宿主二分：主会话激活、子会话只读预览）。
  *
- * 走宿主 `sessions.reveal`：预览不绑 worker、不能对它发提示词——观测层不该获得
- * 指挥用户会话的能力。失败是常态（一次性 run 的会话会被清理），所以文案说清原因，
- * 而不是静默。
+ * 走宿主 `sessions.activate`：目标在当前工作区侧栏就正常激活——「返回主会话」
+ * 时用户拿到的是可写对话；子会话不在侧栏，退化为只读预览（观测层不指挥会话）。
+ * 失败是常态（一次性 run 的会话会被清理），所以文案说清原因，而不是静默。
  * @param {string} sessionFile
  */
 async function openSession(sessionFile) {
-  actionResult = { text: '正在打开…', tone: 'info' }
+  setActionResult({ text: '正在打开…', tone: 'info' })
   render()
   try {
     const result = await bridge.invoke('openSession', { sessionFile })
-    actionResult = result?.ok
-      ? { text: '已打开只读预览（不能向该会话发消息）', tone: 'ok' }
-      : { text: '子会话已不存在，可能已被清理', tone: 'warn' }
+    if (result?.ok) setActionResult({ text: '已打开', tone: 'ok' }, 6_000)
+    else setActionResult({ text: '会话文件已不存在，可能已被清理', tone: 'warn' })
   } catch (error) {
-    actionResult = { text: `打开失败：${error instanceof Error ? error.message : String(error)}`, tone: 'error' }
+    setActionResult({ text: `打开失败：${error instanceof Error ? error.message : String(error)}`, tone: 'error' })
   }
   render()
 }
@@ -208,6 +228,10 @@ function render() {
   const active = Number(data.activeCount) || 0
   const modeText =
     data.source?.mode === 'push' ? '推送' : data.source?.mode === 'poll' ? '轮询' : data.source ? '未连接' : '—'
+  // 当前视图是子会话的只读预览：给一条一眼能找到的回去路（宿主会正常激活主会话，可写）
+  const back = data.parentSessionFile
+    ? `<button class="back-link" data-open-session="${esc(data.parentSessionFile)}">← 返回主会话</button>`
+    : ''
 
   el.innerHTML = `
     <div class="head">
@@ -216,6 +240,7 @@ function render() {
       <span class="spacer"></span>
       <span class="muted" title="数据源">${esc(modeText)}</span>
     </div>
+    ${back}
     ${renderBanner(data.degrade)}
     ${renderActionResult()}
     ${lineages.length ? lineages.map((lineage) => renderLineage(lineage, now)).join('') : data.degrade?.kind === 'ok' ? '<p class="muted pad">这个会话最近没有子代理运行。</p>' : ''}
@@ -284,6 +309,7 @@ bridge.on('context', (next) => {
 })
 bridge.on('dispose', () => {
   if (timer) clearInterval(timer)
+  if (actionTimer) clearTimeout(actionTimer)
 })
 
 let timer = null

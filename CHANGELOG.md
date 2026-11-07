@@ -1,5 +1,20 @@
 # CHANGELOG
 
+## 0.3.0
+
+实测复验的三处修正 + 一个宿主新能力：
+
+- **resume 接链修复**：resume 实测**复用同一个子会话文件**（首行 parentSession 指向父会话
+  而非前一段），旧线索永远接不上 → 两张卡不合并。改为「新段 sessionFile === 某段
+  childSessionFile」接链（取链尾），parentSession 降为兜底。
+- **运行中可点**：async-started 时按 `<父stem>/<runId>/run-0/session.jsonl` 推导子会话
+  路径，complete 前的对话流也能点开（complete 后事件真实路径覆盖）。
+- **「← 返回主会话」**：main 反查「这段会话是谁的 child」（预览子会话时也能看到链）；
+  打开走宿主新增的 `ctx.sessions.activate`——主会话**正常激活（可写）**，只有子会话
+  才是只读预览（宿主 0.7.7-fork 之后的版本，旧宿主回落 reveal）。
+- 动作横幅成功 6s 自动消失，失败才常驻。
+- 60 例测试。
+
 ## 0.2.0
 
 P2-b：从「能看见」到「能回去」。

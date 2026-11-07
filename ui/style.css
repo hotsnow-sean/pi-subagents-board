@@ -175,6 +175,17 @@ html, body {
 .open-session:hover { text-decoration: underline; }
 .open-session .chev { margin-left: 0; opacity: 1; }
 
+/* 预览父链时的「返回主会话」：放在头部正下方，一眼能找到 */
+.back-link {
+  all: unset;
+  display: inline-block;
+  margin: 4px 0 2px;
+  font-size: 12px;
+  color: var(--accent);
+  cursor: pointer;
+}
+.back-link:hover { text-decoration: underline; }
+
 /* 动作结果（打开子会话）：常驻一行，不随重绘消失 */
 .result {
   margin: 8px 0 0;

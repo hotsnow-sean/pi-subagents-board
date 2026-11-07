@@ -138,6 +138,24 @@ test('agent: 握手成功后把事件聚合成 live 状态并落盘', async () =
   assert.ok(state.updatedAt > 0, 'updatedAt 是 main 侧判活的依据')
 })
 
+test('agent: started 阶段就推导子会话路径，complete 前对话流可点（实测反馈）', async () => {
+  const { dataDir, harness } = await boot()
+  await sleep(500)
+  harness.emit('subagent:async-started', {
+    id: 'run-r',
+    agent: 'worker',
+    cwd: 'C:/w',
+    asyncDir: 'C:/tmp/async-r',
+    sessionId: 'C:/sessions/parent.jsonl',
+  })
+  await sleep(600)
+  const state = readState(dataDir)
+  const segment = state.lineages[0].segments[0]
+  assert.equal(segment.state, 'running')
+  // 形状：<父目录>/<父 stem>/<runId>/run-0/session.jsonl（pi-subagents 0.86.0 固定结构）
+  assert.equal(segment.childSessionFile.toLowerCase(), 'c:\\sessions\\parent\\run-r\\run-0\\session.jsonl')
+})
+
 test('agent: jobs-changed 高频触发时 status 被合并节流（不是一条事件一次请求）', async () => {
   const { harness, server } = await boot()
   await sleep(400)

@@ -26,6 +26,7 @@ function fakeCtx(dataDir, opts = {}) {
   /** @type {any[]} */
   const inbox = []
   const reveal = opts.reveal ?? (async () => true)
+  const activate = opts.activate
   return {
     pluginId: 'subagents-board',
     dataDir,
@@ -33,7 +34,10 @@ function fakeCtx(dataDir, opts = {}) {
     logs,
     inbox,
     ui: { inbox: (/** @type {any} */ item) => inbox.push(item) },
-    sessions: { reveal: (/** @type {string} */ file) => reveal(file) },
+    sessions: {
+      reveal: (/** @type {string} */ file) => reveal(file),
+      ...(activate ? { activate: (/** @type {string} */ file) => activate(file) } : {}),
+    },
   }
 }
 
@@ -151,6 +155,54 @@ test('openSession: 走宿主 sessions.reveal，路径非法/不存在时回 ok:f
   const empty = await api2.invoke('openSession', {})
   assert.equal(empty.ok, false)
   assert.match(empty.error, /sessionFile/)
+})
+
+test('openSession: 优先走 activate（主会话可写激活），没有 activate 才回落 reveal', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
+  const mod = await loadMain()
+
+  /** @type {string[]} */
+  const activated = []
+  const api = await mod.activate(fakeCtx(dataDir, { activate: async (file) => (activated.push(file), true) }))
+  const ok = await api.invoke('openSession', { sessionFile: 'C:/sessions/parent.jsonl' })
+  assert.equal(ok.ok, true)
+  assert.deepEqual(activated, ['C:/sessions/parent.jsonl'], '有 activate 必须用它（「返回主会话」要拿到可写对话）')
+
+  // 旧宿主没有 activate：回落 reveal
+  const mod2 = await loadMain()
+  const ctx2 = fakeCtx(dataDir)
+  const api2 = await mod2.activate(ctx2)
+  const fallback = await api2.invoke('openSession', { sessionFile: 'C:/sessions/child/session.jsonl' })
+  assert.equal(fallback.ok, true)
+})
+
+test('getState: 预览子会话时反查出父会话链与 parentSessionFile（「返回主会话」的落点）', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
+  const parentFile = path.join(dataDir, 'sessions', 'parent.jsonl')
+  const sessionKey = sessionKeyOf(parentFile)
+  const childFile = path.join(dataDir, 'sessions', 'parent', 'run-1', 'run-0', 'session.jsonl')
+  const startedAt = Date.now() - 5_000
+  const state = createState({ sessionKey, sessionFile: parentFile, pid: 31, startedAt })
+  applyStarted(state, { id: 'run-1', agent: 'worker', cwd: 'C:/w' }, startedAt + 100)
+  applyComplete(
+    state,
+    { id: 'run-1', state: 'complete', success: true, timestamp: startedAt + 2_000, sessionFile: childFile, summary: 'done' },
+    startedAt + 2_000,
+  )
+  ensureLiveDir(dataDir)
+  writeJsonAtomic(liveFileOf(dataDir, { sessionKey, pid: 31, startedAt }), state)
+
+  const mod = await loadMain()
+  const api = await mod.activate(fakeCtx(dataDir))
+  // 用子会话路径查询（等价于用户正在预览它）：拿到的应当是父会话的链
+  const view = await api.invoke('getState', { sessionFile: childFile })
+  assert.equal(view.parentSessionFile, parentFile)
+  assert.equal(view.lineages.length, 1)
+  assert.equal(view.lineages[0].segments[0].runId, 'run-1')
+  // 主会话本身没有 parentSessionFile
+  const own = await api.invoke('getState', { sessionFile: parentFile })
+  assert.equal(own.parentSessionFile, '')
+  assert.equal(own.lineages.length, 1)
 })
 
 test('信箱: 激活时只通知「刚结束」的 run，历史终态段记进台账不重播', async () => {

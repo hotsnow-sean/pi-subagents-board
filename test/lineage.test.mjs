@@ -125,6 +125,54 @@ test('applyComplete: resume 出的新段靠 childParentSession 接回原链', ()
   assert.equal(lineage.segments[1].runId, 'run-2')
 })
 
+test('applyComplete: resume 复用同一个子会话文件 → 接回原链（实测行为）', () => {
+  const state = fresh()
+  const shared = 'C:/sessions/a/run-1/run-0/session.jsonl'
+  applyStarted(state, { id: 'run-1', agent: 'worker' }, BASE)
+  applyComplete(
+    state,
+    { id: 'run-1', state: 'complete', success: true, timestamp: BASE + 1_000, sessionFile: shared, summary: '第一段' },
+    BASE + 1_000,
+  )
+  // resume：新 runId，但 sessionFile 是同一个文件（pi 往原 session.jsonl 继续写），
+  // 首行 parentSession 指向的是父会话——靠 parentSession 接不上，必须靠文件复用匹配
+  applyStarted(state, { id: 'run-2', agent: 'worker' }, BASE + 5_000)
+  applyComplete(
+    state,
+    {
+      id: 'run-2',
+      state: 'complete',
+      success: true,
+      timestamp: BASE + 9_000,
+      sessionFile: shared,
+      childParentSession: 'C:/sessions/parent.jsonl',
+      summary: '第二段',
+    },
+    BASE + 9_100,
+  )
+  assert.equal(state.lineages.length, 1, '复用同一子会话文件的两段必须同链')
+  const lineage = state.lineages[0]
+  assert.equal(lineage.segments.length, 2)
+  assert.equal(lineage.segments[1].runId, 'run-2')
+  assert.equal(lineage.segments[1].revivedFrom, 'run-1')
+  assert.equal(lineage.segments[1].summary, '第二段', '链尾段的摘要要是新段自己的')
+  assert.equal(lineage.segments[0].summary, '第一段', '前一段摘要不被覆盖')
+})
+
+test('applyComplete: resume 链的第三次接链取链尾，不接回第一段', () => {
+  const state = fresh()
+  const shared = 'C:/sessions/a/run-1/run-0/session.jsonl'
+  applyStarted(state, { id: 'run-1', agent: 'worker' }, BASE)
+  applyComplete(state, { id: 'run-1', state: 'complete', success: true, timestamp: BASE + 1_000, sessionFile: shared }, BASE + 1_000)
+  applyComplete(state, { id: 'run-2', state: 'complete', success: true, timestamp: BASE + 2_000, sessionFile: shared }, BASE + 2_000)
+  applyComplete(state, { id: 'run-3', state: 'complete', success: true, timestamp: BASE + 3_000, sessionFile: shared }, BASE + 3_000)
+  assert.equal(state.lineages.length, 1)
+  const segments = state.lineages[0].segments
+  assert.equal(segments.length, 3)
+  assert.equal(segments[2].runId, 'run-3')
+  assert.equal(segments[2].revivedFrom, 'run-2', 'revivedFrom 必须指向前一段（链尾），不能跳回 run-1')
+})
+
 test('applyComplete: 没有 started 的 resume 段也靠 parentSession 接到已有链', () => {
   const state = fresh()
   applyStarted(state, { id: 'run-1', agent: 'worker' }, BASE)

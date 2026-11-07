@@ -26,7 +26,7 @@ const Q = import.meta.url.includes('?') ? `?${import.meta.url.split('?')[1]}` : 
 const imp = (name) => import(pathToFileURL(path.join(import.meta.dirname, 'lib', `${name}.mjs`)).href + Q)
 
 const { latestForSession, livenessOf, pruneLiveFiles, readLiveFiles, liveDirOf } = await imp('live-store')
-const { sessionKeyOf } = await imp('session-key')
+const { normalizeSessionPath, sessionKeyOf } = await imp('session-key')
 const { listLineages, activeCount } = await imp('lineage')
 const { describeDegrade } = await imp('degrade')
 const { buildInboxItem, pruneLedger, seedLedger, selectNewCompletions } = await imp('inbox-watch')
@@ -74,8 +74,20 @@ function stateFor(sessionFile) {
     })
   }
   const sessionKey = sessionKeyOf(file)
-  const latest = latestForSession(rt.ctx.dataDir, sessionKey)
-  const state = latest?.state ?? null
+  let latest = latestForSession(rt.ctx.dataDir, sessionKey)
+  let state = latest?.state ?? null
+  // 反查：当前是一段子会话的**只读预览**（面板上下文跟着预览会话走），
+  // 而 live 数据按父会话存——扫一遍找到「谁的 child 是它」，显示父会话的链。
+  // 这样预览子会话时右栏还能看到那条链，也给「返回主会话」按钮提供落点。
+  let parentSessionFile = ''
+  if (!state || !(state.lineages ?? []).length) {
+    const owner = findOwnerOf(rt.ctx.dataDir, file)
+    if (owner) {
+      latest = owner
+      state = owner.state
+      parentSessionFile = state.sessionFile ?? ''
+    }
+  }
   const liveness = livenessOf(state)
   const degrade = describeDegrade(state, liveness)
   const lineages = state ? listLineages(state) : []
@@ -83,6 +95,8 @@ function stateFor(sessionFile) {
     ok: true,
     sessionFile: file,
     sessionKey,
+    /** 非空 = 当前视图是子会话预览；UI 据此显示「返回主会话」 */
+    parentSessionFile,
     liveness,
     degrade,
     source: state?.source ?? null,
@@ -92,6 +106,28 @@ function stateFor(sessionFile) {
     /** 数据文件路径：诊断折叠区显示，用户排查「为什么没数据」时最有用 */
     dataFile: latest?.file ?? '',
   }
+}
+
+/**
+ * 反查「这段会话是谁的 child」。live 文件按父会话 key 存，遍历比 childSessionFile
+ * （路径归一化后比较：事件里的路径与面板上下文里的写法可能差斜杠方向与大小写）。
+ * @param {string} dataDir
+ * @param {string} sessionFile
+ */
+function findOwnerOf(dataDir, sessionFile) {
+  const target = normalizeSessionPath(sessionFile)
+  if (!target) return null
+  let best = null
+  for (const item of readLiveFiles(dataDir)) {
+    for (const lineage of item.state?.lineages ?? []) {
+      for (const segment of lineage.segments ?? []) {
+        if (segment.childSessionFile && normalizeSessionPath(segment.childSessionFile) === target) {
+          if (!best || (Number(item.state.startedAt) || 0) > (Number(best.state.startedAt) || 0)) best = item
+        }
+      }
+    }
+  }
+  return best
 }
 
 /** @param {any} ctx */
@@ -170,11 +206,14 @@ async function handleInvoke(method, params) {
       }
     }
     case 'openSession': {
-      // 「这段子会话到底在干什么」→ 宿主只读预览。刻意不做可写打开：
-      // 观测层不该获得指挥用户会话的能力（用户想接手，自己从侧栏切过去）。
+      // 「回到/看一眼这段会话」→ 宿主二分：在当前工作区侧栏就**正常激活**（可写，
+      // 「返回主会话」用的就是它），不在（子会话、跨工作区）才只读预览。
+      // activate 是宿主 0.7.7-fork 之后的能力；旧宿主回落到 reveal（恒为预览）。
       const target = String(params?.sessionFile ?? '').trim()
       if (!target) return { ok: false, error: 'no sessionFile' }
-      const revealed = await rt.ctx.sessions.reveal(target)
+      const sessions = rt.ctx.sessions
+      const jump = typeof sessions.activate === 'function' ? sessions.activate : sessions.reveal.bind(sessions)
+      const revealed = await jump(target)
       return { ok: Boolean(revealed), sessionFile: target }
     }
     default:

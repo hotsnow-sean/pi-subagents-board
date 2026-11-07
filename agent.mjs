@@ -26,7 +26,7 @@ import path from 'node:path'
 
 import { applyComplete, applyStarted, createState, mergeStatus } from './lib/lineage.mjs'
 import { ensureLiveDir, liveFileOf, writeJsonAtomic } from './lib/live-store.mjs'
-import { sessionKeyOf } from './lib/session-key.mjs'
+import { childSessionFile, sessionKeyOf } from './lib/session-key.mjs'
 
 const RPC_VERSION = 1
 /** 事件合并窗口：jobs-changed 一秒能来十几次 */
@@ -210,7 +210,15 @@ export default function subagentsBoard(pi, ctx) {
     if (stale || disposed) return
     const at = Date.now()
     if (key === 'asyncStarted') {
-      applyStarted(state, payload, at)
+      const started = applyStarted(state, payload, at)
+      // running 阶段就把子会话路径推导出来——事件载荷到 complete 才带 sessionFile，
+      // 不推导的话「子代理运行过程中」面板上没法点进对话流（实测反馈）。
+      // 形状是 pi-subagents 0.86.0 实测的固定结构；多 child / workflow 的例外
+      // 由 complete 的真实路径覆盖，点击时宿主还会校验文件存在，推错也只是点不开。
+      const runId = String(payload?.id ?? payload?.runId ?? '')
+      if (started?.segment && !started.segment.childSessionFile && sessionFile && runId) {
+        started.segment.childSessionFile = childSessionFile(sessionFile, runId, 0)
+      }
       markDirty()
       flush()
       return
