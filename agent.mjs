@@ -2,11 +2,12 @@
 /**
  * subagents-board — 会话进程（worker）内的 RPC 客户端。
  *
- * 职责就一件事：把 pi-subagents 的运行状态变成一份**可读的落盘快照**，给 main 侧
- * 的面板读。不渲染、不决策，UI 的一切都从 `live/<sessionKey>-<pid>-<startedAt>.json` 来。
+ * 职责是两件事：把 pi-subagents 的运行状态变成一份**可读的落盘快照**给面板；把面板的
+ * 留言投给**本会话自己的** agent 循环。不渲染、不决策。
  *
  * 为什么不做宿主 IPC：插件 main 与 worker 之间没有可用通道（宿主 IPC 是宿主自己的）。
- * 读方向用文件（本文件写、main 读），写方向（steer/stop）在 P2-c 用命令队列，同一条思路。
+ * 读方向用文件（本文件写 live/、main 读）；写方向用留言邮箱（main 写 inbox/、本文件写
+ * receipts/）。两边各写各的目录，零锁、无死线。
  *
  * 三条实测教训（P0 得来，别重犯）：
  *   1. 扩展实例会随会话切换换代：`pi` 立刻作废，再碰就抛 stale。**每个实例必须能识别
@@ -24,8 +25,8 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
-import { CLAIM_DIR, CMD_DIR, REPLY_WAIT_MS, RESULT_DIR, buildResult, isExpired, parseCommandFileName } from './lib/cmd-queue.mjs'
 import { applyComplete, applyStarted, createState, mergeStatus } from './lib/lineage.mjs'
+import { INBOX_DIR, RECEIPT_DIR, isFresh, parseNoteFileName, renderNoteText } from './lib/note-queue.mjs'
 import { ensureLiveDir, liveFileOf, writeJsonAtomic } from './lib/live-store.mjs'
 import { childSessionFile, sessionKeyOf } from './lib/session-key.mjs'
 
@@ -39,10 +40,10 @@ const HEARTBEAT_POLL_MS = 2_000
 /** 握手重试间隔表：先密后疏，封顶 20s。pi-subagents 没装时会一直重试 */
 const RETRY_DELAYS = [2_000, 5_000, 10_000, 20_000]
 const MAX_STATUS_FAILURES = 3
-/** 命令队列扫描间隔（fs.watch 在 Windows 上偶发丢事件，轮询是兜底而不是备选） */
-const CMD_POLL_MS = 500
-/** 插话/停止的 RPC 超时：比 status 宽一点，扩展要排队投递 */
-const COMMAND_TIMEOUT_MS = 10_000
+/** 留言扫描间隔：面板不再等回执，500ms 只是「点完就投」的手感 */
+const NOTE_POLL_MS = 500
+/** stop 的 RPC 超时：扩展要中断子进程并收敛状态 */
+const STOP_TIMEOUT_MS = 10_000
 
 /**
  * @param {import('@earendil-works/pi-coding-agent').ExtensionAPI} pi
@@ -119,7 +120,7 @@ export default function subagentsBoard(pi, ctx) {
     dirtyTimer = null
     heartbeatTimer = null
     flushTimer = null
-    stopCommands()
+    stopNotes()
   }
 
   /**
@@ -334,140 +335,196 @@ export default function subagentsBoard(pi, ctx) {
     if (typeof handshakeTimer.unref === 'function') handshakeTimer.unref()
   }
 
-  // ---------- 命令队列（steer / stop） ----------
+  // ---------- 留言邮箱（面板 → 主会话） ----------
 
-  const cmdRoot = path.join(ctx.dataDir, CMD_DIR)
-  const claimRoot = path.join(ctx.dataDir, CLAIM_DIR)
-  const resultRoot = path.join(ctx.dataDir, RESULT_DIR)
-  let cmdWatcher = /** @type {any} */ (null)
-  let cmdPoll = /** @type {any} */ (null)
+  /**
+   * 面板不再「遥控」子代理，只**给主会话留一句话**。落点是 SDK 的 `sendUserMessage`：
+   *
+   *   `sendUserMessage(text, { deliverAs })` 内部就是 `prompt(text, { streamingBehavior: deliverAs })`，
+   *   而 `prompt` **只在 isStreaming 分支**读 `streamingBehavior`
+   *   （否则抛 "Agent is already processing. Specify streamingBehavior"）。
+   *
+   *   于是固定传 `deliverAs: 'steer'` 天然覆盖两种场景，不需要我们判断会话忙闲、也不需要排队状态机：
+   *     空闲     → 忽略该参数，直接起一轮（等于用户自己打字）
+   *     正在跑   → 插进当前轮（steer）
+   *
+   * 这套替代了 P2-c 的 cmd-queue（文件命令 + rename 认领 + 5s 双端死线 + 双端过期）。
+   * 那层的每一条复杂度都是在补「跨进程投递的不确定性」，而现在投递目标是**本进程自己的会话**。
+   */
+
+  const inboxRoot = path.join(ctx.dataDir, INBOX_DIR)
+  const receiptRoot = path.join(ctx.dataDir, RECEIPT_DIR)
+  let noteWatcher = /** @type {any} */ (null)
+  let notePoll = /** @type {any} */ (null)
   let scanning = false
+  /** 已处理过的 note id。receipt 落盘前的一瞬靠它防重（重启后靠 receipt 文件本身判断） */
+  const handled = new Set()
 
-  function stopCommands() {
-    if (cmdWatcher) {
+  function stopNotes() {
+    if (noteWatcher) {
       try {
-        cmdWatcher.close()
+        noteWatcher.close()
       } catch {
         /* 已经关了 */
       }
-      cmdWatcher = null
+      noteWatcher = null
     }
-    if (cmdPoll) {
-      clearInterval(cmdPoll)
-      cmdPoll = null
+    if (notePoll) {
+      clearInterval(notePoll)
+      notePoll = null
     }
   }
 
-  function startCommands() {
+  function startNotes() {
     try {
-      for (const dir of [cmdRoot, claimRoot, resultRoot]) fs.mkdirSync(dir, { recursive: true })
+      fs.mkdirSync(inboxRoot, { recursive: true })
+      fs.mkdirSync(receiptRoot, { recursive: true })
     } catch (error) {
-      ctx.log('cmd dirs unavailable:', error instanceof Error ? error.message : error)
+      ctx.log('mail dirs unavailable:', error instanceof Error ? error.message : error)
       return
     }
     try {
-      // fs.watch 只是「快一点」：Windows 上偶尔丢事件，所以轮询才是主路。
-      // unref 是必须的：watcher 会一直挂着事件循环，会话结束/测试进程都不该被它拖住。
-      cmdWatcher = fs.watch(cmdRoot, () => void scanCommands())
-      if (typeof cmdWatcher.unref === 'function') cmdWatcher.unref()
+      // fs.watch 只为「点完就投」的手感；Windows 上会丢事件，所以轮询是主路
+      noteWatcher = fs.watch(inboxRoot, () => void scanNotes())
+      if (typeof noteWatcher.unref === 'function') noteWatcher.unref()
     } catch (error) {
-      ctx.log('cmd watch failed, polling only:', error instanceof Error ? error.message : error)
+      ctx.log('mail watch failed, polling only:', error instanceof Error ? error.message : error)
     }
-    cmdPoll = setInterval(() => void scanCommands(), CMD_POLL_MS)
-    if (typeof cmdPoll.unref === 'function') cmdPoll.unref()
-    void scanCommands()
+    notePoll = setInterval(() => void scanNotes(), NOTE_POLL_MS)
+    if (typeof notePoll.unref === 'function') notePoll.unref()
+    void scanNotes()
   }
 
   /**
-   * 扫一次命令目录。只看**文件名以本会话 sessionKey 开头**的：多个会话的 agent 同时
-   * 在扫同一个目录，不按前缀过滤就会互相抢命令（把 A 会话的插话发到 B 的子代理上）。
+   * 扫自己那一格 `inbox/<sessionKey>/`。
+   *
+   * 按会话分目录的好处：多个会话的 agent 各自读各自的目录，不需要「文件名带前缀」那种过滤，
+   * 也就不需要 rename 认领（认领是为了在共享目录里抢命令，这里根本没有共享）。
    */
-  async function scanCommands() {
+  async function scanNotes() {
     if (scanning || stale || disposed) return
     const key = state.sessionKey
     if (!key || key === 'unknown') return
     scanning = true
     try {
-      /** @type {string[]} */
+      const dir = path.join(inboxRoot, key)
       let names = []
       try {
-        names = fs.readdirSync(cmdRoot)
+        names = fs.readdirSync(dir)
       } catch {
         return
       }
       for (const name of names) {
-        const parsed = parseCommandFileName(name)
-        if (!parsed || parsed.sessionKey !== key) continue
-        const claimed = path.join(claimRoot, name)
-        try {
-          // rename 是原子的：抢不到说明另一个实例已经拿走了
-          fs.renameSync(path.join(cmdRoot, name), claimed)
-        } catch {
+        const id = parseNoteFileName(name)
+        if (!id || handled.has(id)) continue
+        // 有回执 = 这一代或上一代实例已经处理过。note 不可变、id 唯一，因此幂等
+        if (fs.existsSync(path.join(receiptRoot, `${id}.json`))) {
+          handled.add(id)
           continue
         }
-        await runCommand(claimed)
+        /** @type {any} */
+        let note = null
+        try {
+          note = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'))
+        } catch {
+          continue // 正在写（半份 JSON）：下一轮再看。过期判断由 isFresh 兜底
+        }
+        handled.add(id)
+        await runNote(note, id)
       }
     } finally {
       scanning = false
     }
   }
 
-  /** @param {string} claimedFile */
-  async function runCommand(claimedFile) {
-    /** @type {any} */
-    let command = null
-    try {
-      command = JSON.parse(fs.readFileSync(claimedFile, 'utf8'))
-    } catch (error) {
-      ctx.log('bad command file:', error instanceof Error ? error.message : error)
-      try {
-        fs.rmSync(claimedFile, { force: true })
-      } catch {
-        /* 清理失败由 TTL 兜底 */
-      }
+  /** @param {any} note @param {string} id */
+  async function runNote(note, id) {
+    if (!isFresh(note, Date.now())) {
+      // 只有 agent 侧判过期（单端）：用户昨晚留的言不该在早上开机时突然起一轮模型调用
+      writeReceipt(id, note, {
+        ok: false,
+        state: 'expired',
+        error: { code: 'expired', message: '这条留言已经过期，没有投递（当时那个会话大概没在运行）' },
+      })
+      return
+    }
+    if (note.kind === 'stop') {
+      await runStop(note, id)
       return
     }
 
+    const text = renderNoteText(note)
+    let accepted = true
     try {
-      // main 5s 就超时返回了；这里再执行只会「用户以为没发出去，其实插进去了」。
-      // 用 REPLY_WAIT_MS 而不是 CMD_TTL_MS：窗口必须和 UI 侧一致。
-      if (isExpired(command, Date.now(), REPLY_WAIT_MS)) {
-        writeCommandResult(buildResult(command, { ok: false, error: { code: 'expired', message: '命令已过期' } }, Date.now()))
-        return
+      const maybe = /** @type {any} */ (pi.sendUserMessage(text, { deliverAs: 'steer' }))
+      // sendUserMessage 在空闲时会一直挂到整轮结束，所以不 await：先记「已投」，
+      // 真出错再用同一份回执覆盖（原子写，main 读到的永远是最后一份）
+      if (maybe && typeof maybe.catch === 'function') {
+        maybe.catch((/** @type {unknown} */ error) => {
+          writeReceipt(id, note, {
+            ok: false,
+            state: 'failed',
+            error: { code: 'send_failed', message: error instanceof Error ? error.message : String(error) },
+          })
+        })
       }
-      /** @type {Record<string, unknown>} */
-      const params = { id: command.runId }
-      if (Number.isFinite(command.index)) params.index = command.index
-      if (command.action === 'steer') {
-        params.message = command.message
-        params.mode = command.mode || 'steer'
-      }
-      const reply = await request(command.action, params, COMMAND_TIMEOUT_MS)
-      writeCommandResult(buildResult(command, reply, Date.now()))
-      ctx.log(`command ${command.action} ${command.runId}: ${reply.ok ? 'accepted' : 'failed'}`)
-      // stop 的回执只是「受理」，真实终态要靠 status 收敛——立刻读一次，别等心跳
-      if (command.action === 'stop' && reply.ok) void readStatus('after-stop')
-      if (command.action === 'steer' && reply.ok) markDirty()
     } catch (error) {
-      ctx.log('command failed:', error instanceof Error ? error.message : error)
-    } finally {
-      try {
-        fs.rmSync(claimedFile, { force: true })
-      } catch {
-        /* 清不掉也没关系：claim 目录不参与逻辑 */
-      }
+      accepted = false
+      writeReceipt(id, note, {
+        ok: false,
+        state: 'failed',
+        error: { code: 'send_failed', message: error instanceof Error ? error.message : String(error) },
+      })
     }
+    if (accepted) writeReceipt(id, note, { ok: true, state: 'accepted' })
+    ctx.log(`note ${id} → ${accepted ? 'sent to main session' : 'failed'}`)
   }
 
-  /** @param {any} result */
-  function writeCommandResult(result) {
-    const file = path.join(resultRoot, `${result.id}.json`)
+  /** @param {any} note @param {string} id */
+  async function runStop(note, id) {
+    const runId = String(note.runId ?? '').trim()
+    if (!runId) {
+      writeReceipt(id, note, { ok: false, state: 'failed', error: { code: 'bad_request', message: '缺少 runId' } })
+      return
+    }
+    const reply = await request('stop', { id: runId }, STOP_TIMEOUT_MS)
+    writeReceipt(
+      id,
+      note,
+      reply.ok
+        ? { ok: true, state: 'stopping' }
+        : { ok: false, state: 'failed', error: reply.error ?? { code: 'failed', message: '扩展拒绝了停止请求' } },
+    )
+    // stop 的回执只是「受理」，真实终态要靠 status 收敛——立刻读一次，别等心跳
+    if (reply.ok) void readStatus('after-stop')
+    ctx.log(`stop ${runId}: ${reply.ok ? 'accepted' : 'failed'}`)
+  }
+
+  /**
+   * 回执由 agent 独占写（main 只读），所以两边没有写冲突，也不需要锁。
+   * 元数据（sessionKey / kind / runId）从 note 抄一份——main 读回执时靠 sessionKey 分会话、
+   * 靠 runId 匹配卡片，不必再回头读 note 文件。
+   * @param {string} id
+   * @param {any} note
+   * @param {Record<string, unknown>} payload
+   */
+  function writeReceipt(id, note, payload) {
     try {
+      fs.mkdirSync(receiptRoot, { recursive: true })
+      const file = path.join(receiptRoot, `${id}.json`)
       const tmp = `${file}.tmp`
-      fs.writeFileSync(tmp, JSON.stringify(result, null, 2))
+      const receipt = {
+        id,
+        at: Date.now(),
+        sessionKey: String(note?.sessionKey ?? ''),
+        kind: note?.kind === 'stop' ? 'stop' : 'note',
+        runId: String(note?.runId ?? ''),
+        ...payload,
+      }
+      fs.writeFileSync(tmp, JSON.stringify(receipt, null, 2))
       fs.renameSync(tmp, file)
     } catch (error) {
-      ctx.log('cmd result write failed:', error instanceof Error ? error.message : error)
+      ctx.log('receipt write failed:', error instanceof Error ? error.message : error)
     }
   }
 
@@ -513,7 +570,7 @@ export default function subagentsBoard(pi, ctx) {
   }
 
   void handshake('boot')
-  startCommands()
+  startNotes()
   // 兜底心跳：即使一次事件都没来过，也让 main 知道「这个实例还活着」
   restartHeartbeat(HEARTBEAT_PUSH_MS)
   flushNow()

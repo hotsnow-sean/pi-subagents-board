@@ -1,0 +1,726 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>subagents-board · 留言入口四方案原型</title>
+<style>
+  :root {
+    --bg: #0e1014;
+    --surface: #16191f;
+    --surface2: #1d212a;
+    --surface3: #232833;
+    --line: #2b313c;
+    --line2: #3a4150;
+    --text: #dfe3ea;
+    --muted: #8b93a3;
+    --dim: #6a7280;
+    --accent: #5b8cff;
+    --accent-soft: rgba(91,140,255,.14);
+    --ok: #3fb950;
+    --ok-soft: rgba(63,185,80,.14);
+    --bad: #f85149;
+    --bad-soft: rgba(248,81,73,.13);
+    --warn: #d29922;
+    --shadow: 0 18px 50px rgba(0,0,0,.45);
+  }
+  body[data-theme="light"] {
+    --bg: #eef0f4;
+    --surface: #ffffff;
+    --surface2: #f7f8fb;
+    --surface3: #eef1f6;
+    --line: #e1e5ec;
+    --line2: #cfd5df;
+    --text: #1b1f26;
+    --muted: #626b7a;
+    --dim: #8d95a3;
+    --accent: #2f6bf0;
+    --accent-soft: rgba(47,107,240,.1);
+    --ok: #1a7f37;
+    --ok-soft: rgba(26,127,55,.1);
+    --bad: #cf222e;
+    --bad-soft: rgba(207,34,46,.08);
+    --shadow: 0 14px 40px rgba(20,30,50,.14);
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 13px/1.55 -apple-system, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px;
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--line);
+    background: var(--surface);
+    position: sticky; top: 0; z-index: 20;
+  }
+  .brand { font-weight: 650; letter-spacing: .2px; }
+  .brand small { color: var(--muted); font-weight: 400; margin-left: 8px; }
+  nav.tabs { display: flex; gap: 4px; margin-left: 8px; flex-wrap: wrap; }
+  nav.tabs button {
+    background: transparent; color: var(--muted); border: 1px solid transparent;
+    padding: 6px 11px; border-radius: 7px; font-size: 12.5px; cursor: pointer;
+    font-family: inherit; transition: .15s;
+  }
+  nav.tabs button:hover { background: var(--surface3); color: var(--text); }
+  nav.tabs button.on { background: var(--accent-soft); color: var(--accent); border-color: color-mix(in srgb, var(--accent) 35%, transparent); }
+  .spacer { flex: 1; }
+  #theme {
+    background: var(--surface3); color: var(--muted); border: 1px solid var(--line);
+    border-radius: 7px; padding: 6px 10px; cursor: pointer; font-family: inherit; font-size: 12px;
+  }
+  #theme:hover { color: var(--text); }
+
+  main { display: grid; grid-template-columns: 440px minmax(320px, 1fr); gap: 28px; padding: 26px 24px 60px; align-items: start; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+
+  .stage { display: flex; flex-direction: column; align-items: center; gap: 10px; }
+  .stage-label { color: var(--dim); font-size: 11.5px; letter-spacing: .3px; }
+
+  /* ---------- 面板模拟器 ---------- */
+  .panel {
+    width: 420px; height: 720px; max-width: 100%;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    box-shadow: var(--shadow);
+    display: flex; flex-direction: column;
+    overflow: hidden; position: relative;
+  }
+  .panel-head {
+    display: flex; align-items: center; gap: 8px;
+    padding: 11px 13px; border-bottom: 1px solid var(--line);
+    font-size: 12.5px; color: var(--muted); flex: none;
+  }
+  .panel-head b { color: var(--text); font-weight: 600; }
+  .panel-head .count { margin-left: auto; color: var(--dim); font-size: 11.5px; }
+  .panel-body { flex: 1; overflow-y: auto; padding: 10px; scrollbar-width: thin; }
+  .panel-body::-webkit-scrollbar { width: 8px; }
+  .panel-body::-webkit-scrollbar-thumb { background: var(--line2); border-radius: 4px; }
+
+  /* ---------- 卡片 ---------- */
+  .card {
+    border: 1px solid var(--line); border-radius: 10px;
+    background: var(--surface2); padding: 11px 12px 10px;
+    margin-bottom: 8px; transition: border-color .15s;
+  }
+  body[data-plan="D"] .card { cursor: pointer; }
+  body[data-plan="D"] .card:hover { border-color: var(--line2); }
+  .card.live { border-color: color-mix(in srgb, var(--ok) 30%, var(--line)); }
+  .row1 { display: flex; align-items: center; gap: 7px; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dim); flex: none; }
+  .dot.running { background: var(--ok); box-shadow: 0 0 0 0 var(--ok); animation: pulse 2s infinite; }
+  .dot.failed { background: var(--bad); }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 55%, transparent); }
+    70% { box-shadow: 0 0 0 6px transparent; }
+    100% { box-shadow: 0 0 0 0 transparent; }
+  }
+  .agent { font-weight: 600; font-size: 12.8px; }
+  .state { font-size: 11px; color: var(--muted); }
+  .state.running { color: var(--ok); }
+  .state.failed { color: var(--bad); }
+  .timer { margin-left: auto; font-variant-numeric: tabular-nums; color: var(--dim); font-size: 11.5px; }
+  .summary {
+    margin: 7px 0 0; color: var(--muted); font-size: 12.2px;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .meta { margin-top: 6px; color: var(--dim); font-size: 11px; display: flex; gap: 10px; }
+  .acts { display: flex; gap: 6px; margin-top: 9px; }
+  .acts button {
+    background: transparent; border: 1px solid var(--line); color: var(--muted);
+    border-radius: 6px; padding: 4px 9px; font-size: 11.5px; cursor: pointer; font-family: inherit;
+    transition: .13s;
+  }
+  .acts button:hover { border-color: var(--line2); color: var(--text); background: var(--surface3); }
+  .acts button.primary { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 30%, var(--line)); }
+  .acts button.danger { color: var(--bad); }
+  .acts button.danger:hover { background: var(--bad-soft); border-color: color-mix(in srgb, var(--bad) 40%, var(--line)); }
+  .acts button.confirm { background: var(--bad-soft); color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, var(--line)); }
+  .acts button[disabled] { opacity: .5; cursor: default; }
+
+  /* 代际链 */
+  .gen { margin-top: 8px; border-top: 1px dashed var(--line); padding-top: 7px; }
+  .gen summary {
+    cursor: pointer; color: var(--dim); font-size: 11.2px; list-style: none;
+    display: flex; align-items: center; gap: 5px;
+  }
+  .gen summary::-webkit-details-marker { display: none; }
+  .gen summary::before { content: "▸"; font-size: 9px; transition: transform .15s; }
+  .gen[open] summary::before { transform: rotate(90deg); }
+  .gen-line { color: var(--muted); font-size: 11.2px; padding: 4px 0 0 12px; }
+
+  /* 回执 chip */
+  .chip {
+    display: inline-flex; align-items: center; gap: 5px;
+    margin-top: 8px; font-size: 11px; padding: 3px 8px; border-radius: 999px;
+    border: 1px solid var(--line); color: var(--muted);
+    animation: fade .2s ease-out;
+  }
+  .chip.sent { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 30%, transparent); background: var(--accent-soft); }
+  .chip.read { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 30%, transparent); background: var(--ok-soft); }
+  @keyframes fade { from { opacity: 0; transform: translateY(-2px); } to { opacity: 1; transform: none; } }
+
+  /* ---------- A：卡片内联撰写 ---------- */
+  .inline {
+    margin-top: 9px; border-top: 1px solid var(--line); padding-top: 9px;
+    animation: fade .16s ease-out;
+  }
+  .inline .hint { font-size: 11px; color: var(--dim); margin-bottom: 6px; }
+  .inline textarea, .dock textarea, .sheet textarea, .detail textarea {
+    width: 100%; background: var(--surface); color: var(--text);
+    border: 1px solid var(--line); border-radius: 7px; padding: 7px 9px;
+    font: inherit; font-size: 12.3px; resize: none; outline: none;
+    transition: border-color .15s;
+  }
+  .inline textarea:focus, .dock textarea:focus, .sheet textarea:focus, .detail textarea:focus {
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+  }
+  .compose-acts { display: flex; gap: 6px; justify-content: flex-end; margin-top: 7px; }
+  .compose-acts button {
+    border-radius: 6px; padding: 4px 11px; font-size: 11.5px; cursor: pointer; font-family: inherit;
+    border: 1px solid var(--line); background: transparent; color: var(--muted);
+  }
+  .compose-acts button.send { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .compose-acts button.send:hover { filter: brightness(1.08); }
+
+  /* ---------- B：底部常驻坞 ---------- */
+  .dock {
+    flex: none; border-top: 1px solid var(--line); background: var(--surface);
+    padding: 9px 10px 10px;
+  }
+  .dock .to {
+    display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--dim); margin-bottom: 6px;
+  }
+  .dock .to b { color: var(--muted); font-weight: 550; }
+  .dock-line { display: flex; gap: 7px; align-items: flex-end; }
+  .dock textarea { min-height: 34px; max-height: 96px; }
+  .circle {
+    width: 30px; height: 30px; flex: none; border-radius: 50%;
+    border: none; background: var(--accent); color: #fff; cursor: pointer;
+    font-size: 15px; line-height: 1; display: grid; place-items: center;
+    transition: .15s;
+  }
+  .circle:hover { filter: brightness(1.1); }
+  .circle:disabled { background: var(--surface3); color: var(--dim); cursor: default; }
+  .toast {
+    position: absolute; left: 10px; right: 10px; bottom: 84px;
+    background: var(--surface3); border: 1px solid var(--line); border-radius: 8px;
+    padding: 7px 10px; font-size: 11.5px; color: var(--muted);
+    display: flex; align-items: center; gap: 7px;
+    box-shadow: 0 8px 20px rgba(0,0,0,.2);
+    animation: fade .18s ease-out;
+  }
+  .toast.read { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 28%, var(--line)); }
+
+  /* ---------- C：半屏撰写层 ---------- */
+  .scrim {
+    position: absolute; inset: 0; background: rgba(0,0,0,.35);
+    opacity: 0; pointer-events: none; transition: opacity .2s; z-index: 5;
+  }
+  .scrim.on { opacity: 1; pointer-events: auto; }
+  .sheet {
+    position: absolute; left: 0; right: 0; bottom: 0; z-index: 6;
+    background: var(--surface); border-top: 1px solid var(--line2);
+    border-radius: 14px 14px 0 0; padding: 12px 13px 14px;
+    transform: translateY(102%); transition: transform .24s cubic-bezier(.2,.8,.2,1);
+    box-shadow: 0 -12px 32px rgba(0,0,0,.3);
+  }
+  .sheet.on { transform: none; }
+  .sheet-handle { width: 34px; height: 3px; border-radius: 2px; background: var(--line2); margin: 0 auto 10px; }
+  .sheet .target {
+    display: flex; align-items: center; gap: 7px; font-size: 11.5px; color: var(--muted); margin-bottom: 8px;
+  }
+  .sheet .target .who { color: var(--text); font-weight: 600; }
+  .sheet textarea { min-height: 76px; }
+  .sheet-foot { display: flex; gap: 8px; justify-content: flex-end; margin-top: 9px; }
+
+  /* ---------- D：焦点切换 ---------- */
+  .detail { display: flex; flex-direction: column; height: 100%; }
+  .detail-bar {
+    flex: none; display: flex; align-items: center; gap: 8px;
+    padding: 9px 12px; border-bottom: 1px solid var(--line);
+    background: var(--surface); position: sticky; top: 0; z-index: 2;
+  }
+  .detail-bar button {
+    background: transparent; border: none; color: var(--accent); cursor: pointer;
+    font-family: inherit; font-size: 12px; padding: 3px 6px; border-radius: 5px;
+  }
+  .detail-bar button:hover { background: var(--accent-soft); }
+  .detail-bar .who { margin-left: auto; color: var(--dim); font-size: 11.5px; }
+  .stream { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 9px; }
+  .msg { max-width: 88%; font-size: 12.2px; line-height: 1.5; padding: 7px 10px; border-radius: 9px; }
+  .msg.u { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 3px; }
+  .msg.a { align-self: flex-start; background: var(--surface2); border: 1px solid var(--line); border-bottom-left-radius: 3px; }
+  .msg.sys { align-self: center; color: var(--dim); font-size: 11px; background: transparent; }
+  .detail-dock { flex: none; border-top: 1px solid var(--line); padding: 9px 10px 10px; }
+  .detail-dock .hint { font-size: 11px; color: var(--dim); margin-bottom: 6px; display: flex; gap: 5px; align-items: center; }
+
+  /* ---------- 说明 ---------- */
+  aside {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 12px;
+    padding: 18px 20px; max-width: 620px;
+  }
+  aside h1 { font-size: 15px; margin: 0 0 4px; font-weight: 650; }
+  aside .sub { color: var(--dim); font-size: 11.5px; margin-bottom: 16px; }
+  aside h2 { font-size: 12px; margin: 16px 0 6px; color: var(--muted); font-weight: 600; letter-spacing: .4px; text-transform: uppercase; }
+  aside p { margin: 0 0 8px; color: var(--muted); font-size: 12.4px; }
+  aside ul { margin: 0 0 8px; padding-left: 17px; color: var(--muted); font-size: 12.4px; }
+  aside li { margin-bottom: 3px; }
+  aside code { background: var(--surface3); padding: 1px 5px; border-radius: 4px; font-size: 11.4px; color: var(--text); }
+  .kbd { border: 1px solid var(--line2); border-bottom-width: 2px; border-radius: 4px; padding: 0 5px; font-size: 11px; color: var(--text); background: var(--surface2); }
+  .verdict { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  .tag { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--dim); }
+  .tag.good { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 30%, var(--line)); }
+  .tag.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 30%, var(--line)); }
+  .criteria { margin-top: 22px; border-top: 1px solid var(--line); padding-top: 14px; }
+  .criteria ol { margin: 0; padding-left: 18px; color: var(--muted); font-size: 12.3px; }
+  .criteria li { margin-bottom: 6px; }
+  .criteria b { color: var(--text); font-weight: 600; }
+</style>
+</head>
+<body data-plan="A" data-theme="dark">
+
+<header>
+  <div class="brand">subagents-board<small>留言入口 · 四方案原型</small></div>
+  <nav class="tabs" id="tabs">
+    <button data-plan="A" class="on">A 卡片内联</button>
+    <button data-plan="B">B 底部常驻</button>
+    <button data-plan="C">C 半屏撰写</button>
+    <button data-plan="D">D 焦点切换</button>
+  </nav>
+  <div class="spacer"></div>
+  <button id="theme">切换主题</button>
+</header>
+
+<main>
+  <div class="stage">
+    <div class="stage-label">右栏面板 · 420px</div>
+    <div class="panel" id="panel">
+      <div class="panel-head">
+        <b>子代理</b>
+        <span>· 本会话</span>
+        <span class="count" id="count">3 个运行记录</span>
+      </div>
+      <div class="panel-body" id="body"></div>
+      <div id="overlay"></div>
+    </div>
+    <div class="stage-label" style="color:var(--dim)">数据为假，交互是真的：点「留言」写一句、点「停止」看二次确认</div>
+  </div>
+
+  <aside id="notes"></aside>
+</main>
+
+<script>
+/* ============================================================
+   假数据 —— 仿真实 lineage：一张 running（有代际链）、一张 completed、一张 failed
+   ============================================================ */
+const RUNS = [
+  {
+    id: '7f3a',
+    agent: 'reviewer',
+    state: 'running',
+    elapsed: 192,
+    summary: '正在检查 packages/shared/plugin-context.ts 的类型收窄，已定位 2 处可疑分支',
+    meta: ['3 个子代理', '18.4k tokens'],
+    gens: [{ n: 1, state: 'completed', dur: '1:04', note: 'API 兼容性扫描' }]
+  },
+  {
+    id: '2b91',
+    agent: 'impl',
+    state: 'completed',
+    elapsed: 64,
+    summary: '把 activate 拆成「终态绑定 / 运行中预览」两路，测试 8 例全绿',
+    meta: ['1 个子代理', '9.1k tokens']
+  },
+  {
+    id: '9c02',
+    agent: 'research',
+    state: 'failed',
+    elapsed: 37,
+    summary: '拉取 dsh-agent-teams 的 mailbox 实现失败：远端返回 404',
+    meta: ['1 个子代理', '3.2k tokens']
+  }
+];
+
+const state = {
+  plan: 'A',
+  openFor: null,       // A / C 展开的卡片
+  detailFor: null,     // D 进入的详情
+  receipts: {},        // runId -> 'sent' | 'read'
+  stopping: {},        // runId -> true（二次确认中）
+  stopped: {},         // runId -> true
+  dockText: '',
+  composeText: '',
+  toast: null
+};
+
+const $ = (s) => document.querySelector(s);
+const fmt = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+
+/* ============================================================
+   渲染
+   ============================================================ */
+function chipHTML(id) {
+  const r = state.receipts[id];
+  if (!r) return '';
+  if (r === 'sent') return `<div class="chip sent">↑ 已发送 · 等待主代理读取</div>`;
+  return `<div class="chip read">✓ 主代理已读</div>`;
+}
+
+function cardHTML(run) {
+  const stopped = state.stopped[run.id];
+  const live = run.state === 'running' && !stopped;
+  const stateText = stopped ? '已停止' : ({ running: '运行中', completed: '已完成', failed: '失败' })[run.state];
+  const stateCls = stopped ? '' : run.state;
+
+  const stopBtn = run.state !== 'running' ? '' : stopped ? '' : state.stopping[run.id]
+    ? `<button class="confirm" data-act="stop-confirm" data-id="${run.id}">确认停止？</button>`
+    : `<button class="danger" data-act="stop" data-id="${run.id}">停止</button>`;
+
+  const noteBtn = (state.plan === 'B' || state.plan === 'D') ? ''
+    : `<button class="primary" data-act="note" data-id="${run.id}">留言</button>`;
+
+  const inline = (state.plan === 'A' && state.openFor === run.id) ? `
+    <div class="inline">
+      <div class="hint">这条会作为用户消息发给<b>主代理</b>，由它决定是否转达给 ${run.agent}</div>
+      <textarea rows="3" data-compose="${run.id}" placeholder="例如：日志级别改成 debug 再跑一次"></textarea>
+      <div class="compose-acts">
+        <button data-act="cancel" data-id="${run.id}">取消</button>
+        <button class="send" data-act="send" data-id="${run.id}">发送</button>
+      </div>
+    </div>` : '';
+
+  const gen = run.gens ? `
+    <details class="gen">
+      <summary>第 2 段 · ${live ? '运行中' : '已结束'} <span style="color:var(--dim)">（前 1 段已折叠）</span></summary>
+      ${run.gens.map(g => `<div class="gen-line">第 ${g.n} 段 · ${g.state === 'completed' ? '已完成' : g.state} · ${g.dur} · ${g.note}</div>`).join('')}
+    </details>` : '';
+
+  return `
+  <article class="card ${live ? 'live' : ''}" data-card="${run.id}">
+    <div class="row1">
+      <span class="dot ${live ? 'running' : (stopped ? '' : run.state)}"></span>
+      <span class="agent">${run.agent}</span>
+      <span class="state ${stateCls}">${stateText}</span>
+      <span class="timer" data-timer="${run.id}">${fmt(run.elapsed)}</span>
+    </div>
+    <p class="summary">${run.summary}</p>
+    <div class="meta">${run.meta.map(m => `<span>${m}</span>`).join('')}</div>
+    <div class="acts">
+      ${noteBtn}
+      <button data-act="open" data-id="${run.id}">打开</button>
+      ${stopBtn}
+    </div>
+    ${inline}
+    ${chipHTML(run.id)}
+    ${gen}
+  </article>`;
+}
+
+function detailHTML(run) {
+  return `
+  <div class="detail">
+    <div class="detail-bar">
+      <button data-act="back">← 全部子代理</button>
+      <span class="who">${run.agent} · run-${run.id}</span>
+    </div>
+    <div class="stream">
+      <div class="msg sys">子代理会话 · 只读</div>
+      <div class="msg u">${run.summary}</div>
+      ${run.state === 'failed'
+        ? '<div class="msg a">拉取失败：远端返回 404，我停在这里不再重试。</div>'
+        : '<div class="msg a">我先扫一遍所有调用点，确认判别式有没有漏。</div><div class="msg a">发现 2 处：注入处、回落分支。</div>'}
+      <div class="msg sys">${run.meta[0] || ''}</div>
+    </div>
+    <div class="detail-dock">
+      <div class="hint">↑ 发给<b style="color:var(--text)">主代理</b>，附带当前 run 上下文</div>
+      <div class="dock-line">
+        <textarea rows="2" data-compose="detail" placeholder="就这个 run 说一句…"></textarea>
+        <button class="circle" data-act="send-detail" title="发送">↑</button>
+      </div>
+      ${state.receipts[run.id] ? `<div style="margin-top:7px">${chipHTML(run.id)}</div>` : ''}
+    </div>
+  </div>`;
+}
+
+function render() {
+  const body = $('#body');
+  const overlay = $('#overlay');
+  const run = RUNS.find(r => r.id === state.detailFor);
+
+  if (run) {
+    body.innerHTML = detailHTML(run);
+    body.style.padding = '0';
+    overlay.innerHTML = '';
+    $('#count').textContent = '详情';
+  } else {
+    body.style.padding = '10px';
+    body.innerHTML = RUNS.map(cardHTML).join('');
+    $('#count').textContent = '3 个运行记录';
+
+    // B：底部常驻坞
+    if (state.plan === 'B') {
+      overlay.innerHTML = `
+        ${state.toast ? `<div class="toast ${state.toast.read ? 'read' : ''}">${state.toast.text}</div>` : ''}
+        <div class="dock">
+          <div class="to" style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--dim);margin-bottom:6px">
+            发给 <b style="color:var(--muted)">主代理</b>
+            <span style="margin-left:auto;color:var(--dim)">不指定子代理</span>
+          </div>
+          <div class="dock-line">
+            <textarea rows="1" data-compose="dock" placeholder="说一句…（Enter 发送 / Shift+Enter 换行）">${state.dockText}</textarea>
+            <button class="circle" data-act="send-dock" title="发送">↑</button>
+          </div>
+        </div>`;
+    } else {
+      overlay.innerHTML = '';
+    }
+  }
+  if (state.plan === 'C' && !state.detailFor) renderSheet();
+  renderNotes();
+  restoreFocus();
+}
+
+function restoreFocus() {
+  const sel = state.detailFor ? '[data-compose="detail"]'
+    : state.plan === 'A' && state.openFor ? `[data-compose="${state.openFor}"]`
+    : state.plan === 'B' ? '[data-compose="dock"]'
+    : state.plan === 'C' && state.openFor ? '[data-compose="sheet"]'
+    : null;
+  if (!sel) return;
+  const t = document.querySelector(sel);
+  if (t) t.focus();
+}
+
+/* ============================================================
+   C 方案的半屏层（独立于 render，避免动画被重建打断）
+   ============================================================ */
+function renderSheet() {
+  if (state.plan !== 'C') { $('#overlay').innerHTML = ''; return; }
+  const run = RUNS.find(r => r.id === state.openFor);
+  $('#overlay').innerHTML = `
+    <div class="scrim ${run ? 'on' : ''}" data-act="close-sheet"></div>
+    <div class="sheet ${run ? 'on' : ''}">
+      <div class="sheet-handle"></div>
+      <div class="target">
+        发给 <span class="who">主代理</span>
+        ${run ? `<span>· 关于 ${run.agent} · run-${run.id}</span>` : ''}
+      </div>
+      <textarea rows="4" data-compose="sheet" placeholder="这条会先到主代理，由它决定怎么处理"></textarea>
+      <div class="sheet-foot">
+        <button style="background:transparent;border:1px solid var(--line);color:var(--muted);border-radius:7px;padding:5px 13px;font:inherit;font-size:11.5px;cursor:pointer" data-act="close-sheet">取消</button>
+        <button style="background:var(--accent);border:none;color:#fff;border-radius:7px;padding:5px 14px;font:inherit;font-size:11.5px;cursor:pointer" data-act="send-sheet">发送</button>
+      </div>
+    </div>`;
+  const t = document.querySelector('[data-compose="sheet"]');
+  if (t && run) t.focus();
+}
+
+/* ============================================================
+   说明文案
+   ============================================================ */
+const NOTES = {
+  A: {
+    title: 'A · 卡片内联',
+    sub: '点卡片上的「留言」，就地展开撰写区，提交后收起并留一条回执',
+    from: '就近操作原则；与「停止」「打开」并列，操作对象天然明确',
+    good: ['目标明确：留言就长在那张卡上，不需要额外说明「发给谁」', '零常驻占位：没有坞、没有浮条，U1/U4 那种「内容被顶下去」不会发生', '一次只写一条，误触成本低'],
+    bad: ['展开时这张卡会变高，下方卡片位移（局部，但仍是一次跳动）', '如果同时想给两个 run 留言，要来回展开、收起', '卡片本身会更长，信息密度上升'],
+    watch: '展开时输入框拿到焦点；此时如果面板每秒重绘整块 DOM，焦点会丢——这是现在真实的 bug，原型里用局部更新规避了。'
+  },
+  B: {
+    title: 'B · 底部常驻坞',
+    sub: '固定底部输入条，永远是「发给主代理」，卡片上只有「打开 / 停止」',
+    from: '主输入框形态；也是我们 P2-c 现在这一版的做法',
+    good: ['形态最像主输入框，Enter 发送的心智最统一', '可以连着说几句，不用反复展开', '卡片更短、更干净'],
+    bad: ['常驻占位：P2-c 的 U4「绿条顶内容」正是从这里来的', '目标不明确：坞不绑定某张卡，要用文字自己说清「关于谁」', '容易再次滑向「坞里也放停止」——一放就回到老问题'],
+    watch: '把坞的高度变化（1 行 → 3 行）也当成一次位置突变来看：它同样会推动上方内容。'
+  },
+  C: {
+    title: 'C · 半屏撰写层',
+    sub: '点「留言」从底部滑出撰写层，遮住下半部分，提交后滑下',
+    from: '移动端 composer / 抽屉式输入',
+    good: ['撰写时有足够空间，长文本舒服', '目标明确，层上直接写着「关于 reviewer · run-7f3a」', '不改变卡片本身的高度，列表不跳动'],
+    bad: ['遮挡内容：写字时看不到其它 run 的状态', '多一次进出（点开、写完、关掉）', '半屏层在窄面板里容易显得重'],
+    watch: '滑出动画的时长要压到 200ms 上下，否则每次留言都有「等一下」的感觉。'
+  },
+  D: {
+    title: 'D · 焦点切换',
+    sub: '点卡片进入该 run 的详情，底部输入框发给主代理；顶部返回条固定',
+    from: 'Claude Code 的 agent panel：选人 → 进入该 agent 的 transcript',
+    good: ['返回条固定在顶部，不参与滚动——直接治 U1「按钮顶内容」', '天然有「当前在看谁」的上下文，底部输入框不歧义', '详情页可以放会话流，等于把「打开会话」和「留言」合成一个动作'],
+    bad: ['面板从「列表」变成「详情」，失去全局视野，要来回切', '一次只能看一个 run，运行中的其它 run 只能看到点提示', '实现最重：要维护列表/详情两套渲染'],
+    watch: '这是唯一一个「切换上下文」的方案。注意返回时列表滚动位置要不要恢复。'
+  }
+};
+
+function renderNotes() {
+  const n = NOTES[state.plan];
+  $('#notes').innerHTML = `
+    <h1>${n.title}</h1>
+    <div class="sub">${n.sub}</div>
+
+    <h2>参照来源</h2>
+    <p>${n.from}</p>
+
+    <h2>好在哪</h2>
+    <ul>${n.good.map(g => `<li>${g}</li>`).join('')}</ul>
+
+    <h2>代价</h2>
+    <ul>${n.bad.map(b => `<li>${b}</li>`).join('')}</ul>
+
+    <h2>看的时候留意</h2>
+    <p>${n.watch}</p>
+
+    <div class="verdict">
+      <span class="tag">位置突变 ${state.plan === 'A' ? '局部' : state.plan === 'C' ? '无' : state.plan === 'D' ? '无' : '有'}</span>
+      <span class="tag">目标明确 ${state.plan === 'B' ? '弱' : '强'}</span>
+      <span class="tag">常驻占位 ${state.plan === 'B' ? '有' : '无'}</span>
+    </div>
+
+    <div class="criteria">
+      <h2 style="margin-top:0">四个方案共用的不变量</h2>
+      <ol>
+        <li><b>停止不在输入区</b>：它是按钮，就地二次确认，<b>3 秒不点自动回退</b>。</li>
+        <li><b>回执必须显式</b>：发送 → 「等待主代理读取」→「主代理已读」，因为留言可能触发一轮模型调用。</li>
+        <li><b>卡片信息分层</b>：卡面只留 agent · 状态 · 计时 · 一条摘要；代际链折叠成一行。</li>
+        <li><b>不整块重绘</b>：计时器只更新自己那个数字，输入框不会丢焦点。</li>
+      </ol>
+    </div>`;
+}
+
+/* ============================================================
+   交互
+   ============================================================ */
+function submit(text, runId) {
+  if (!text.trim()) return;
+  if (runId) {
+    state.receipts[runId] = 'sent';
+    render();
+    setTimeout(() => { state.receipts[runId] = 'read'; render(); }, 1500);
+    setTimeout(() => { delete state.receipts[runId]; render(); }, 6000);
+  } else {
+    state.toast = { text: '↑ 已发送 · 等待主代理读取', read: false };
+    render();
+    setTimeout(() => { state.toast = { text: '✓ 主代理已读', read: true }; render(); }, 1500);
+    setTimeout(() => { state.toast = null; render(); }, 5000);
+  }
+}
+
+document.addEventListener('click', (e) => {
+  const el = e.target.closest('[data-act]') || e.target.closest('#tabs [data-plan]');
+  if (!el) {
+    // D 方案：点卡片空白处也能进详情
+    if (state.plan === 'D') {
+      const card = e.target.closest('[data-card]');
+      if (card) { state.detailFor = card.dataset.card; render(); }
+    }
+    return;
+  }
+
+  if (el.dataset.plan) {
+    state.plan = el.dataset.plan;
+    state.openFor = null;
+    state.detailFor = null;
+    state.toast = null;
+    document.body.dataset.plan = state.plan;
+    document.querySelectorAll('#tabs button').forEach(b => b.classList.toggle('on', b.dataset.plan === state.plan));
+    render();
+    return;
+  }
+
+  const act = el.dataset.act;
+  const id = el.dataset.id;
+
+  if (act === 'note') {
+    if (state.plan === 'C') { state.openFor = id; renderSheet(); }
+    else { state.openFor = state.openFor === id ? null : id; render(); }
+  }
+
+  if (act === 'cancel') { state.openFor = null; render(); }
+
+  if (act === 'send') {
+    const t = document.querySelector(`[data-compose="${id}"]`);
+    if (t) submit(t.value, id);
+    state.openFor = null;
+  }
+
+  if (act === 'send-sheet') {
+    const t = document.querySelector('[data-compose="sheet"]');
+    const rid = state.openFor;
+    if (t && t.value.trim()) {
+      state.openFor = null;
+      renderSheet();
+      submit(t.value, rid);
+    }
+  }
+
+  if (act === 'close-sheet') { state.openFor = null; renderSheet(); }
+
+  if (act === 'send-dock') {
+    const t = document.querySelector('[data-compose="dock"]');
+    if (t) submit(t.value, null);
+    state.dockText = '';
+  }
+
+  if (act === 'send-detail') {
+    const t = document.querySelector('[data-compose="detail"]');
+    if (t) submit(t.value, state.detailFor);
+  }
+
+  if (act === 'open') { state.detailFor = id; render(); }
+
+  if (act === 'back') { state.detailFor = null; render(); }
+
+  if (act === 'stop') {
+    state.stopping[id] = true; render();
+    setTimeout(() => { if (state.stopping[id]) { state.stopping[id] = false; render(); } }, 3000);
+  }
+
+  if (act === 'stop-confirm') {
+    state.stopping[id] = false; state.stopped[id] = true; render();
+  }
+});
+
+/* Enter 发送（Shift+Enter 换行） */
+document.addEventListener('input', (e) => {
+  const t = e.target.closest('[data-compose="dock"]');
+  if (t) state.dockText = t.value;
+});
+
+document.addEventListener('keydown', (e) => {
+  const t = e.target.closest('[data-compose]');
+  if (!t) return;
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    const key = t.dataset.compose;
+    if (key === 'dock') { submit(t.value, null); state.dockText = ''; }
+    else if (key === 'sheet') { const rid = state.openFor; state.openFor = null; renderSheet(); submit(t.value, rid); }
+    else if (key === 'detail') { submit(t.value, state.detailFor); }
+    else { submit(t.value, key); state.openFor = null; }
+  }
+});
+
+/* 主题 */
+document.getElementById('theme').addEventListener('click', () => {
+  const b = document.body;
+  b.dataset.theme = b.dataset.theme === 'dark' ? 'light' : 'dark';
+});
+
+/* 计时器：只改数字，绝不重绘（这是给真实实现的示范） */
+setInterval(() => {
+  const run = RUNS.find(r => r.state === 'running' && !state.stopped[r.id]);
+  if (!run) return;
+  run.elapsed += 1;
+  document.querySelectorAll(`[data-timer="${run.id}"]`).forEach(el => { el.textContent = fmt(run.elapsed); });
+}, 1000);
+
+render();
+</script>
+</body>
+</html>

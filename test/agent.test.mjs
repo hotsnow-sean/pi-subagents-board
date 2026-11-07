@@ -6,7 +6,6 @@ import test from 'node:test'
 import { pathToFileURL } from 'node:url'
 
 import { readLiveFiles } from '../lib/live-store.mjs'
-import { commandFileName } from '../lib/cmd-queue.mjs'
 import { sessionKeyOf } from '../lib/session-key.mjs'
 
 const entry = pathToFileURL(path.join(import.meta.dirname, '..', 'agent.mjs')).href
@@ -17,6 +16,9 @@ function fakePi() {
   const listeners = new Map()
   /** @type {Map<string, Function>} */
   const hooks = new Map()
+  /** 投出去的留言。真实实现在空闲时会挂到整轮结束，这里立即 resolve 就够 */
+  /** @type {{ content: string, options: any }[]} */
+  const sent = []
   const pi = {
     events: {
       on(name, cb) {
@@ -30,9 +32,14 @@ function fakePi() {
     on(name, cb) {
       hooks.set(name, cb)
     },
+    sendUserMessage(content, options) {
+      sent.push({ content, options })
+      return Promise.resolve()
+    },
   }
   return {
     pi,
+    sent,
     hook(name) {
       return hooks.get(name)
     },
@@ -214,71 +221,100 @@ test('agent: 没有 pi-subagents 回包时记为未连接并持续重试', async
   assert.ok(state.source.handshake.lastError)
 })
 
-test('agent: 认领本会话的 steer 命令，调 RPC 并把回执（queued）写回去', async () => {
-  const { dataDir, server } = await boot()
-  await sleep(500)
+/** 写一条留言到本会话的收件箱（模拟 main 侧的投递） */
+function postNoteFile(dataDir, body) {
   const key = sessionKeyOf('C:/sessions/parent.jsonl')
-  const cmdDir = path.join(dataDir, 'cmd')
-  fs.mkdirSync(cmdDir, { recursive: true })
-  const command = {
-    action: 'steer',
+  const dir = path.join(dataDir, 'inbox', key)
+  fs.mkdirSync(dir, { recursive: true })
+  const note = { sessionKey: key, createdAt: Date.now(), ...body }
+  const file = path.join(dir, `${note.id}.json`)
+  fs.writeFileSync(file, JSON.stringify(note))
+  return { key, file }
+}
+
+function readReceipt(dataDir, id) {
+  const file = path.join(dataDir, 'receipts', `${id}.json`)
+  return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : null
+}
+
+test('agent: 扫到留言就投给本会话（sendUserMessage + steer），并把回执写回去', async () => {
+  const { dataDir, harness } = await boot()
+  await sleep(500)
+  const { key } = postNoteFile(dataDir, {
+    id: 'n1',
+    kind: 'note',
     runId: 'run-1',
-    sessionKey: key,
+    agent: 'code-reviewer',
     message: '换个方向',
-    mode: 'follow_up',
-    createdAt: Date.now(),
-    id: 'cmd-1',
-  }
-  const name = commandFileName(key, command.id)
-  fs.writeFileSync(path.join(cmdDir, name), JSON.stringify(command))
+  })
+  assert.equal(await waitFor(() => readReceipt(dataDir, 'n1') !== null), true, '500ms 内该被扫到并投出去')
 
-  const resultFile = path.join(dataDir, 'cmd-result', 'cmd-1.json')
-  assert.equal(await waitFor(() => fs.existsSync(resultFile)), true, '500ms 内该被扫到并执行')
+  const receipt = readReceipt(dataDir, 'n1')
+  assert.equal(receipt.ok, true)
+  assert.equal(receipt.state, 'accepted')
+  assert.equal(receipt.runId, 'run-1', '回执要带 runId，UI 靠它匹配卡片')
+  assert.equal(receipt.sessionKey, key)
 
-  const result = JSON.parse(fs.readFileSync(resultFile, 'utf8'))
-  assert.equal(result.ok, true)
-  assert.equal(result.receipt.deliveryStatus, 'queued', 'queued 要原样保留，不能合并成「已发送」')
-  assert.equal(result.runId, 'run-1')
-
-  const sent = server.commands.at(-1)
-  assert.equal(sent.method, 'steer')
-  assert.deepEqual(sent.params, { id: 'run-1', message: '换个方向', mode: 'follow_up' })
-  // 认领过的命令必须从 cmd/ 消失，否则下次启动会被再执行一遍
-  assert.equal(fs.existsSync(path.join(cmdDir, name)), false)
+  const sent = harness.sent.at(-1)
+  assert.ok(sent, '要真的投出去')
+  assert.match(sent.content, /换个方向/)
+  assert.match(sent.content, /code-reviewer/, '文本要带上是哪个子代理，否则主会话看不懂在说什么')
+  // deliverAs 固定传 steer：prompt() 只在 isStreaming 分支读它，空闲时直接忽略 → 一种写法覆盖两种状态
+  assert.equal(sent.options.deliverAs, 'steer')
 })
 
-test('agent: stop 命令回执是 stopping，并立刻拉一次 status（不等心跳）', async () => {
+test('agent: stop 走扩展的 stop RPC，回执是 stopping，并立刻拉一次 status（不等心跳）', async () => {
   const { dataDir, server } = await boot()
   await sleep(500)
-  const key = sessionKeyOf('C:/sessions/parent.jsonl')
-  const cmdDir = path.join(dataDir, 'cmd')
-  fs.mkdirSync(cmdDir, { recursive: true })
-  fs.writeFileSync(
-    path.join(cmdDir, commandFileName(key, 'cmd-stop')),
-    JSON.stringify({ action: 'stop', runId: 'run-2', sessionKey: key, createdAt: Date.now(), id: 'cmd-stop' }),
-  )
-  const resultFile = path.join(dataDir, 'cmd-result', 'cmd-stop.json')
-  assert.equal(await waitFor(() => fs.existsSync(resultFile)), true)
-  const result = JSON.parse(fs.readFileSync(resultFile, 'utf8'))
-  assert.equal(result.receipt.state, 'stopping', '受理 ≠ 已终止，UI 要靠 state 收敛')
+  postNoteFile(dataDir, { id: 's1', kind: 'stop', runId: 'run-2' })
+  assert.equal(await waitFor(() => readReceipt(dataDir, 's1') !== null), true)
+  const receipt = readReceipt(dataDir, 's1')
+  assert.equal(receipt.state, 'stopping', '受理 ≠ 已终止，UI 要靠 state 收敛')
   assert.equal(server.commands.at(-1).method, 'stop')
+  assert.deepEqual(server.commands.at(-1).params, { id: 'run-2' })
+  assert.equal(receipt.kind, 'stop')
 })
 
-test('agent: 别的会话的命令不认领（多会话共用一个命令目录，靠文件名前缀分流）', async () => {
-  const { dataDir, server } = await boot()
+test('agent: 过期的留言不投，只记一条 expired（隔夜的留言不该在开机时突然起一轮）', async () => {
+  const { dataDir, harness } = await boot()
   await sleep(500)
-  const cmdDir = path.join(dataDir, 'cmd')
-  fs.mkdirSync(cmdDir, { recursive: true })
-  const foreign = commandFileName('ffffffffffff', 'cmd-2')
-  fs.writeFileSync(
-    path.join(cmdDir, foreign),
-    JSON.stringify({ action: 'stop', runId: 'run-9', sessionKey: 'ffffffffffff', createdAt: Date.now(), id: 'cmd-2' }),
-  )
-  await sleep(1_200)
-  assert.equal(fs.existsSync(path.join(cmdDir, foreign)), true, '不属于自己的命令要留着，别顺手删掉')
-  assert.equal(server.commands.length, 0)
+  postNoteFile(dataDir, {
+    id: 'old1',
+    kind: 'note',
+    message: '昨天的想法',
+    createdAt: Date.now() - 11 * 60 * 1000,
+  })
+  assert.equal(await waitFor(() => readReceipt(dataDir, 'old1') !== null), true)
+  const receipt = readReceipt(dataDir, 'old1')
+  assert.equal(receipt.ok, false)
+  assert.equal(receipt.state, 'expired')
+  assert.equal(harness.sent.length, 0, '过期就一个字都不能投')
 })
 
+test('agent: 已有回执的留言不重复投（换代/重启后幂等），别的会话的目录不碰', async () => {
+  const { dataDir, harness, server } = await boot()
+  await sleep(500)
+  const { file } = postNoteFile(dataDir, { id: 'dup1', kind: 'note', message: '只投一次' })
+  fs.mkdirSync(path.join(dataDir, 'receipts'), { recursive: true })
+  fs.writeFileSync(
+    path.join(dataDir, 'receipts', 'dup1.json'),
+    JSON.stringify({ id: 'dup1', ok: true, state: 'accepted' }),
+  )
+
+  // 另一个会话的收件箱：本会话不该读，更不该执行
+  const foreignDir = path.join(dataDir, 'inbox', 'ffffffffffff')
+  fs.mkdirSync(foreignDir, { recursive: true })
+  fs.writeFileSync(
+    path.join(foreignDir, 'x1.json'),
+    JSON.stringify({ id: 'x1', kind: 'stop', sessionKey: 'ffffffffffff', runId: 'run-9', createdAt: Date.now() }),
+  )
+
+  await sleep(1_200)
+  assert.equal(harness.sent.length, 0, '有回执就别再投')
+  assert.equal(server.commands.length, 0, '别的会话的 stop 不能被执行')
+  assert.equal(fs.existsSync(file), true, '留言不可变，投完也不删（幂等靠回执判断）')
+  assert.equal(fs.existsSync(path.join(foreignDir, 'x1.json')), true)
+})
 test('agent: 没有 pi.events 时立刻落一份说明原因的状态', async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-agent-'))
   const { default: factory } = await import(entry)

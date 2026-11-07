@@ -3,18 +3,20 @@
 /**
  * subagents-board — main 侧服务（入口）。
  *
- * P2-a 阶段只做**数据打通**：把 agent.mjs 落盘的 live 状态读出来，附带一份
- * 「这份数据能不能信」的判定，交给面板。不做 steer/stop（P2-c），不发信箱。
+ * 两件事：把 agent.mjs 落盘的 live 状态读出来，附带一份「这份数据能不能信」的判定，
+ * 交给面板；以及把面板的留言**投给主会话**（不投给子代理——那是扩展自己的事）。
  *
  * 契约：
  *   invoke('getState', { sessionFile }) →
- *     { ok, sessionFile, sessionKey, ownerSessionKey, liveness, degrade, source, lineages, activeCount, now }
+ *     { ok, sessionFile, sessionKey, ownerSessionKey, liveness, degrade, source, lineages,
+ *       activeCount, mail, now }
  *   invoke('getDiagnostics', { sessionFile }) → 原始 live 状态（面板的「诊断」折叠区用）
  *   invoke('openSession', { sessionFile }) → { ok }（宿主 activate：主会话可写、子会话预览）
- *   invoke('steer', { sessionKey, runId, index?, message, mode? }) → { ok, receipt, error }
- *   invoke('stop', { sessionKey, runId, index? }) → { ok, receipt, error }
- *     （steer/stop 走文件命令队列：写 cmd/ → worker 里的 agent 认领执行 → 写 cmd-result/，
- *       main 等 5s。详见 lib/cmd-queue.mjs）
+ *   invoke('note', { sessionKey, runId?, agent?, message }) → { ok, id, expiresAt }
+ *   invoke('stop', { sessionKey, runId }) → { ok, id, expiresAt }
+ *     （两种写入都是「一消息一文件」写进 inbox/<sessionKey>/，**不等回执**；
+ *       worker 里的 agent 扫到后调 SDK / 扩展，把结果写进 receipts/<id>.json，
+ *       面板从 getState().mail 读。详见 lib/note-queue.mjs）
  *
  * ── 多文件结构与热重载 ─────────────────────────────────────────────────────
  *
@@ -35,7 +37,7 @@ const { normalizeSessionPath, sessionKeyOf } = await imp('session-key')
 const { listLineages, activeCount } = await imp('lineage')
 const { describeDegrade } = await imp('degrade')
 const { buildInboxItem, pruneLedger, seedLedger, selectNewCompletions } = await imp('inbox-watch')
-const { CMD_DIR, CLAIM_DIR, RESULT_DIR, REPLY_WAIT_MS, buildCommand, commandFileName } = await imp('cmd-queue')
+const { INBOX_DIR, NOTE_TTL_MS, RECEIPT_DIR, buildNote, pruneMail } = await imp('note-queue')
 
 /** 面板 id：与 manifest `panels[].id` 一致，信箱条目的落点 */
 const PANEL_ID = 'fleet'
@@ -65,6 +67,7 @@ function emptyState(degrade) {
     source: null,
     lineages: [],
     activeCount: 0,
+    mail: [],
     now: Date.now(),
   }
 }
@@ -114,6 +117,8 @@ function stateFor(sessionFile) {
     source: state?.source ?? null,
     lineages,
     activeCount: state ? activeCount(state) : 0,
+    /** 最近的留言回执（按 runId 供 UI 匹配）。面板不给「已读」——我们只知道投没投出去 */
+    mail: readMail(rt.ctx, state?.sessionKey ?? sessionKey),
     now: Date.now(),
     /** 数据文件路径：诊断折叠区显示，用户排查「为什么没数据」时最有用 */
     dataFile: latest?.file ?? '',
@@ -147,115 +152,74 @@ function ledgerPath(ctx) {
   return path.join(ctx.dataDir, LEDGER_FILE)
 }
 
-/** 三个命令目录的绝对路径 @param {any} ctx */
-function cmdDirs(ctx) {
-  return {
-    cmd: path.join(ctx.dataDir, CMD_DIR),
-    claim: path.join(ctx.dataDir, CLAIM_DIR),
-    result: path.join(ctx.dataDir, RESULT_DIR),
-  }
-}
+/** 面板上最多显示多少条留言回执（按时间倒序，UI 按 runId 找最新一条） */
+const MAIL_LIMIT = 24
 
 /**
- * 清理命令目录：未认领的、认领后没写完的、没人读的结果。
+ * 投一条留言。**不等回执**——这是和 P2-c 最大的区别。
  *
- * 不清理的话，下次启动时那条陈旧命令会被某个 agent 扫到并**执行**——
- * 用户早就不记得自己点过什么了（计划 §5.5 的 30s 规则）。
- * @param {any} ctx
- * @param {number} now
- */
-function pruneCommandDirs(ctx, now) {
-  const dirs = cmdDirs(ctx)
-  let removed = 0
-  for (const [dir, ttlMs] of /** @type {[string, number][]} */ ([
-    [dirs.cmd, 30_000],
-    [dirs.claim, 30_000],
-    [dirs.result, 120_000],
-  ])) {
-    let names = []
-    try {
-      names = fs.readdirSync(dir)
-    } catch {
-      continue
-    }
-    for (const name of names) {
-      try {
-        const full = path.join(dir, name)
-        if (now - fs.statSync(full).mtimeMs > ttlMs) {
-          fs.rmSync(full, { force: true })
-          removed += 1
-        }
-      } catch {
-        /* 正被别的进程动：跳过 */
-      }
-    }
-  }
-  return removed
-}
-
-let commandSeq = 0
-
-/**
- * 投一条命令给 worker 里的 agent，等它带回收执。
- *
- * 死线是 `REPLY_WAIT_MS`（5s）：超时后**把命令撤掉**，否则会出现
- * 「面板说没送达，几秒后子代理却真的被插了话」——这种不可解释的行为比失败更糟。
- * agent 侧用同一个窗口校验（`isExpired(..., REPLY_WAIT_MS)`），两端口径一致。
+ * P2-c 的 dispatchCommand 写完命令文件还要轮询 5s 等结果，超时就把命令撤回，
+ * 于是出现「面板说没送达、几秒后子代理却真被插了话」这种无法解释的行为。
+ * 现在投递目标是本会话自己的 agent 循环：面板写完就走，回执由 UI 通过 getState 轮询拿，
+ * 只显示三种事实——已发出 / 已被主代理接收 / 没等到确认。
  * @param {any} ctx
  * @param {any} input
  */
-async function dispatchCommand(ctx, input) {
-  const built = buildCommand(input, Date.now())
+function postNote(ctx, input) {
+  const built = buildNote(input, Date.now())
   if (!built.ok) return { ok: false, error: { code: 'bad_request', message: built.error } }
-  const command = built.command
-  commandSeq += 1
-  command.id = `${Date.now().toString(36)}-${commandSeq.toString(36)}-${Math.random().toString(36).slice(2, 6)}`
-
-  const dirs = cmdDirs(ctx)
-  const name = commandFileName(command.sessionKey, command.id)
-  const resultFile = path.join(dirs.result, `${command.id}.json`)
+  const note = built.note
+  const dir = path.join(ctx.dataDir, INBOX_DIR, note.sessionKey)
   try {
-    for (const dir of [dirs.cmd, dirs.claim, dirs.result]) fs.mkdirSync(dir, { recursive: true })
-    const tmp = path.join(dirs.cmd, `${name}.tmp`)
-    fs.writeFileSync(tmp, JSON.stringify(command, null, 2))
-    fs.renameSync(tmp, path.join(dirs.cmd, name))
+    fs.mkdirSync(dir, { recursive: true })
+    const file = path.join(dir, `${note.id}.json`)
+    const tmp = `${file}.tmp`
+    fs.writeFileSync(tmp, JSON.stringify(note, null, 2))
+    fs.renameSync(tmp, file)
   } catch (error) {
-    return { ok: false, error: { code: 'queue_failed', message: error instanceof Error ? error.message : String(error) } }
+    return { ok: false, error: { code: 'write_failed', message: error instanceof Error ? error.message : String(error) } }
   }
+  return { ok: true, id: note.id, expiresAt: note.createdAt + NOTE_TTL_MS }
+}
 
-  const deadline = Date.now() + REPLY_WAIT_MS
-  while (Date.now() < deadline) {
-    try {
-      if (fs.existsSync(resultFile)) {
-        const result = JSON.parse(fs.readFileSync(resultFile, 'utf8'))
-        try {
-          fs.rmSync(resultFile, { force: true })
-        } catch {
-          /* 留着由 TTL 清 */
-        }
-        return result
-      }
-    } catch {
-      /* 还没写完（半份 JSON）：下一轮再看 */
-    }
-    await new Promise((resolve) => setTimeout(resolve, 100))
-  }
-
-  // 超时：撤掉还没被认领的那份（已被认领的撤不掉，但 agent 会用同一个窗口判过期）
+/**
+ * 读最近的留言回执。
+ *
+ * receipts 目录是全局的（一个 agent 只有一个收件箱身份，但多个会话共用数据目录），
+ * 用 sessionKey 过滤——receipt 里带了这个字段（agent 写回执时从 note 抄过来）。
+ * @param {any} ctx
+ * @param {string} sessionKey
+ */
+function readMail(ctx, sessionKey) {
+  const dir = path.join(ctx.dataDir, RECEIPT_DIR)
+  let names = []
   try {
-    fs.rmSync(path.join(dirs.cmd, name), { force: true })
+    names = fs.readdirSync(dir)
   } catch {
-    /* 已被认领 */
+    return []
   }
-  return {
-    ok: false,
-    action: command.action,
-    runId: command.runId,
-    error: {
-      code: 'timeout',
-      message: '该子代理所属的会话已经不活跃，命令没能送达（切回那个会话再试一次）',
-    },
+  const items = []
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue
+    try {
+      const raw = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'))
+      if (!raw || typeof raw !== 'object') continue
+      if (sessionKey && String(raw.sessionKey ?? '') !== sessionKey) continue
+      items.push({
+        id: String(raw.id ?? ''),
+        kind: raw.kind === 'stop' ? 'stop' : 'note',
+        runId: String(raw.runId ?? ''),
+        state: String(raw.state ?? ''),
+        ok: raw.ok === true,
+        at: Number(raw.at) || 0,
+        error: raw.error?.message ? String(raw.error.message) : '',
+      })
+    } catch {
+      /* 半份 JSON：下一轮再看 */
+    }
   }
+  items.sort((a, b) => b.at - a.at)
+  return items.slice(0, MAIL_LIMIT)
 }
 
 /** 读台账；坏了就重来（丢的是「已通知」标记，最坏结果是重复通知一次） @param {any} ctx */
@@ -339,17 +303,16 @@ async function handleInvoke(method, params) {
       const revealed = await jump(target)
       return { ok: Boolean(revealed), sessionFile: target }
     }
-    case 'steer':
+    case 'note':
     case 'stop': {
-      // 干预只作用于后台 async run（计划 §5.7）。字段校验全在 buildCommand 里做：
+      // 面板只有两种写入：给主会话留言、停止一个 run。字段校验全在 buildNote 里做，
       // UI 传来的东西一律当作不可信输入。
-      return dispatchCommand(rt.ctx, {
-        action: method,
+      return postNote(rt.ctx, {
+        kind: method === 'stop' ? 'stop' : 'note',
         sessionKey: params?.sessionKey,
         runId: params?.runId,
-        index: params?.index,
+        agent: params?.agent,
         message: params?.message,
-        mode: params?.mode,
       })
     }
     default:
@@ -366,7 +329,14 @@ export async function activate(pluginContext) {
   }
   rt = { ctx: pluginContext }
   const removed = pruneLiveFiles(pluginContext.dataDir)
-  const staleCommands = pruneCommandDirs(pluginContext, Date.now())
+  // 留言/回执留一天：够用户回看「我当时说了什么、它收到了没」，再久就是垃圾
+  const staleMail = pruneMail(
+    pluginContext.dataDir,
+    Date.now(),
+    (dir) => fs.readdirSync(dir),
+    (file) => fs.statSync(file).mtimeMs,
+    (file) => fs.rmSync(file, { force: true }),
+  )
   // 先巡检一次：把历史终态段记进台账（不发通知），之后只发新增的
   sweepInbox(pluginContext)
   sweepTimer = setInterval(() => {
@@ -380,7 +350,7 @@ export async function activate(pluginContext) {
   if (typeof sweepTimer.unref === 'function') sweepTimer.unref()
   pluginContext.log(
     `subagents-board active, dataDir=${pluginContext.dataDir}${removed ? `, pruned ${removed} stale live file(s)` : ''}${
-      staleCommands ? `, pruned ${staleCommands} stale command file(s)` : ''
+      staleMail ? `, pruned ${staleMail} stale mail file(s)` : ''
     }`,
   )
   return { invoke: handleInvoke }

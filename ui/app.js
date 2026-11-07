@@ -1,15 +1,19 @@
 /*
  * 子代理面板。
  *
- * P2-a 打通数据，P2-b 加「打开会话 + 信箱」，P2-c 加干预（steer / stop）。
+ * 观测 + 两件事：留言给主会话、停止一个 run。
  *
- * 三条硬约束来自实测教训：
- *   1. 面板每秒轮询，整块 DOM 会重建——**所有操作结果都必须存成变量**再渲染，
- *      只写一次 DOM 的东西会在下一帧消失（探针那次「点了没结果框」就是这么来的）。
- *   2. 输入框**不能放进每秒重建的容器里**：用户每打一个字就被重建一次，焦点与光标全丢。
- *      所以干预坞是 body 下独立的 #dock，只在它自己的状态变化时重绘。
- *   3. 看不到数据时不能只显示空白：降级原因（未连上 / 陈旧 / 无记录）必须写出来，
- *      否则用户分不清「没跑」和「插件坏了」。
+ * 交互形态定为「A · 卡片内联」：
+ *   - 留言入口在卡片上，点了就地展开一个小表单，提交后收起、原地留一行回执。
+ *     没有常驻输入坞 —— 那玩意儿既占版面，又永远说不清「我现在说的是谁」。
+ *   - 停止不占输入区：按钮就地变「确认停止」，3 秒不点自动退回。
+ *   - 不再有绿色/结果横幅：它会顶得内容往下跳（U4）。
+ *
+ * 渲染策略（这是「位置突变」的总根源）：
+ *   1. **计时数字单独更新**：卡片 HTML 里只放 `<span data-timing>`，每秒用 textContent
+ *      改那一个数字，不重建 DOM。否则整块 innerHTML 每秒重来一次，选区、焦点、动画全丢。
+ *   2. **HTML 没变就不碰 DOM**：`lastHtml` 比对，相等直接返回。
+ *   3. **编辑留言时暂停重绘**：用户正在打字的那几秒，画面不该动；提交/取消后再同步。
  */
 
 const bridge = window.pi || {
@@ -19,7 +23,6 @@ const bridge = window.pi || {
 }
 
 const el = document.getElementById('app')
-const dockEl = document.getElementById('dock')
 
 /** 面板上下文里的会话路径：宿主会在切换会话时推新的 */
 let context = bridge.context || {}
@@ -30,30 +33,28 @@ let lastError = ''
 let busy = false
 /** 用户手动展开的链（按 lineageRoot 记），重绘后恢复 */
 const expanded = new Set()
-/** 诊断折叠区的展开状态：每秒整块重绘会把它拍回去，必须自己记 */
+/** 诊断折叠区的展开状态：整块重绘会把它拍回去，必须自己记 */
 let diagOpen = false
-/** 最近一次「打开子会话」的结果；同样要活过重绘 */
-let actionResult = /** @type {{ text: string, tone: string } | null} */ (null)
-let actionTimer = /** @type {any} */ (null)
+/** 上一帧的 HTML：一样就不碰 DOM */
+let lastHtml = ''
+/** 编辑留言时默认不重绘；改表单自身状态（展开/发送中）时放行一次 */
+let paintOnce = false
 
-/**
- * 写动作结果。成功类给 autoHideMs 就自动消失——横幅常驻的话，用户点完一次，
- * 往后每秒重绘都带着一条过时的「已打开」，比没有更吵（实测反馈）。
- * 失败/警告常驻：错误信息需要时间读。
- */
-function setActionResult(result, autoHideMs = 0) {
-  actionResult = result
-  if (actionTimer) {
-    clearTimeout(actionTimer)
-    actionTimer = null
-  }
-  if (result && autoHideMs > 0) {
-    actionTimer = setTimeout(() => {
-      actionResult = null
-      actionTimer = null
-      render()
-    }, autoHideMs)
-  }
+/** 正在编辑的留言：`{ runId, agent, text, busy, error }` */
+let noteDraft = /** @type {any} */ (null)
+/** 停止的二次确认：`{ runId, until }`，3 秒不点自动回退 */
+let stopConfirm = /** @type {any} */ (null)
+/** 顶部浮层提示（绝对定位，不占文档流，所以不会顶内容） */
+let notice = /** @type {{ text: string, tone: string, at: number } | null} */ (null)
+/** 本会话发出去、还在等回执的留言：`[{ id, runId, kind, at }]` */
+const sentNotes = []
+
+const NOTICE_MS = { ok: 3_000, warn: 8_000, error: 8_000, info: 4_000 }
+/** 发出多久还没回执，就从「等待中」改口成「未确认」 */
+const RECEIPT_PATIENCE_MS = 4_000
+
+function setNotice(text, tone = 'info') {
+  notice = { text, tone, at: Date.now() }
 }
 
 function esc(value) {
@@ -61,34 +62,37 @@ function esc(value) {
 }
 
 function fmtDuration(ms) {
-  const total = Math.max(0, Math.round((Number(ms) || 0) / 1000))
-  const minutes = Math.floor(total / 60)
-  const seconds = total % 60
-  if (minutes >= 60) return `${Math.floor(minutes / 60)}:${String(minutes % 60).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
-  return `${minutes}:${String(seconds).padStart(2, '0')}`
+  const total = Math.max(0, Math.round(Number(ms) / 1000))
+  const m = Math.floor(total / 60)
+  const s = total % 60
+  if (m < 60) return `${m}:${String(s).padStart(2, '0')}`
+  return `${Math.floor(m / 60)}:${String(m % 60).padStart(2, '0')}:${String(s).padStart(2, '0')}`
 }
 
 function fmtAge(ms) {
-  const value = Number(ms) || 0
-  if (value < 1000) return '刚刚'
-  const seconds = Math.round(value / 1000)
-  if (seconds < 60) return `${seconds} 秒前`
-  const minutes = Math.floor(seconds / 60)
-  if (minutes < 60) return `${minutes} 分钟前`
-  return `${Math.floor(minutes / 60)} 小时前`
+  const sec = Math.max(0, Math.round(Number(ms) / 1000))
+  if (sec < 60) return `${sec}s 前`
+  if (sec < 3600) return `${Math.floor(sec / 60)}m 前`
+  return `${Math.floor(sec / 3600)}h 前`
+}
+
+function fmtClock(at) {
+  const d = new Date(Number(at) || Date.now())
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
 
 const STATE_TEXT = {
-  running: '进行中',
-  queued: '排队中',
-  stopping: '停止中',
+  running: '运行中',
   complete: '已完成',
   failed: '失败',
-  partial: '部分完成',
+  error: '出错',
   stopped: '已停止',
-  paused: '已暂停',
-  rejected: '被拒绝',
-  unknown: '未知',
+  stopping: '正在停止',
+  timeout: '超时',
+  cancelled: '已取消',
+  queued: '排队中',
+  pending: '等待中',
+  unknown: '状态未知',
 }
 
 function statePill(state) {
@@ -97,12 +101,40 @@ function statePill(state) {
 }
 
 /** 段的时间信息：进行中看「从现在倒推」，终态看耗时 */
-function segmentTiming(segment, now) {
+function timingOf(segment, now) {
   if (segment.durationMs) return fmtDuration(segment.durationMs)
   const start = Number(segment.startedAt) || 0
   const end = Number(segment.endedAt) || (segment.state === 'running' ? now : 0)
   if (!start || !end) return ''
   return fmtDuration(end - start)
+}
+
+/**
+ * 计时占位：内容先渲染一次，之后由 `tickTimings` 单独改 textContent。
+ * key 用 runId —— 同一段在页面上的身份就是它。
+ */
+function timingSpan(segment, now) {
+  const id = String(segment.runId || '')
+  return `<span class="muted timing" data-timing="${esc(id)}">${esc(timingOf(segment, now))}</span>`
+}
+
+function findSegment(runId) {
+  for (const lineage of snapshot?.lineages || []) {
+    for (const segment of lineage.segments || []) {
+      if (String(segment.runId) === String(runId)) return segment
+    }
+  }
+  return null
+}
+
+/** 每秒只改这几个数字，不动结构 */
+function tickTimings() {
+  const now = Date.now()
+  for (const node of el.querySelectorAll('[data-timing]')) {
+    const segment = findSegment(node.getAttribute('data-timing'))
+    const next = segment ? timingOf(segment, now) : ''
+    if (node.textContent !== next) node.textContent = next
+  }
 }
 
 function renderChildren(segment, now) {
@@ -130,27 +162,98 @@ function renderChildren(segment, now) {
     .join('')}</ul>`
 }
 
+/* ---------- 留言（A 方案：卡片内联） ---------- */
+
+/** 这个 run 上最近一条留言回执：先看 agent 写的，再看本地「已发出待确认」 */
+function mailFor(runId) {
+  const id = String(runId ?? '')
+  if (!id) return null
+  const confirmed = (snapshot?.mail || []).find((item) => String(item.runId) === id)
+  if (confirmed) return { confirmed: true, ...confirmed }
+  const pending = sentNotes.filter((item) => item.runId === id).sort((a, b) => b.at - a.at)[0]
+  return pending ? { confirmed: false, ...pending } : null
+}
+
+/** 回执文案：只说事实——我们不知道主代理「读没读」，别编 */
+function describeMail(mail) {
+  if (!mail) return null
+  const kind = mail.kind === 'stop' ? 'stop' : 'note'
+  if (!mail.confirmed) {
+    const age = Date.now() - Number(mail.at || 0)
+    if (age < RECEIPT_PATIENCE_MS) {
+      return { text: kind === 'stop' ? '停止请求已发出…' : '已发出，等主代理接收…', tone: 'waiting' }
+    }
+    return {
+      text:
+        kind === 'stop'
+          ? '停止请求已发出，但没等到确认（会话可能不在运行）'
+          : '已发出，但没等到确认（会话可能不在运行）',
+      tone: 'warn',
+    }
+  }
+  if (mail.state === 'expired') return { text: '这条没投出去：已经过期了', tone: 'warn' }
+  if (!mail.ok) return { text: mail.error || '投递失败', tone: 'error' }
+  if (kind === 'stop') return { text: `已受理停止 · ${fmtClock(mail.at)}`, tone: 'ok' }
+  return { text: `已投给主代理 · ${fmtClock(mail.at)}`, tone: 'ok' }
+}
+
+function renderMailLine(segment) {
+  const described = describeMail(mailFor(segment.runId))
+  if (!described) return ''
+  return `<p class="mail-line mail-${esc(described.tone)}">${esc(described.text)}</p>`
+}
+
+/**
+ * 留言表单。**只在编辑这一个 run 时出现**，提交即收起。
+ * 编辑期间 render 会整体跳过（见 render 开头），所以这里的 textarea 不会被重建。
+ */
+function renderNoteForm(segment) {
+  if (!noteDraft || String(noteDraft.runId) !== String(segment.runId)) return ''
+  const busyAttr = noteDraft.busy ? ' disabled' : ''
+  return `<div class="note-form">
+    <textarea data-note-input rows="2" placeholder="跟主代理说一句（Enter 发送，Shift+Enter 换行）"${busyAttr}>${esc(noteDraft.text)}</textarea>
+    <div class="note-row">
+      <span class="note-hint">发给主代理 · 关于 ${esc(noteDraft.agent || '这个子代理')}</span>
+      <span class="spacer"></span>
+      <button class="act" data-note-cancel${busyAttr}>取消</button>
+      <button class="act act-primary" data-note-send${busyAttr}>${noteDraft.busy ? '发送中…' : '发送'}</button>
+    </div>
+    ${noteDraft.error ? `<p class="mail-line mail-error">${esc(noteDraft.error)}</p>` : ''}
+  </div>`
+}
+
 /**
  * 干预入口。**只在 canSteer / canStop 为真时出现**——这两个字段是数据层算的，
  * 前台 run（没有 async id）和已终态段不会出现按钮，用户不会先点再被报错。
  */
 function renderActions(segment) {
-  if (!segment.canSteer && !segment.canStop) return ''
-  return `<div class="actions">
-    ${segment.canSteer ? `<button class="act" data-steer="${esc(segment.runId)}">插话…</button>` : ''}
-    ${segment.canStop ? `<button class="act act-danger" data-stop="${esc(segment.runId)}">停止</button>` : ''}
-  </div>`
+  const runId = esc(segment.runId)
+  const acts = []
+  if (segment.canSteer) {
+    acts.push(`<button class="act" data-note="${runId}">留言…</button>`)
+  }
+  if (segment.canStop) {
+    const confirming = stopConfirm && String(stopConfirm.runId) === String(segment.runId) && Date.now() < stopConfirm.until
+    if (confirming) {
+      acts.push(`<button class="act act-danger" data-stop-confirm="${runId}">确认停止</button>`)
+      acts.push('<button class="act" data-stop-cancel>取消</button>')
+    } else {
+      acts.push(`<button class="act act-danger" data-stop="${runId}">停止</button>`)
+    }
+  }
+  return acts.length ? `<div class="actions">${acts.join('')}</div>` : ''
 }
 
 function renderSegment(segment, now, isLast) {
-  const timing = segmentTiming(segment, now)
-  const summary = segment.summary ? `<p class="summary">${esc(segment.summary.slice(0, 240))}${segment.summary.length > 240 ? '…' : ''}</p>` : ''
+  const summary = segment.summary
+    ? `<p class="summary">${esc(segment.summary.slice(0, 240))}${segment.summary.length > 240 ? '…' : ''}</p>`
+    : ''
   const tokens = segment.tokens?.total ? `<span class="muted">${esc(segment.tokens.total)} tok</span>` : ''
   const cost = Number.isFinite(segment.costUsd) ? `<span class="muted">$${segment.costUsd.toFixed(4)}</span>` : ''
   return `<div class="segment ${isLast ? 'segment-last' : ''}">
     <div class="segment-head">
       ${statePill(segment.state)}
-      <span class="muted">${esc(timing)}</span>
+      ${timingSpan(segment, now)}
       ${tokens}
       ${cost}
       ${segment.origin === 'status' ? '<span class="muted" title="插件在这个 run 开始之后才起来，只看到它的当前状态">中途接入</span>' : ''}
@@ -158,6 +261,8 @@ function renderSegment(segment, now, isLast) {
     ${renderChildren(segment, now)}
     ${summary}
     ${renderActions(segment)}
+    ${renderNoteForm(segment)}
+    ${renderMailLine(segment)}
   </div>`
 }
 
@@ -173,7 +278,7 @@ function renderLineage(lineage, now) {
         )}</button>`
       : ''
   const history = isOpen && earlier.length
-    ? `<div class="history">${earlier.map((segment, index) => renderSegment(segment, now, false)).join('')}</div>`
+    ? `<div class="history">${earlier.map((segment) => renderSegment(segment, now, false)).join('')}</div>`
     : ''
 
   return `<article class="card card-${esc(lineage.state || 'unknown')}">
@@ -181,8 +286,6 @@ function renderLineage(lineage, now) {
       <span class="dot dot-${esc(lineage.state || 'unknown')}"></span>
       <span class="agent">${esc(lineage.agent || '子代理')}</span>
       ${statePill(lineage.state)}
-      <span class="spacer"></span>
-      <span class="muted">${esc(segmentTiming(last, now))}</span>
     </header>
     ${renderSegment(last, now, true)}
     ${reviveLine}
@@ -199,212 +302,42 @@ function renderBanner(degrade) {
   </div>`
 }
 
-/** 动作结果横幅：只读预览能不能打开，用户必须当场知道，不能一闪就没 */
-function renderActionResult() {
-  if (!actionResult) return ''
-  return `<div class="result result-${esc(actionResult.tone)}">${esc(actionResult.text)}</div>`
-}
-
-/* ---------- 干预坞（steer / stop） ---------- */
-
-/**
- * 干预坞状态。**整个面板只有这一个**：打开插话就替换现有的。
- * `busy` 期间的输入不做拦截——用户可能会继续打字，重绘时用 dock.message 回填。
- */
-let dock = /** @type {any} */ (null)
-
-/** @param {string} runId */
-function findRun(runId) {
-  for (const lineage of snapshot?.lineages || []) {
-    for (const segment of lineage.segments || []) {
-      if (segment.runId === runId) return { segment, agent: lineage.agent }
-    }
+/** 顶部浮层：绝对定位，不占文档流，所以不会顶得内容往下跳 */
+function renderNotice() {
+  if (!notice) return ''
+  const ttl = NOTICE_MS[notice.tone] ?? 4_000
+  if (Date.now() - notice.at > ttl) {
+    notice = null
+    return ''
   }
-  return null
-}
-
-/**
- * @param {'steer' | 'stop'} kind
- * @param {string} runId
- */
-function openDock(kind, runId) {
-  const found = findRun(runId)
-  dock = {
-    kind,
-    runId,
-    // ownerSessionKey 而不是 sessionKey：预览子会话时链属于父会话，
-    // 命令必须发给「跑着这条链的那个进程」，否则永远等不到回执
-    sessionKey: String(snapshot?.ownerSessionKey || ''),
-    agent: found?.agent || found?.segment?.agent || '',
-    message: '',
-    mode: 'steer',
-    busy: false,
-    result: null,
-  }
-  renderDock()
-  if (kind === 'steer') {
-    const input = dockEl.querySelector('textarea')
-    if (input) input.focus()
-  }
-}
-
-function closeDock() {
-  dock = null
-  renderDock()
-}
-
-/** 回执文案：`delivered` 与 `queued` 必须分开说（计划 §5.7） */
-function describeIntervention(action, result) {
-  if (!result?.ok) {
-    return { text: result?.error?.message || '没能送到，请重试', tone: 'error' }
-  }
-  const receipt = result.receipt || {}
-  if (action === 'stop') {
-    return receipt.state === 'stopping'
-      ? { text: '已受理停止：正在等它收尾，状态会自己收敛（不是立刻变「已停止」）', tone: 'ok' }
-      : { text: '已受理停止', tone: 'ok' }
-  }
-  if (receipt.deliveryStatus === 'delivered') return { text: '已送达：子代理这一轮就能看到', tone: 'ok' }
-  if (receipt.deliveryStatus === 'queued') return { text: '已排队：子代理这一轮结束后才会看到', tone: 'warn' }
-  return { text: '已受理（扩展没给送达状态，别当作它已经看到）', tone: 'warn' }
-}
-
-function renderDock() {
-  if (!dock) {
-    dockEl.hidden = true
-    dockEl.innerHTML = ''
-    return
-  }
-  const who = `<span class="who">${esc(dock.agent || '子代理')}</span>`
-  const result = dock.result
-    ? `<div class="dock-result dock-result-${esc(dock.result.tone)}">${esc(dock.result.text)}</div>`
-    : ''
-
-  if (dock.kind === 'steer') {
-    dockEl.innerHTML = `
-      <div class="dock-head">${who}<span class="muted">插话</span><span class="spacer"></span></div>
-      <textarea data-dock-message placeholder="说一句，子代理会照着调整方向" ${dock.busy ? 'disabled' : ''}>${esc(dock.message)}</textarea>
-      <div class="dock-row">
-        <select data-dock-mode ${dock.busy ? 'disabled' : ''}>
-          <option value="steer"${dock.mode === 'steer' ? ' selected' : ''}>立刻插话</option>
-          <option value="follow_up"${dock.mode === 'follow_up' ? ' selected' : ''}>本轮结束后再说</option>
-        </select>
-        <span class="spacer"></span>
-        <button class="act" data-dock-cancel>取消</button>
-        <button class="act act-primary" data-dock-send ${dock.busy ? 'disabled' : ''}>${dock.busy ? '发送中…' : '发送'}</button>
-      </div>
-      ${result}`
-  } else {
-    dockEl.innerHTML = `
-      <div class="dock-head">${who}<span class="muted">停止</span><span class="spacer"></span></div>
-      <p class="dock-note">停止后这一段不能继续（扩展明确：stopped 不能 resume），只能重新派一个。</p>
-      <div class="dock-row">
-        <span class="spacer"></span>
-        <button class="act" data-dock-cancel>取消</button>
-        <button class="act act-danger" data-dock-confirm ${dock.busy ? 'disabled' : ''}>${dock.busy ? '停止中…' : '确认停止'}</button>
-      </div>
-      ${result}`
-  }
-  dockEl.hidden = false
-}
-
-async function submitDock() {
-  if (!dock || dock.busy) return
-  const action = dock.kind === 'steer' ? 'steer' : 'stop'
-  if (action === 'steer' && !dock.message.trim()) {
-    dock.result = { text: '说点什么再发', tone: 'warn' }
-    renderDock()
-    return
-  }
-  if (!dock.sessionKey) {
-    dock.result = { text: '拿不到会话标识，先切回主会话再试', tone: 'error' }
-    renderDock()
-    return
-  }
-  dock.busy = true
-  dock.result = { text: '发送中…', tone: 'info' }
-  renderDock()
-  try {
-    /** @type {any} */
-    const payload = { sessionKey: dock.sessionKey, runId: dock.runId }
-    if (action === 'steer') {
-      payload.message = dock.message.trim()
-      payload.mode = dock.mode
-    }
-    const result = await bridge.invoke(action, payload)
-    dock.busy = false
-    dock.result = describeIntervention(action, result)
-    if (result?.ok && action === 'steer') dock.message = ''
-  } catch (error) {
-    dock.busy = false
-    dock.result = { text: `发送失败：${error instanceof Error ? error.message : String(error)}`, tone: 'error' }
-  }
-  renderDock()
-  // 干预后立刻拉一次：stop 的「stopping」到终态要靠 status 收敛，别让用户盯着不动的卡
-  void tick()
-}
-
-// 坞自己的监听器挂一次：它不重绘 innerHTML 之外的东西，所以不会丢。
-dockEl.addEventListener('input', (/** @type {InputEvent} */ event) => {
-  const target = /** @type {HTMLTextAreaElement} */ (event.target)
-  if (dock && target.matches?.('[data-dock-message]')) dock.message = target.value
-})
-dockEl.addEventListener('change', (/** @type {Event} */ event) => {
-  const target = /** @type {HTMLSelectElement} */ (event.target)
-  if (dock && target.matches?.('[data-dock-mode]')) dock.mode = target.value
-})
-dockEl.addEventListener('keydown', (/** @type {KeyboardEvent} */ event) => {
-  if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
-    event.preventDefault()
-    void submitDock()
-  }
-  if (event.key === 'Escape') {
-    event.preventDefault()
-    closeDock()
-  }
-})
-dockEl.addEventListener('click', (/** @type {MouseEvent} */ event) => {
-  const target = /** @type {HTMLElement} */ (event.target)
-  if (!target?.closest) return
-  if (target.closest('[data-dock-cancel]')) {
-    closeDock()
-    return
-  }
-  if (target.closest('[data-dock-send]') || target.closest('[data-dock-confirm]')) void submitDock()
-})
-
-/**
- * 打开一段会话（宿主二分：主会话激活、子会话只读预览）。
- *
- * 走宿主 `sessions.activate`：目标在当前工作区侧栏就正常激活——「返回主会话」
- * 时用户拿到的是可写对话；子会话不在侧栏，退化为只读预览（观测层不指挥会话）。
- * 失败是常态（一次性 run 的会话会被清理），所以文案说清原因，而不是静默。
- * @param {string} sessionFile
- */
-async function openSession(sessionFile) {
-  setActionResult({ text: '正在打开…', tone: 'info' })
-  render()
-  try {
-    const result = await bridge.invoke('openSession', { sessionFile })
-    if (result?.ok) setActionResult({ text: '已打开', tone: 'ok' }, 6_000)
-    else setActionResult({ text: '会话文件已不存在，可能已被清理', tone: 'warn' })
-  } catch (error) {
-    setActionResult({ text: `打开失败：${error instanceof Error ? error.message : String(error)}`, tone: 'error' })
-  }
-  render()
+  return `<div class="notice notice-${esc(notice.tone)}">${esc(notice.text)}</div>`
 }
 
 function render() {
   const now = Date.now()
-  const scrollTop = el.scrollTop
-  const data = snapshot
+  // 编辑留言时不重建：用户正在打字，画面一动就丢焦点，而且卡片位置会跳。
+  // 但「展开表单」「切成发送中」这些是表单自己的状态变化，要放行一次。
+  if (noteDraft && !paintOnce) {
+    tickTimings()
+    return
+  }
+  paintOnce = false
+  if (stopConfirm && Date.now() >= stopConfirm.until) {
+    stopConfirm = null
+  }
 
+  const data = snapshot
   if (lastError) {
-    el.innerHTML = `<div class="banner banner-error"><strong>面板读取失败</strong><p>${esc(lastError)}</p></div>`
+    const html = `<div class="banner banner-error"><strong>面板读取失败</strong><p>${esc(lastError)}</p></div>`
+    if (html !== lastHtml) el.innerHTML = html
+    lastHtml = html
     return
   }
   if (!data) {
-    el.innerHTML = '<p class="muted pad">正在读取…</p>'
+    if (lastHtml !== '<p class="muted pad">正在读取…</p>') {
+      el.innerHTML = '<p class="muted pad">正在读取…</p>'
+      lastHtml = '<p class="muted pad">正在读取…</p>'
+    }
     return
   }
 
@@ -417,7 +350,14 @@ function render() {
     ? `<button class="back-link" data-open-session="${esc(data.parentSessionFile)}">← 返回主会话</button>`
     : ''
 
-  el.innerHTML = `
+  const body = lineages.length
+    ? lineages.map((lineage) => renderLineage(lineage, now)).join('')
+    : data.degrade?.kind === 'ok'
+      ? '<p class="muted pad">这个会话最近没有子代理运行。</p>'
+      : ''
+
+  const html = `
+    ${renderNotice()}
     <div class="head">
       <span class="title">子代理</span>
       ${active ? `<span class="count">${active} 个在跑</span>` : ''}
@@ -426,8 +366,7 @@ function render() {
     </div>
     ${back}
     ${renderBanner(data.degrade)}
-    ${renderActionResult()}
-    ${lineages.length ? lineages.map((lineage) => renderLineage(lineage, now)).join('') : data.degrade?.kind === 'ok' ? '<p class="muted pad">这个会话最近没有子代理运行。</p>' : ''}
+    ${body}
     <details class="diag"${diagOpen ? ' open' : ''}>
       <summary>诊断</summary>
       <dl>
@@ -437,7 +376,7 @@ function render() {
         <dt>能力</dt><dd>${esc((data.source?.capabilities || []).join(', ') || '—')}</dd>
         <dt>干预</dt><dd>${esc(
           data.source?.supports
-            ? `插话 ${data.source.supports.steer ? '可用' : '不支持'} · 停止 ${data.source.supports.stop ? '可用' : '不支持'}`
+            ? `留言 ${data.source.supports.steer ? '可用' : '不支持'} · 停止 ${data.source.supports.stop ? '可用' : '不支持'}`
             : '—（扩展未公告）',
         )}</dd>
         <dt>事件</dt><dd>${esc((data.source?.events || []).join(', ') || '—')}</dd>
@@ -445,7 +384,125 @@ function render() {
       </dl>
     </details>
   `
-  el.scrollTop = scrollTop
+  if (html !== lastHtml) {
+    const scrollTop = el.scrollTop
+    el.innerHTML = html
+    el.scrollTop = scrollTop
+    lastHtml = html
+  } else {
+    // 结构没变，只把计时数字推到当前值
+    tickTimings()
+  }
+}
+
+/* ---------- 操作 ---------- */
+
+function openNote(runId) {
+  const segment = findSegment(runId)
+  noteDraft = {
+    runId: String(runId),
+    agent: String(segment?.agent || ''),
+    text: '',
+    busy: false,
+    error: '',
+  }
+  paintOnce = true
+  render()
+  const input = el.querySelector('[data-note-input]')
+  if (input) input.focus()
+}
+
+function closeNote() {
+  noteDraft = null
+  render()
+}
+
+async function submitNote() {
+  if (!noteDraft || noteDraft.busy) return
+  const text = String(noteDraft.text || '').trim()
+  if (!text) {
+    noteDraft.error = '说点什么再发'
+    paintOnce = true
+    render()
+    return
+  }
+  // 留言发给**父会话**：预览子会话时链属于父会话，ownerSessionKey 才是跑着这条链的那个
+  const sessionKey = String(snapshot?.ownerSessionKey || '')
+  if (!sessionKey) {
+    noteDraft.error = '拿不到会话标识，先切回主会话再试'
+    paintOnce = true
+    render()
+    return
+  }
+  noteDraft.busy = true
+  noteDraft.error = ''
+  paintOnce = true
+  render()
+  try {
+    const result = await bridge.invoke('note', {
+      sessionKey,
+      runId: noteDraft.runId,
+      agent: noteDraft.agent || undefined,
+      message: text,
+    })
+    if (!result?.ok) {
+      noteDraft.busy = false
+      noteDraft.error = result?.error?.message || '没能投出去，请重试'
+      paintOnce = true
+      render()
+      return
+    }
+    sentNotes.push({ id: String(result.id || ''), runId: String(noteDraft.runId), kind: 'note', at: Date.now() })
+    noteDraft = null
+    render()
+    void tick()
+  } catch (error) {
+    noteDraft.busy = false
+    noteDraft.error = `发送失败：${error instanceof Error ? error.message : String(error)}`
+    paintOnce = true
+    render()
+  }
+}
+
+async function confirmStop(runId) {
+  const sessionKey = String(snapshot?.ownerSessionKey || '')
+  if (!sessionKey) {
+    setNotice('拿不到会话标识，先切回主会话再试', 'error')
+    render()
+    return
+  }
+  stopConfirm = null
+  try {
+    const result = await bridge.invoke('stop', { sessionKey, runId })
+    if (!result?.ok) {
+      setNotice(result?.error?.message || '停止请求没能投出去', 'error')
+    } else {
+      sentNotes.push({ id: String(result.id || ''), runId: String(runId), kind: 'stop', at: Date.now() })
+    }
+  } catch (error) {
+    setNotice(`停止失败：${error instanceof Error ? error.message : String(error)}`, 'error')
+  }
+  render()
+  // stop 的「stopping」到终态要靠 status 收敛，别让用户盯着不动的卡
+  void tick()
+}
+
+/**
+ * 打开一段会话（宿主二分：主会话激活、子会话只读预览）。
+ *
+ * 走宿主 `sessions.activate`：目标在当前工作区侧栏就正常激活——「返回主会话」
+ * 时用户拿到的是可写对话；子会话不在侧栏，退化为只读预览（观测层不指挥会话）。
+ * 失败是常态（一次性 run 的会话会被清理），所以文案说清原因，而不是静默。
+ * @param {string} sessionFile
+ */
+async function openSession(sessionFile) {
+  try {
+    const result = await bridge.invoke('openSession', { sessionFile })
+    if (!result?.ok) setNotice('会话文件已不存在，可能已被清理', 'warn')
+  } catch (error) {
+    setNotice(`打开失败：${error instanceof Error ? error.message : String(error)}`, 'error')
+  }
+  render()
 }
 
 // 事件委托，挂一次就够——innerHTML 重建不带走 el 自己的监听器。
@@ -459,27 +516,67 @@ el.addEventListener(
   },
   true,
 )
+el.addEventListener('input', (/** @type {InputEvent} */ event) => {
+  const target = /** @type {HTMLTextAreaElement} */ (event.target)
+  if (noteDraft && target.matches?.('[data-note-input]')) noteDraft.text = target.value
+})
+el.addEventListener('keydown', (/** @type {KeyboardEvent} */ event) => {
+  if (!noteDraft) return
+  const target = /** @type {HTMLElement} */ (event.target)
+  if (!target?.matches?.('[data-note-input]')) return
+  if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+    event.preventDefault()
+    void submitNote()
+  }
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    closeNote()
+  }
+})
 el.addEventListener('click', (/** @type {MouseEvent} */ event) => {
   const target = /** @type {HTMLElement} */ (event.target)
-  const steerButton = /** @type {HTMLElement | null} */ (target?.closest?.('[data-steer]'))
-  if (steerButton) {
-    const runId = steerButton.getAttribute('data-steer')
-    if (runId) openDock('steer', runId)
+  if (!target?.closest) return
+
+  if (target.closest('[data-note-cancel]')) {
+    closeNote()
     return
   }
-  const stopButton = /** @type {HTMLElement | null} */ (target?.closest?.('[data-stop]'))
+  if (target.closest('[data-note-send]')) {
+    void submitNote()
+    return
+  }
+  const noteButton = /** @type {HTMLElement | null} */ (target.closest('[data-note]'))
+  if (noteButton) {
+    const runId = noteButton.getAttribute('data-note')
+    if (runId) openNote(runId)
+    return
+  }
+  if (target.closest('[data-stop-cancel]')) {
+    stopConfirm = null
+    render()
+    return
+  }
+  const stopConfirmButton = /** @type {HTMLElement | null} */ (target.closest('[data-stop-confirm]'))
+  if (stopConfirmButton) {
+    const runId = stopConfirmButton.getAttribute('data-stop-confirm')
+    if (runId) void confirmStop(runId)
+    return
+  }
+  const stopButton = /** @type {HTMLElement | null} */ (target.closest('[data-stop]'))
   if (stopButton) {
     const runId = stopButton.getAttribute('data-stop')
-    if (runId) openDock('stop', runId)
+    // 就地二次确认：3 秒不点自动退回，不弹框、不占输入区
+    if (runId) stopConfirm = { runId, until: Date.now() + 3_000 }
+    render()
     return
   }
-  const sessionButton = /** @type {HTMLElement | null} */ (target?.closest?.('[data-open-session]'))
+  const sessionButton = /** @type {HTMLElement | null} */ (target.closest('[data-open-session]'))
   if (sessionButton) {
     const file = sessionButton.getAttribute('data-open-session')
     if (file) void openSession(file)
     return
   }
-  const button = /** @type {HTMLElement | null} */ (target?.closest?.('[data-open]'))
+  const button = /** @type {HTMLElement | null} */ (target.closest('[data-open]'))
   if (!button) return
   const root = button.getAttribute('data-open')
   if (!root) return
@@ -506,16 +603,21 @@ async function tick() {
 bridge.on('context', (next) => {
   context = next || {}
   snapshot = null
-  // 换会话了，坞里那条命令指向的 run 已经不在这个会话里——留着只会发错地方
-  closeDock()
+  lastHtml = ''
+  // 换会话了，正在编辑的留言指向的 run 已经不在这个会话里——留着只会发错地方
+  noteDraft = null
+  stopConfirm = null
+  sentNotes.length = 0
   void tick()
 })
 bridge.on('dispose', () => {
   if (timer) clearInterval(timer)
-  if (actionTimer) clearTimeout(actionTimer)
-  dock = null
+  noteDraft = null
 })
 
 let timer = null
-timer = setInterval(() => void tick(), 1000)
+// 1s 一次：拿不到新数据时也要让计时和「未确认」的措辞往前走
+timer = setInterval(() => {
+  if (!busy) void tick()
+}, 1000)
 void tick()

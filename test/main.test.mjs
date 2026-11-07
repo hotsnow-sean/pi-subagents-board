@@ -292,95 +292,115 @@ test('干预能力：canSteer / canStop 跟着段状态与扩展能力走（UI �
   assert.equal(sessionKey, sessionKeyOf(sessionFile))
 })
 
-test('steer: 命令进 cmd/ 队列（文件名带 sessionKey 前缀），拿到回执原样返回', async () => {
+test('note: 写进 inbox/<sessionKey>/（一消息一文件），立刻返回 id，不等回执', async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
   const sessionFile = path.join(dataDir, 'sessions', 'e.jsonl')
   const { sessionKey } = seedLive(dataDir, sessionFile)
   const mod = await loadMain()
   const api = await mod.activate(fakeCtx(dataDir))
 
-  const pending = api.invoke('steer', { sessionKey, runId: 'run-1', message: ' 换个方向 ', mode: 'follow_up' })
-  const cmdDir = path.join(dataDir, 'cmd')
-  assert.equal(await waitFor(() => fs.existsSync(cmdDir) && fs.readdirSync(cmdDir).filter((n) => n.endsWith('.json')).length > 0), true)
-
-  const name = fs.readdirSync(cmdDir).find((n) => n.endsWith('.json'))
-  assert.ok(name.startsWith(`${sessionKey}--`), `命令文件名要带会话前缀，实际：${name}`)
-  const command = JSON.parse(fs.readFileSync(path.join(cmdDir, name), 'utf8'))
-  assert.equal(command.action, 'steer')
-  assert.equal(command.runId, 'run-1')
-  assert.equal(command.message, '换个方向', '两端空白要修掉')
-  assert.equal(command.mode, 'follow_up')
-
-  // 模拟 worker 里的 agent 写回执
-  const resultDir = path.join(dataDir, 'cmd-result')
-  fs.mkdirSync(resultDir, { recursive: true })
-  fs.writeFileSync(
-    path.join(resultDir, `${command.id}.json`),
-    JSON.stringify({ id: command.id, action: 'steer', runId: 'run-1', ok: true, receipt: { deliveryStatus: 'queued', state: 'pending', targets: [] }, error: null, timedOut: false }),
-  )
-  const result = await pending
+  // 不等回执是这里最重要的一条：P2-c 要轮询 5s，超时就撤回，于是出现
+  // 「面板说没送达、几秒后子代理却真被插了话」。现在返回即完成。
+  const startedAt = Date.now()
+  const result = await api.invoke('note', {
+    sessionKey,
+    runId: 'run-1',
+    agent: 'code-reviewer',
+    message: ' 换个方向 ',
+  })
+  assert.ok(Date.now() - startedAt < 1_000, '投递不能被等待阻塞')
   assert.equal(result.ok, true)
-  assert.equal(result.receipt.deliveryStatus, 'queued', 'queued 不能被 UI 当成「已读到」')
-  // 结果文件读走即删，别在盘上越积越多
-  assert.equal(fs.existsSync(path.join(resultDir, `${command.id}.json`)), false)
+  assert.ok(result.id, '要返回 id，UI 靠它在回执里找自己那条')
+  assert.ok(result.expiresAt > Date.now(), '要告诉 UI 这条什么时候作废')
+
+  const dir = path.join(dataDir, 'inbox', sessionKey)
+  const names = fs.readdirSync(dir).filter((name) => name.endsWith('.json'))
+  assert.equal(names.length, 1, '一消息一文件，不做追加')
+  const note = JSON.parse(fs.readFileSync(path.join(dir, names[0]), 'utf8'))
+  assert.equal(note.id, result.id)
+  assert.equal(note.kind, 'note')
+  assert.equal(note.message, '换个方向', '两端空白要修掉')
+  assert.equal(note.runId, 'run-1')
+  assert.equal(note.agent, 'code-reviewer')
+  assert.equal(note.sessionKey, sessionKey, '文件名用 sessionKey 分目录，body 里也要留一份')
 })
 
-test('steer / stop: 参数不合格直接拒，不进队列（UI 传来的东西一律当不可信输入）', async () => {
+test('stop: 只给 runId 就够（停止是生命周期控制，不需要正文）', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
+  const sessionFile = path.join(dataDir, 'sessions', 'stop.jsonl')
+  const { sessionKey } = seedLive(dataDir, sessionFile)
+  const mod = await loadMain()
+  const api = await mod.activate(fakeCtx(dataDir))
+
+  const result = await api.invoke('stop', { sessionKey, runId: 'run-2' })
+  assert.equal(result.ok, true)
+  const dir = path.join(dataDir, 'inbox', sessionKey)
+  const note = JSON.parse(fs.readFileSync(path.join(dir, fs.readdirSync(dir)[0]), 'utf8'))
+  assert.equal(note.kind, 'stop')
+  assert.equal(note.runId, 'run-2')
+  assert.equal(note.message, undefined)
+})
+
+test('note / stop: 参数不合格直接拒，一个字都不落盘', async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
   const sessionFile = path.join(dataDir, 'sessions', 'bad.jsonl')
   const { sessionKey } = seedLive(dataDir, sessionFile)
   const mod = await loadMain()
   const api = await mod.activate(fakeCtx(dataDir))
 
-  const noRun = await api.invoke('steer', { sessionKey, message: 'x' })
-  assert.equal(noRun.ok, false)
-  assert.equal(noRun.error.code, 'bad_request')
-
-  const noKey = await api.invoke('stop', { runId: 'run-1' })
-  assert.equal(noKey.ok, false)
-
-  const blank = await api.invoke('steer', { sessionKey, runId: 'run-1', message: '   ' })
+  const blank = await api.invoke('note', { sessionKey, runId: 'run-1', message: '   ' })
   assert.equal(blank.ok, false)
+  assert.equal(blank.error.code, 'bad_request')
   assert.match(blank.error.message, /说点什么/)
 
-  const badMode = await api.invoke('steer', { sessionKey, runId: 'run-1', message: 'x', mode: 'shout' })
-  assert.equal(badMode.ok, false)
+  const noKey = await api.invoke('note', { message: 'x' })
+  assert.equal(noKey.ok, false)
 
-  const cmdDir = path.join(dataDir, 'cmd')
-  const leftovers = fs.existsSync(cmdDir) ? fs.readdirSync(cmdDir).filter((n) => n.endsWith('.json')) : []
-  assert.deepEqual(leftovers, [], '被拒的命令不能留在队列里等某个 agent 执行')
+  const tooLong = await api.invoke('note', { sessionKey, message: 'x'.repeat(4_001) })
+  assert.equal(tooLong.ok, false)
+
+  const stopNoRun = await api.invoke('stop', { sessionKey })
+  assert.equal(stopNoRun.ok, false, 'stop 没有 runId 无从停起')
+
+  const dir = path.join(dataDir, 'inbox', sessionKey)
+  const leftovers = fs.existsSync(dir) ? fs.readdirSync(dir).filter((name) => name.endsWith('.json')) : []
+  assert.deepEqual(leftovers, [], '被拒的留言不能留在盘上等某个 agent 投出去')
 })
 
-test('命令超时：5 秒没人认领就撤回，并如实说「会话不活跃」（不能悄悄生效）', async () => {
+test('getState: 带回本会话最近的回执（倒序），别的会话不混进来', async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
-  const sessionFile = path.join(dataDir, 'sessions', 'slow.jsonl')
+  const sessionFile = path.join(dataDir, 'sessions', 'm.jsonl')
   const { sessionKey } = seedLive(dataDir, sessionFile)
+  const receipts = path.join(dataDir, 'receipts')
+  fs.mkdirSync(receipts, { recursive: true })
+  const write = (id, body) => fs.writeFileSync(path.join(receipts, `${id}.json`), JSON.stringify({ id, ...body }))
+  write('a1', { at: 1_000, sessionKey, kind: 'note', runId: 'run-1', state: 'accepted', ok: true })
+  write('a2', { at: 2_000, sessionKey, kind: 'stop', runId: 'run-2', state: 'stopping', ok: true })
+  write('other', { at: 3_000, sessionKey: 'someone-else', kind: 'note', runId: 'run-9', state: 'accepted', ok: true })
+
   const mod = await loadMain()
   const api = await mod.activate(fakeCtx(dataDir))
-
-  const startedAt = Date.now()
-  const result = await api.invoke('stop', { sessionKey, runId: 'run-1' })
-  const elapsed = Date.now() - startedAt
-  assert.equal(result.ok, false)
-  assert.equal(result.error.code, 'timeout')
-  assert.match(result.error.message, /不活跃/)
-  assert.ok(elapsed >= 4_500 && elapsed < 8_000, `等待窗口应当是 5s，实际 ${elapsed}ms`)
-
-  const cmdDir = path.join(dataDir, 'cmd')
-  const leftovers = fs.existsSync(cmdDir) ? fs.readdirSync(cmdDir).filter((n) => n.endsWith('.json')) : []
-  assert.deepEqual(leftovers, [], '超时后必须撤回，否则几秒后子代理真的被停了，用户却以为没生效')
+  const state = await api.invoke('getState', { sessionFile })
+  assert.deepEqual(state.mail.map((item) => item.id), ['a2', 'a1'], '按时间倒序，且只留本会话的')
+  assert.equal(state.mail[0].state, 'stopping')
 })
 
-test('activate: 启动时清理过期命令（陈旧命令不能被下次启动执行）', async () => {
+test('activate: 清理隔夜的留言与回执（昨天留的言不该在开机时突然起一轮）', async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
-  const cmdDir = path.join(dataDir, 'cmd')
-  fs.mkdirSync(cmdDir, { recursive: true })
-  const old = path.join(cmdDir, 'abcdef123456--old.json')
-  fs.writeFileSync(old, JSON.stringify({ action: 'stop', runId: 'run-9', sessionKey: 'abcdef123456', createdAt: 1, id: 'old' }))
-  const past = new Date(Date.now() - 10 * 60 * 1000)
-  fs.utimesSync(old, past, past)
+  const inboxDir = path.join(dataDir, 'inbox', 'abcdef123456')
+  const receipts = path.join(dataDir, 'receipts')
+  fs.mkdirSync(inboxDir, { recursive: true })
+  fs.mkdirSync(receipts, { recursive: true })
+  const oldNote = path.join(inboxDir, 'old-1.json')
+  const oldReceipt = path.join(receipts, 'old-1.json')
+  fs.writeFileSync(oldNote, JSON.stringify({ id: 'old-1', kind: 'note', sessionKey: 'abcdef123456', createdAt: 1, message: 'x' }))
+  fs.writeFileSync(oldReceipt, JSON.stringify({ id: 'old-1', state: 'accepted' }))
+  const past = new Date(Date.now() - 48 * 60 * 60 * 1000)
+  fs.utimesSync(oldNote, past, past)
+  fs.utimesSync(oldReceipt, past, past)
 
   const mod = await loadMain()
   await mod.activate(fakeCtx(dataDir))
-  assert.equal(fs.existsSync(old), false)
+  assert.equal(fs.existsSync(oldNote), false)
+  assert.equal(fs.existsSync(oldReceipt), false)
 })
