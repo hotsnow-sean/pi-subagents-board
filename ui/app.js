@@ -28,6 +28,8 @@ let lastError = ''
 let busy = false
 /** 用户手动展开的链（按 lineageRoot 记），重绘后恢复 */
 const expanded = new Set()
+/** 诊断折叠区的展开状态：每秒整块重绘会把它拍回去，必须自己记 */
+let diagOpen = false
 
 function esc(value) {
   return String(value ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c])
@@ -178,7 +180,7 @@ function render() {
     </div>
     ${renderBanner(data.degrade)}
     ${lineages.length ? lineages.map((lineage) => renderLineage(lineage, now)).join('') : data.degrade?.kind === 'ok' ? '<p class="muted pad">这个会话最近没有子代理运行。</p>' : ''}
-    <details class="diag">
+    <details class="diag"${diagOpen ? ' open' : ''}>
       <summary>诊断</summary>
       <dl>
         <dt>会话</dt><dd>${esc(data.sessionFile || '—')}</dd>
@@ -191,17 +193,28 @@ function render() {
     </details>
   `
   el.scrollTop = scrollTop
-
-  for (const button of el.querySelectorAll('[data-open]')) {
-    button.addEventListener('click', () => {
-      const root = button.getAttribute('data-open')
-      if (!root) return
-      if (expanded.has(root)) expanded.delete(root)
-      else expanded.add(root)
-      render()
-    })
-  }
 }
+
+// 事件委托，挂一次就够——innerHTML 重建不带走 el 自己的监听器。
+// toggle 不冒泡但捕获阶段能到达：details 每次重建后状态由 diagOpen 恢复，
+// 用户点击 summary → 浏览器切 open → toggle 事件更新 diagOpen → 下一帧重绘不丢。
+el.addEventListener(
+  'toggle',
+  (/** @type {Event} */ event) => {
+    const target = /** @type {HTMLElement} */ (event.target)
+    if (target instanceof HTMLDetailsElement && target.classList.contains('diag')) diagOpen = target.open
+  },
+  true,
+)
+el.addEventListener('click', (/** @type {MouseEvent} */ event) => {
+  const button = /** @type {HTMLElement | null} */ (/** @type {HTMLElement} */ (event.target)?.closest?.('[data-open]'))
+  if (!button) return
+  const root = button.getAttribute('data-open')
+  if (!root) return
+  if (expanded.has(root)) expanded.delete(root)
+  else expanded.add(root)
+  render()
+})
 
 async function tick() {
   if (busy) return

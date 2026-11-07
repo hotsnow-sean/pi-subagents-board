@@ -219,6 +219,104 @@ test('mergeStatus: 多 child 的 run 不硬塞同一个子会话路径', () => {
   assert.equal(children[1].sessionFile, null)
 })
 
+test('mergeStatus: children 不带 index 时按位置归位，不无限追加（实测刷屏 bug）', () => {
+  const state = fresh()
+  applyStarted(state, { id: 'run-1', agent: 'worker' }, BASE)
+  // pi-subagents 的 status children 实测没有 index 字段
+  const snapshot = {
+    runs: [
+      {
+        id: 'run-1',
+        state: 'running',
+        children: [{ agent: 'worker', state: 'running', model: 'm2', thinking: 'high', activity: { lastActivityAt: BASE + 1_000 } }],
+      },
+    ],
+  }
+  for (let i = 1; i <= 10; i += 1) {
+    mergeStatus(state, JSON.parse(JSON.stringify(snapshot)), BASE + i * 1_000)
+  }
+  const children = state.lineages[0].segments[0].children
+  assert.equal(children.length, 1, '轮询 10 次也只应有 1 条 child')
+  assert.equal(children[0].model, 'm2')
+  assert.equal(children[0].thinking, 'high')
+})
+
+test('mergeStatus: 已终态的段跳过 status（心跳不再写盘、lastActivityAt 不再动）', () => {
+  const state = fresh()
+  applyStarted(state, { id: 'run-1', agent: 'worker' }, BASE)
+  applyComplete(
+    state,
+    {
+      id: 'run-1',
+      state: 'complete',
+      success: true,
+      timestamp: BASE + 1_000,
+      durationMs: 1_000,
+      sessionFile: 'C:/sessions/a/run-1/run-0/session.jsonl',
+      results: [{ sessionFile: 'C:/sessions/a/run-1/run-0/session.jsonl' }],
+    },
+    BASE + 1_000,
+  )
+  const before = JSON.stringify(state.lineages[0])
+  mergeStatus(
+    state,
+    {
+      runs: [{ id: 'run-1', state: 'complete', updatedAt: BASE + 999_999, children: [{ agent: 'ghost', state: 'running' }] }],
+    },
+    BASE + 999_999,
+  )
+  assert.equal(JSON.stringify(state.lineages[0]), before, '终态段必须原封不动')
+})
+
+test('listLineages: 读出时收敛重复 children（自愈旧数据）', () => {
+  const state = fresh()
+  applyStarted(state, { id: 'run-1', agent: 'worker' }, BASE)
+  const segment = state.lineages[0].segments[0]
+  // 模拟修复前攒出来的脏数据：同一条 child 被 byIndex.size 兜底追加了 3 次
+  // （签名相同 = 同一份 status 快照反复到达；带 sessionFile 的那条是 complete 事件补的）
+  segment.children = [
+    { index: 0, agent: 'worker', model: 'm1', state: 'complete', lastActivityAt: BASE, sessionFile: null },
+    { index: 1, agent: 'worker', model: 'm2', state: 'complete', lastActivityAt: BASE, sessionFile: 'C:/x/session.jsonl' },
+    { index: 2, agent: 'worker', model: 'm2', state: 'complete', lastActivityAt: BASE, sessionFile: null },
+  ]
+  const list = listLineages(state)
+  assert.equal(list[0].segments[0].children.length, 2, '签名相同的两条应收敛，不同签名保留')
+  assert.equal(list[0].segments[0].children[0].sessionFile, null, 'm1 没有带路径的替身，原样保留')
+  assert.equal(list[0].segments[0].children[1].sessionFile, 'C:/x/session.jsonl', '签名组内优先保留带 sessionFile 的那条')
+  // 状态本体不动（浅拷贝语义）
+  assert.equal(segment.children.length, 3)
+})
+
+test('listLineages: model 的 :档位 后缀拆成 thinking，同一条 child 两种表述收敛为一条', () => {
+  const state = fresh()
+  applyStarted(state, { id: 'run-1', agent: 'worker' }, BASE)
+  const segment = state.lineages[0].segments[0]
+  // 复刻实测脏数据形状：complete results 的 model 带 :high 后缀，status 的 model+thinking 分写
+  segment.children = [
+    { index: 0, agent: 'worker', model: 'deepseek/x:high', thinking: null, state: 'complete', lastActivityAt: BASE + 129, sessionFile: 'C:/x/session.jsonl' },
+    { index: 1, agent: 'worker', model: 'deepseek/x', thinking: 'high', state: 'complete', lastActivityAt: BASE, sessionFile: 'C:/x/session.jsonl' },
+    { index: 2, agent: 'worker', model: 'deepseek/x', thinking: 'high', state: 'complete', lastActivityAt: BASE, sessionFile: null },
+  ]
+  const list = listLineages(state)
+  assert.equal(list[0].segments[0].children.length, 1, '同一条 child 的两种表述应收敛为一条')
+  const child = list[0].segments[0].children[0]
+  assert.equal(child.model, 'deepseek/x')
+  assert.equal(child.thinking, 'high')
+  assert.equal(child.sessionFile, 'C:/x/session.jsonl')
+})
+
+test('listLineages: 无路径的并行 children 按 lastActivityAt 区分，不误合', () => {
+  const state = fresh()
+  applyStarted(state, { id: 'run-1', agent: 'worker' }, BASE)
+  const segment = state.lineages[0].segments[0]
+  segment.children = [
+    { index: 0, agent: 'worker', model: 'm1', thinking: null, state: 'running', lastActivityAt: BASE + 1_000, sessionFile: null },
+    { index: 1, agent: 'worker', model: 'm1', thinking: null, state: 'running', lastActivityAt: BASE + 2_000, sessionFile: null },
+  ]
+  const list = listLineages(state)
+  assert.equal(list[0].segments[0].children.length, 2, 'lastActivityAt 不同的并行 child 必须都保留')
+})
+
 test('listLineages: 按最后活动时间降序（复活后回到顶部）', () => {
   const state = fresh()
   applyStarted(state, { id: 'run-old', agent: 'worker' }, BASE)
