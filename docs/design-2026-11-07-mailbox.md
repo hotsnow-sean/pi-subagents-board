@@ -343,3 +343,31 @@ dataDir/receipts/<id>.json              agent 独占写；存在 = 已处理（�
 - 停止就地二次确认（3s 回退），永不占输入区
 - 绿色结果横幅删除；提示改为顶部 absolute 浮层（不占文档流）
 - 渲染三条：计时数字单独 `textContent` 更新；HTML 未变不碰 DOM；编辑留言时暂停重绘（表单自身状态变化放行一次，`paintOnce`）
+
+---
+
+## 9. 返工：投递对象改回子代理（0.6.0）
+
+0.5.0 上线前，零语指出：A 方案的**形态**是对的，但**投递对象**错了——既然扩展本身
+就提供对子代理的 steer（`subagent({ action: "steer", id })` / RPC `steer`），
+留言就应该直达那个 run，而不是绕道主会话让模型转派。0.5.0 的「放弃直接引导」
+只该放弃**输入坞**那层 UI，不该放弃直达的通道。
+
+改动（`git 8459a70..HEAD`）：
+
+| 0.5.0（投主会话） | 0.6.0（投子代理） |
+|---|---|
+| `pi.sendUserMessage(text, { deliverAs: 'steer' })`，不 await | `request('steer', { id: runId, message, mode })`，await |
+| 回执两态：`accepted` / 4s 后改口「未确认」 | 回执记扩展收据：`delivered` / `queued` / 失败原因原文 |
+| note 带前缀「来自子代理面板 · 关于 X / run Y」 | 正文原样，零前缀（不污染子代理上下文） |
+| TTL 10 分钟（怕隔夜突然起一轮） | TTL 2 分钟（steer 是瞬时动作，隔久了必撞终态） |
+| `renderNoteText` 翻译层 | 删除 |
+| note 不要求 runId | runId 必填（投递地址），新增 `mode`（默认 steer）与 `index` |
+
+不变的部分：一消息一文件 + 回执独占写的邮箱结构、A 方案卡片内联 UI、
+停止保留直连（生命周期控制）、面板不等回执只轮询。
+
+一个吃到的教训记在这里：**「参照 DSH 放弃直接引导」抄的是它的 UI 权衡，不是它的能力边界。**
+DSH 面板只能对 captain 说话，是因为它的成员没有可寻址的对话通道；而 pi-subagents 有
+（steering inbox 是一等公民）。能力存在时，绕道模型转派反而是更差的选择——转派靠模型配合，
+迟到、漏转、改写都可能发生。

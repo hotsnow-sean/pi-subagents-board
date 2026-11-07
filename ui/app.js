@@ -1,10 +1,10 @@
 /*
  * 子代理面板。
  *
- * 观测 + 两件事：留言给主会话、停止一个 run。
+ * 观测 + 两件事：插话（对某个 run 发一次 steer）、停止一个 run。
  *
  * 交互形态定为「A · 卡片内联」：
- *   - 留言入口在卡片上，点了就地展开一个小表单，提交后收起、原地留一行回执。
+ *   - 插话入口在卡片上，点了就地展开一个小表单，提交后收起、原地留一行回执。
  *     没有常驻输入坞 —— 那玩意儿既占版面，又永远说不清「我现在说的是谁」。
  *   - 停止不占输入区：按钮就地变「确认停止」，3 秒不点自动退回。
  *   - 不再有绿色/结果横幅：它会顶得内容往下跳（U4）。
@@ -13,7 +13,7 @@
  *   1. **计时数字单独更新**：卡片 HTML 里只放 `<span data-timing>`，每秒用 textContent
  *      改那一个数字，不重建 DOM。否则整块 innerHTML 每秒重来一次，选区、焦点、动画全丢。
  *   2. **HTML 没变就不碰 DOM**：`lastHtml` 比对，相等直接返回。
- *   3. **编辑留言时暂停重绘**：用户正在打字的那几秒，画面不该动；提交/取消后再同步。
+ *   3. **编辑插话时暂停重绘**：用户正在打字的那几秒，画面不该动；提交/取消后再同步。
  */
 
 const bridge = window.pi || {
@@ -37,21 +37,24 @@ const expanded = new Set()
 let diagOpen = false
 /** 上一帧的 HTML：一样就不碰 DOM */
 let lastHtml = ''
-/** 编辑留言时默认不重绘；改表单自身状态（展开/发送中）时放行一次 */
+/** 编辑插话时默认不重绘；改表单自身状态（展开/发送中）时放行一次 */
 let paintOnce = false
 
-/** 正在编辑的留言：`{ runId, agent, text, busy, error }` */
+/** 正在编辑的插话：`{ runId, agent, mode, text, busy, error }` */
 let noteDraft = /** @type {any} */ (null)
 /** 停止的二次确认：`{ runId, until }`，3 秒不点自动回退 */
 let stopConfirm = /** @type {any} */ (null)
 /** 顶部浮层提示（绝对定位，不占文档流，所以不会顶内容） */
 let notice = /** @type {{ text: string, tone: string, at: number } | null} */ (null)
-/** 本会话发出去、还在等回执的留言：`[{ id, runId, kind, at }]` */
+/** 本会话发出去、还在等回执的投递：`[{ id, runId, kind, at }]` */
 const sentNotes = []
 
 const NOTICE_MS = { ok: 3_000, warn: 8_000, error: 8_000, info: 4_000 }
-/** 发出多久还没回执，就从「等待中」改口成「未确认」 */
-const RECEIPT_PATIENCE_MS = 4_000
+/**
+ * 发出多久还没回执，就从「投递中」改口成「未确认」。
+ * 6 秒的口径：worker 500ms 轮询 + 扩展内部最多 3s ack 等待 + RPC 往返。
+ */
+const RECEIPT_PATIENCE_MS = 6_000
 
 function setNotice(text, tone = 'info') {
   notice = { text, tone, at: Date.now() }
@@ -162,9 +165,9 @@ function renderChildren(segment, now) {
     .join('')}</ul>`
 }
 
-/* ---------- 留言（A 方案：卡片内联） ---------- */
+/* ---------- 插话（A 方案：卡片内联） ---------- */
 
-/** 这个 run 上最近一条留言回执：先看 agent 写的，再看本地「已发出待确认」 */
+/** 这个 run 上最近一条投递回执：先看 agent 写的，再看本地「已发出待确认」 */
 function mailFor(runId) {
   const id = String(runId ?? '')
   if (!id) return null
@@ -174,27 +177,28 @@ function mailFor(runId) {
   return pending ? { confirmed: false, ...pending } : null
 }
 
-/** 回执文案：只说事实——我们不知道主代理「读没读」，别编 */
+/** 回执文案：四种事实，全部来自扩展给的结果，不猜 */
 function describeMail(mail) {
   if (!mail) return null
   const kind = mail.kind === 'stop' ? 'stop' : 'note'
   if (!mail.confirmed) {
     const age = Date.now() - Number(mail.at || 0)
     if (age < RECEIPT_PATIENCE_MS) {
-      return { text: kind === 'stop' ? '停止请求已发出…' : '已发出，等主代理接收…', tone: 'waiting' }
+      return { text: kind === 'stop' ? '停止请求已发出…' : '正在投递给子代理…', tone: 'waiting' }
     }
     return {
       text:
         kind === 'stop'
-          ? '停止请求已发出，但没等到确认（会话可能不在运行）'
-          : '已发出，但没等到确认（会话可能不在运行）',
+          ? '停止请求已发出，但没等到确认（父会话进程可能不在）'
+          : '已发出，但没等到确认（父会话进程可能不在）',
       tone: 'warn',
     }
   }
   if (mail.state === 'expired') return { text: '这条没投出去：已经过期了', tone: 'warn' }
   if (!mail.ok) return { text: mail.error || '投递失败', tone: 'error' }
   if (kind === 'stop') return { text: `已受理停止 · ${fmtClock(mail.at)}`, tone: 'ok' }
-  return { text: `已投给主代理 · ${fmtClock(mail.at)}`, tone: 'ok' }
+  if (mail.state === 'delivered') return { text: `已插进子代理这一轮 · ${fmtClock(mail.at)}`, tone: 'ok' }
+  return { text: `已排队，等它这一步结束 · ${fmtClock(mail.at)}`, tone: 'ok' }
 }
 
 function renderMailLine(segment) {
@@ -204,16 +208,16 @@ function renderMailLine(segment) {
 }
 
 /**
- * 留言表单。**只在编辑这一个 run 时出现**，提交即收起。
+ * 插话表单。**只在编辑这一个 run 时出现**，提交即收起。
  * 编辑期间 render 会整体跳过（见 render 开头），所以这里的 textarea 不会被重建。
  */
 function renderNoteForm(segment) {
   if (!noteDraft || String(noteDraft.runId) !== String(segment.runId)) return ''
   const busyAttr = noteDraft.busy ? ' disabled' : ''
   return `<div class="note-form">
-    <textarea data-note-input rows="2" placeholder="跟主代理说一句（Enter 发送，Shift+Enter 换行）"${busyAttr}>${esc(noteDraft.text)}</textarea>
+    <textarea data-note-input rows="2" placeholder="对 ${esc(noteDraft.agent || '这个子代理')} 说一句（Enter 发送，Shift+Enter 换行）"${busyAttr}>${esc(noteDraft.text)}</textarea>
     <div class="note-row">
-      <span class="note-hint">发给主代理 · 关于 ${esc(noteDraft.agent || '这个子代理')}</span>
+      <span class="note-hint">插进它当前这一轮</span>
       <span class="spacer"></span>
       <button class="act" data-note-cancel${busyAttr}>取消</button>
       <button class="act act-primary" data-note-send${busyAttr}>${noteDraft.busy ? '发送中…' : '发送'}</button>
@@ -230,7 +234,7 @@ function renderActions(segment) {
   const runId = esc(segment.runId)
   const acts = []
   if (segment.canSteer) {
-    acts.push(`<button class="act" data-note="${runId}">留言…</button>`)
+    acts.push(`<button class="act" data-note="${runId}">插话…</button>`)
   }
   if (segment.canStop) {
     const confirming = stopConfirm && String(stopConfirm.runId) === String(segment.runId) && Date.now() < stopConfirm.until
@@ -315,7 +319,7 @@ function renderNotice() {
 
 function render() {
   const now = Date.now()
-  // 编辑留言时不重建：用户正在打字，画面一动就丢焦点，而且卡片位置会跳。
+  // 编辑插话时不重建：用户正在打字，画面一动就丢焦点，而且卡片位置会跳。
   // 但「展开表单」「切成发送中」这些是表单自己的状态变化，要放行一次。
   if (noteDraft && !paintOnce) {
     tickTimings()
@@ -376,7 +380,7 @@ function render() {
         <dt>能力</dt><dd>${esc((data.source?.capabilities || []).join(', ') || '—')}</dd>
         <dt>干预</dt><dd>${esc(
           data.source?.supports
-            ? `留言 ${data.source.supports.steer ? '可用' : '不支持'} · 停止 ${data.source.supports.stop ? '可用' : '不支持'}`
+            ? `插话 ${data.source.supports.steer ? '可用' : '不支持'} · 停止 ${data.source.supports.stop ? '可用' : '不支持'}`
             : '—（扩展未公告）',
         )}</dd>
         <dt>事件</dt><dd>${esc((data.source?.events || []).join(', ') || '—')}</dd>
@@ -402,6 +406,7 @@ function openNote(runId) {
   noteDraft = {
     runId: String(runId),
     agent: String(segment?.agent || ''),
+    mode: 'steer',
     text: '',
     busy: false,
     error: '',
@@ -426,7 +431,7 @@ async function submitNote() {
     render()
     return
   }
-  // 留言发给**父会话**：预览子会话时链属于父会话，ownerSessionKey 才是跑着这条链的那个
+  // 投递按**父会话**寻址：预览子会话时链属于父会话，跑着这条链的 agent 在父会话进程里
   const sessionKey = String(snapshot?.ownerSessionKey || '')
   if (!sessionKey) {
     noteDraft.error = '拿不到会话标识，先切回主会话再试'
@@ -443,6 +448,8 @@ async function submitNote() {
       sessionKey,
       runId: noteDraft.runId,
       agent: noteDraft.agent || undefined,
+      // 默认打断它当前这一轮；扩展还支持 follow_up（等这一轮做完再说），需要时由 UI 加开关
+      mode: noteDraft.mode || 'steer',
       message: text,
     })
     if (!result?.ok) {
@@ -604,7 +611,7 @@ bridge.on('context', (next) => {
   context = next || {}
   snapshot = null
   lastHtml = ''
-  // 换会话了，正在编辑的留言指向的 run 已经不在这个会话里——留着只会发错地方
+  // 换会话了，正在编辑的插话指向的 run 已经不在这个会话里——留着只会发错地方
   noteDraft = null
   stopConfirm = null
   sentNotes.length = 0

@@ -72,13 +72,15 @@ pi-subagents (worker 进程内)
         读：ping / status / 事件        写：steer / stop
 agent.mjs（worker 进程，宿主注入的 pi extension）
       ↓ 原子写 <dataDir>/live/<sessionKey>-<pid>-<startedAt>.json
-      ↑ 认领 <dataDir>/cmd/<sessionKey>--<id>.json，执行后写 cmd-result/<id>.json
+      ↑ 读 <dataDir>/inbox/<sessionKey>/<id>.json，执行后写 receipts/<id>.json
 main.mjs（main 进程）
-      ↕ 插件面板通过 pi.invoke('getState' | 'steer' | 'stop', …) 每秒读 / 按需写
+      ↕ 插件面板通过 pi.invoke('getState' | 'note' | 'stop', …) 每秒读 / 按需写
 ui/（sandbox iframe）
 ```
 
-main 与 worker 之间没有插件可用的 IPC 通道，所以两个方向都走文件。文件名带实例后缀是必需的：会话切换会让插件扩展**换代**（工厂重新调用、state 清空），共用文件名会把上一代结果覆盖成空白。命令文件名带会话前缀同理：多个 worker 在扫同一个 `cmd/` 目录，不按前缀分流就会把 A 会话的插话发给 B 的子代理。
+main 与 worker 之间没有插件可用的 IPC 通道，所以两个方向都走文件。文件名带实例后缀是必需的：会话切换会让插件扩展**换代**（工厂重新调用、state 清空），共用文件名会把上一代结果覆盖成空白。
+
+「插话」= 对某个 run 的一次 steer：面板写一条不可变的 note，worker 里的 agent 读到后调扩展的 `steer` RPC（`{ id, message, mode }`），把扩展返回的 steering 收据写成回执。不自己实现投递状态机、不做双端死线，也不碰别人的会话文件——steer 的落点是那个 run 自己的 steering inbox。
 
 ## 路线图
 

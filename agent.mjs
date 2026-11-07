@@ -3,7 +3,7 @@
  * subagents-board — 会话进程（worker）内的 RPC 客户端。
  *
  * 职责是两件事：把 pi-subagents 的运行状态变成一份**可读的落盘快照**给面板；把面板的
- * 留言投给**本会话自己的** agent 循环。不渲染、不决策。
+ * 留言变成一次 **steer RPC**（投给指定子代理 run）。不渲染、不决策。
  *
  * 为什么不做宿主 IPC：插件 main 与 worker 之间没有可用通道（宿主 IPC 是宿主自己的）。
  * 读方向用文件（本文件写 live/、main 读）；写方向用留言邮箱（main 写 inbox/、本文件写
@@ -26,7 +26,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 
 import { applyComplete, applyStarted, createState, mergeStatus } from './lib/lineage.mjs'
-import { INBOX_DIR, RECEIPT_DIR, isFresh, parseNoteFileName, renderNoteText } from './lib/note-queue.mjs'
+import { INBOX_DIR, RECEIPT_DIR, isFresh, parseNoteFileName } from './lib/note-queue.mjs'
 import { ensureLiveDir, liveFileOf, writeJsonAtomic } from './lib/live-store.mjs'
 import { childSessionFile, sessionKeyOf } from './lib/session-key.mjs'
 
@@ -44,6 +44,11 @@ const MAX_STATUS_FAILURES = 3
 const NOTE_POLL_MS = 500
 /** stop 的 RPC 超时：扩展要中断子进程并收敛状态 */
 const STOP_TIMEOUT_MS = 10_000
+/**
+ * steer 的 RPC 超时：扩展内部会等 3s ack 才返回，再加余量。
+ * 超时只说明「没等到 RPC 回答」，不代表没投出去——回执照实说「未确认」，不编。
+ */
+const STEER_TIMEOUT_MS = 12_000
 
 /**
  * @param {import('@earendil-works/pi-coding-agent').ExtensionAPI} pi
@@ -335,21 +340,14 @@ export default function subagentsBoard(pi, ctx) {
     if (typeof handshakeTimer.unref === 'function') handshakeTimer.unref()
   }
 
-  // ---------- 留言邮箱（面板 → 主会话） ----------
+  // ---------- 留言邮箱（面板 → 子代理 run） ----------
 
   /**
-   * 面板不再「遥控」子代理，只**给主会话留一句话**。落点是 SDK 的 `sendUserMessage`：
+   * 一条留言 = 对该 run 的一次 steer。这里只做三件事：校验目标、发 RPC、把扩展的回答写成回执。
    *
-   *   `sendUserMessage(text, { deliverAs })` 内部就是 `prompt(text, { streamingBehavior: deliverAs })`，
-   *   而 `prompt` **只在 isStreaming 分支**读 `streamingBehavior`
-   *   （否则抛 "Agent is already processing. Specify streamingBehavior"）。
-   *
-   *   于是固定传 `deliverAs: 'steer'` 天然覆盖两种场景，不需要我们判断会话忙闲、也不需要排队状态机：
-   *     空闲     → 忽略该参数，直接起一轮（等于用户自己打字）
-   *     正在跑   → 插进当前轮（steer）
-   *
-   * 这套替代了 P2-c 的 cmd-queue（文件命令 + rename 认领 + 5s 双端死线 + 双端过期）。
-   * 那层的每一条复杂度都是在补「跨进程投递的不确定性」，而现在投递目标是**本进程自己的会话**。
+   * 不再自己实现状态机：`steering.state` 直接来自 pi-subagents
+   * （scheduled / pending / queued / delivered），我们只把它压成面板要的两种事实——
+   * 「已经进了它这一轮」和「排在它这一轮之后」。不猜、不重试、不做死线。
    */
 
   const inboxRoot = path.join(ctx.dataDir, INBOX_DIR)
@@ -440,11 +438,11 @@ export default function subagentsBoard(pi, ctx) {
   /** @param {any} note @param {string} id */
   async function runNote(note, id) {
     if (!isFresh(note, Date.now())) {
-      // 只有 agent 侧判过期（单端）：用户昨晚留的言不该在早上开机时突然起一轮模型调用
+      // 只有 agent 侧判过期（单端）：steer 是瞬时动作，几分钟前的留言投过去也只会撞上终态
       writeReceipt(id, note, {
         ok: false,
         state: 'expired',
-        error: { code: 'expired', message: '这条留言已经过期，没有投递（当时那个会话大概没在运行）' },
+        error: { code: 'expired', message: '这条已经过期，没有投递（当时父会话进程没在跑）' },
       })
       return
     }
@@ -453,31 +451,32 @@ export default function subagentsBoard(pi, ctx) {
       return
     }
 
-    const text = renderNoteText(note)
-    let accepted = true
-    try {
-      const maybe = /** @type {any} */ (pi.sendUserMessage(text, { deliverAs: 'steer' }))
-      // sendUserMessage 在空闲时会一直挂到整轮结束，所以不 await：先记「已投」，
-      // 真出错再用同一份回执覆盖（原子写，main 读到的永远是最后一份）
-      if (maybe && typeof maybe.catch === 'function') {
-        maybe.catch((/** @type {unknown} */ error) => {
-          writeReceipt(id, note, {
-            ok: false,
-            state: 'failed',
-            error: { code: 'send_failed', message: error instanceof Error ? error.message : String(error) },
-          })
-        })
-      }
-    } catch (error) {
-      accepted = false
+    const runId = String(note.runId ?? '').trim()
+    if (!runId) {
+      writeReceipt(id, note, { ok: false, state: 'failed', error: { code: 'bad_request', message: '缺少 runId' } })
+      return
+    }
+    /** @type {Record<string, unknown>} */
+    const params = { id: runId, message: String(note.message ?? ''), mode: String(note.mode || 'steer') }
+    if (Number.isInteger(note.index)) params.index = note.index
+
+    const reply = await request('steer', params, STEER_TIMEOUT_MS)
+    if (reply.ok) {
+      // 扩展的 steering 收据：delivered = 已经进了它在跑的这一轮；其余都算排队。
+      // 两种形状都认（RPC 回的是 { text, details:{ steering } }，老版本可能直给收据本体）
+      const steering = reply.data?.details?.steering ?? reply.data ?? null
+      const upstream = String(steering?.state || 'queued')
+      writeReceipt(id, note, { ok: true, state: upstream === 'delivered' ? 'delivered' : 'queued', upstream })
+      // status 里也记了 steering，立刻读一次让卡片上的转向提示跟上，不等心跳
+      void readStatus('after-steer')
+    } else {
       writeReceipt(id, note, {
         ok: false,
         state: 'failed',
-        error: { code: 'send_failed', message: error instanceof Error ? error.message : String(error) },
+        error: reply.error ?? { code: 'failed', message: '扩展拒绝了这次投递' },
       })
     }
-    if (accepted) writeReceipt(id, note, { ok: true, state: 'accepted' })
-    ctx.log(`note ${id} → ${accepted ? 'sent to main session' : 'failed'}`)
+    ctx.log(`steer ${runId}: ${reply.ok ? 'accepted' : 'failed'}`)
   }
 
   /** @param {any} note @param {string} id */

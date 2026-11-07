@@ -16,9 +16,6 @@ function fakePi() {
   const listeners = new Map()
   /** @type {Map<string, Function>} */
   const hooks = new Map()
-  /** 投出去的留言。真实实现在空闲时会挂到整轮结束，这里立即 resolve 就够 */
-  /** @type {{ content: string, options: any }[]} */
-  const sent = []
   const pi = {
     events: {
       on(name, cb) {
@@ -32,14 +29,9 @@ function fakePi() {
     on(name, cb) {
       hooks.set(name, cb)
     },
-    sendUserMessage(content, options) {
-      sent.push({ content, options })
-      return Promise.resolve()
-    },
   }
   return {
     pi,
-    sent,
     hook(name) {
       return hooks.get(name)
     },
@@ -81,9 +73,14 @@ function fakeServer(harness, options = {}) {
     }
     if (request.method === 'steer') {
       commands.push({ method: 'steer', params: request.params })
+      // 真实形状：dataFromToolResult 给 { text, details: { steering } }
+      const steeringState = options.steerState ?? 'queued'
       harness.emit(replyName, {
         success: true,
-        data: { deliveryStatus: 'queued', state: 'pending', targets: [{ index: 0, state: 'pending' }] },
+        data: {
+          text: 'Steering queued',
+          details: { mode: 'management', results: [], steering: { state: steeringState, deliveryStatus: steeringState, targets: [{ index: 0, state: steeringState }] } },
+        },
       })
       return
     }
@@ -237,30 +234,38 @@ function readReceipt(dataDir, id) {
   return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : null
 }
 
-test('agent: 扫到留言就投给本会话（sendUserMessage + steer），并把回执写回去', async () => {
-  const { dataDir, harness } = await boot()
+test('agent: 扫到插话就发一次 steer RPC 给那个 run，回执记扩展给的状态', async () => {
+  const { dataDir, server } = await boot()
   await sleep(500)
   const { key } = postNoteFile(dataDir, {
     id: 'n1',
     kind: 'note',
     runId: 'run-1',
     agent: 'code-reviewer',
+    mode: 'steer',
     message: '换个方向',
   })
   assert.equal(await waitFor(() => readReceipt(dataDir, 'n1') !== null), true, '500ms 内该被扫到并投出去')
 
   const receipt = readReceipt(dataDir, 'n1')
   assert.equal(receipt.ok, true)
-  assert.equal(receipt.state, 'accepted')
+  assert.equal(receipt.state, 'queued', '扩展说排队就报排队，不自己升级成 delivered')
+  assert.equal(receipt.upstream, 'queued')
   assert.equal(receipt.runId, 'run-1', '回执要带 runId，UI 靠它匹配卡片')
   assert.equal(receipt.sessionKey, key)
 
-  const sent = harness.sent.at(-1)
-  assert.ok(sent, '要真的投出去')
-  assert.match(sent.content, /换个方向/)
-  assert.match(sent.content, /code-reviewer/, '文本要带上是哪个子代理，否则主会话看不懂在说什么')
-  // deliverAs 固定传 steer：prompt() 只在 isStreaming 分支读它，空闲时直接忽略 → 一种写法覆盖两种状态
-  assert.equal(sent.options.deliverAs, 'steer')
+  const sent = server.commands.at(-1)
+  assert.equal(sent.method, 'steer', '投递走扩展的 steering，不再落到主会话的 prompt')
+  assert.deepEqual(sent.params, { id: 'run-1', message: '换个方向', mode: 'steer' })
+})
+
+test('agent: 扩展说 delivered 就报「已插进这一轮」，index 会原样带到 RPC', async () => {
+  const { dataDir, server } = await boot({ steerState: 'delivered' })
+  await sleep(500)
+  postNoteFile(dataDir, { id: 'n2', kind: 'note', runId: 'run-3', index: 1, message: '看第二段' })
+  assert.equal(await waitFor(() => readReceipt(dataDir, 'n2') !== null), true)
+  assert.equal(readReceipt(dataDir, 'n2').state, 'delivered')
+  assert.deepEqual(server.commands.at(-1).params, { id: 'run-3', message: '看第二段', mode: 'steer', index: 1 })
 })
 
 test('agent: stop 走扩展的 stop RPC，回执是 stopping，并立刻拉一次 status（不等心跳）', async () => {
@@ -275,8 +280,8 @@ test('agent: stop 走扩展的 stop RPC，回执是 stopping，并立刻拉一�
   assert.equal(receipt.kind, 'stop')
 })
 
-test('agent: 过期的留言不投，只记一条 expired（隔夜的留言不该在开机时突然起一轮）', async () => {
-  const { dataDir, harness } = await boot()
+test('agent: 过期的留言不投，只记一条 expired（几分钟前的留言投过去也只会撞上终态）', async () => {
+  const { dataDir, harness, server } = await boot()
   await sleep(500)
   postNoteFile(dataDir, {
     id: 'old1',
@@ -288,17 +293,17 @@ test('agent: 过期的留言不投，只记一条 expired（隔夜的留言不�
   const receipt = readReceipt(dataDir, 'old1')
   assert.equal(receipt.ok, false)
   assert.equal(receipt.state, 'expired')
-  assert.equal(harness.sent.length, 0, '过期就一个字都不能投')
+  assert.equal(server.commands.length, 0, '过期就一个字都不能投')
 })
 
 test('agent: 已有回执的留言不重复投（换代/重启后幂等），别的会话的目录不碰', async () => {
-  const { dataDir, harness, server } = await boot()
+  const { dataDir, server } = await boot()
   await sleep(500)
-  const { file } = postNoteFile(dataDir, { id: 'dup1', kind: 'note', message: '只投一次' })
+  const { file } = postNoteFile(dataDir, { id: 'dup1', kind: 'note', runId: 'run-1', message: '只投一次' })
   fs.mkdirSync(path.join(dataDir, 'receipts'), { recursive: true })
   fs.writeFileSync(
     path.join(dataDir, 'receipts', 'dup1.json'),
-    JSON.stringify({ id: 'dup1', ok: true, state: 'accepted' }),
+    JSON.stringify({ id: 'dup1', ok: true, state: 'queued' }),
   )
 
   // 另一个会话的收件箱：本会话不该读，更不该执行
@@ -310,8 +315,7 @@ test('agent: 已有回执的留言不重复投（换代/重启后幂等），别
   )
 
   await sleep(1_200)
-  assert.equal(harness.sent.length, 0, '有回执就别再投')
-  assert.equal(server.commands.length, 0, '别的会话的 stop 不能被执行')
+  assert.equal(server.commands.length, 0, '有回执就别再投；别的会话的 stop 也不能被执行')
   assert.equal(fs.existsSync(file), true, '留言不可变，投完也不删（幂等靠回执判断）')
   assert.equal(fs.existsSync(path.join(foreignDir, 'x1.json')), true)
 })

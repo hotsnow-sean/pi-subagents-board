@@ -26,7 +26,7 @@ html, body {
   font: 13px/1.5 system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
 }
 
-/* 没有常驻坞了：面板就是一个滚动容器（留言在卡片内联展开） */
+/* 没有常驻坞了：面板就是一个滚动容器（插话在卡片内联展开） */
 #app {
   height: 100%;
   overflow-y: auto;
@@ -246,7 +246,7 @@ html, body {
 .diag dd { margin: 0; word-break: break-all; }
 
 
-/* ---------- 干预：留言（卡片内联）+ 停止（就地二次确认） ---------- */
+/* ---------- 干预：插话（卡片内联）+ 停止（就地二次确认） ---------- */
 
 .actions {
   display: flex;
@@ -275,7 +275,7 @@ html, body {
 }
 .act-primary:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }
 
-/* 留言表单：就地展开，不占别人的位置 */
+/* 插话表单：就地展开，不占别人的位置 */
 .note-form {
   margin-top: 8px;
   padding: 8px;

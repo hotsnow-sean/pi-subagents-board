@@ -4,7 +4,7 @@
  * subagents-board — main 侧服务（入口）。
  *
  * 两件事：把 agent.mjs 落盘的 live 状态读出来，附带一份「这份数据能不能信」的判定，
- * 交给面板；以及把面板的留言**投给主会话**（不投给子代理——那是扩展自己的事）。
+ * 交给面板；以及把面板的留言投给**指定的子代理 run**（worker 侧发一次 steer RPC）。
  *
  * 契约：
  *   invoke('getState', { sessionFile }) →
@@ -12,10 +12,10 @@
  *       activeCount, mail, now }
  *   invoke('getDiagnostics', { sessionFile }) → 原始 live 状态（面板的「诊断」折叠区用）
  *   invoke('openSession', { sessionFile }) → { ok }（宿主 activate：主会话可写、子会话预览）
- *   invoke('note', { sessionKey, runId?, agent?, message }) → { ok, id, expiresAt }
+ *   invoke('note', { sessionKey, runId, index?, agent?, mode?, message }) → { ok, id, expiresAt }
  *   invoke('stop', { sessionKey, runId }) → { ok, id, expiresAt }
  *     （两种写入都是「一消息一文件」写进 inbox/<sessionKey>/，**不等回执**；
- *       worker 里的 agent 扫到后调 SDK / 扩展，把结果写进 receipts/<id>.json，
+ *       worker 里的 agent 扫到后调扩展的 steer / stop RPC，把结果写进 receipts/<id>.json，
  *       面板从 getState().mail 读。详见 lib/note-queue.mjs）
  *
  * ── 多文件结构与热重载 ─────────────────────────────────────────────────────
@@ -156,12 +156,12 @@ function ledgerPath(ctx) {
 const MAIL_LIMIT = 24
 
 /**
- * 投一条留言。**不等回执**——这是和 P2-c 最大的区别。
+ * 投一条留言。**不等回执**——投递是 worker 侧的一次 steer RPC，结果由回执如实带回。
  *
  * P2-c 的 dispatchCommand 写完命令文件还要轮询 5s 等结果，超时就把命令撤回，
  * 于是出现「面板说没送达、几秒后子代理却真被插了话」这种无法解释的行为。
- * 现在投递目标是本会话自己的 agent 循环：面板写完就走，回执由 UI 通过 getState 轮询拿，
- * 只显示三种事实——已发出 / 已被主代理接收 / 没等到确认。
+ * 现在面板写完就走，UI 通过 getState 轮询 receipts：拿不到就是拿不到（说「没等到确认」），
+ * 拿到就是扩展给的确定状态（已插入 / 已排队 / 失败原因）。
  * @param {any} ctx
  * @param {any} input
  */
@@ -305,13 +305,15 @@ async function handleInvoke(method, params) {
     }
     case 'note':
     case 'stop': {
-      // 面板只有两种写入：给主会话留言、停止一个 run。字段校验全在 buildNote 里做，
+      // 面板只有两种写入：对某个 run 插话（steer）、停止它。字段校验全在 buildNote 里做，
       // UI 传来的东西一律当作不可信输入。
       return postNote(rt.ctx, {
         kind: method === 'stop' ? 'stop' : 'note',
         sessionKey: params?.sessionKey,
         runId: params?.runId,
+        index: params?.index,
         agent: params?.agent,
+        mode: params?.mode,
         message: params?.message,
       })
     }

@@ -4,6 +4,7 @@ import test from 'node:test'
 import {
   MAX_MESSAGE,
   NOTE_TTL_MS,
+  STEER_MODES,
   buildNote,
   isFresh,
   noteFileOf,
@@ -11,21 +12,43 @@ import {
   parseNoteFileName,
   pruneMail,
   receiptFileOf,
-  renderNoteText,
 } from '../lib/note-queue.mjs'
 
 const NOW = 1_700_000_000_000
 
-test('note-queue: 留言要带会话与正文，空白正文直接拒', () => {
+test('note-queue: 留言要带会话、目标与正文，空白正文直接拒', () => {
   const ok = buildNote({ kind: 'note', sessionKey: 'k1', runId: 'run-1', agent: 'worker', message: ' 继续 ' }, NOW)
   assert.equal(ok.ok, true)
   assert.equal(ok.note.message, '继续', '两端空白要修掉')
   assert.equal(ok.note.kind, 'note')
   assert.equal(ok.note.createdAt, NOW)
 
-  assert.equal(buildNote({ kind: 'note', sessionKey: 'k1', message: '   ' }, NOW).ok, false)
-  assert.equal(buildNote({ kind: 'note', sessionKey: '', message: 'x' }, NOW).ok, false)
-  assert.equal(buildNote({ kind: 'note', sessionKey: 'k1', message: 'x'.repeat(MAX_MESSAGE + 1) }, NOW).ok, false)
+  assert.equal(buildNote({ kind: 'note', sessionKey: 'k1', runId: 'run-1', message: '   ' }, NOW).ok, false)
+  assert.equal(buildNote({ kind: 'note', sessionKey: '', runId: 'run-1', message: 'x' }, NOW).ok, false)
+  assert.equal(buildNote({ kind: 'note', sessionKey: 'k1', message: 'x' }, NOW).ok, false, '没有 runId 就没有投递目标')
+  assert.equal(
+    buildNote({ kind: 'note', sessionKey: 'k1', runId: 'run-1', message: 'x'.repeat(MAX_MESSAGE + 1) }, NOW).ok,
+    false,
+  )
+})
+
+test('note-queue: mode 只认扩展支持的三种，缺省 steer；index 只收非负整数', () => {
+  for (const mode of STEER_MODES) {
+    assert.equal(buildNote({ kind: 'note', sessionKey: 'k1', runId: 'r', message: 'x', mode }, NOW).note.mode, mode)
+  }
+  assert.equal(buildNote({ kind: 'note', sessionKey: 'k1', runId: 'r', message: 'x', mode: 'later' }, NOW).ok, false)
+  assert.equal(
+    buildNote({ kind: 'note', sessionKey: 'k1', runId: 'r', message: 'x', index: 2 }, NOW).note.index,
+    2,
+  )
+  assert.equal(
+    buildNote({ kind: 'note', sessionKey: 'k1', runId: 'r', message: 'x', index: -1 }, NOW).note.index,
+    undefined,
+  )
+  assert.equal(
+    buildNote({ kind: 'note', sessionKey: 'k1', runId: 'r', message: 'x', index: 'two' }, NOW).note.index,
+    undefined,
+  )
 })
 
 test('note-queue: stop 必须有 runId（没有就无从停起），且不需要正文', () => {
@@ -72,16 +95,12 @@ test('note-queue: 过期只由单端判断，越界与坏值都算过期', () =>
   assert.equal(isFresh({}, NOW), false)
 })
 
-test('note-queue: 投出去的文本要说明是谁、哪次运行，但不写成命令', () => {
-  const text = renderNoteText({ agent: 'code-reviewer', runId: 'run-1', message: '换个方向' })
-  assert.match(text, /code-reviewer/)
-  assert.match(text, /run-1/)
-  assert.match(text, /换个方向/)
-  assert.doesNotMatch(text, /请|必须|立即/, '面板不该用祈使句指挥主代理')
-
-  const bare = renderNoteText({ message: '看看这个' })
-  assert.match(bare, /子代理/)
-  assert.doesNotMatch(bare, /run/)
+test('note-queue: 正文原样投递，不加「来自面板」前缀（steer 直达子代理，不经过主代理翻译）', () => {
+  const ok = buildNote({ kind: 'note', sessionKey: 'k1', runId: 'run-1', agent: 'code-reviewer', message: ' 换个方向 ' }, NOW)
+  assert.equal(ok.ok, true)
+  assert.equal(ok.note.message, '换个方向')
+  assert.equal(ok.note.mode, 'steer', '默认打断它当前这一轮')
+  assert.equal(ok.note.runId, 'run-1', 'runId 现在是投递地址，不是上下文备注')
 })
 
 test('note-queue: 清理只删过期的，没到期的留着', () => {
