@@ -302,7 +302,7 @@ DSH 用 `withTeamLock` 串行化「原地改 JSONL 行」。我们是**两个进
 - pi-subagents `bundle/chunk-BWC2LVII.js:5042`（`createParentWake`）
 - pi-subagents `bundle/chunk-3RKFH2UZ.js`（steering 状态机、`follow_up` 排队）
 - pi-coding-agent `dist/core/extensions/types.d.ts:1240`（`sendUserMessage`）
-- 本仓库 `docs/research-2026-11-07-multi-agent-clients.md` §7.5
+- 工作区 `RESEARCH-multi-agent-clients-2026-11-07.md` §7.5（调研记录，不入库）
 
 ---
 
