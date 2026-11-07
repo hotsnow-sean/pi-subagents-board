@@ -125,13 +125,15 @@ test('getState: 打开目标按候选顺序取第一个真实存在的，全不�
   // 旧落盘文件（0.7.0 及以前）没有 openCandidates，只有 childSessionFile
   const d = applyStarted(state, { id: 'run-d', agent: 'worker', cwd: 'C:/w' }, startedAt + 400)
 
-  const real = path.join(dataDir, 'child-real.jsonl')
-  fs.writeFileSync(real, '{}')
+  const realA = path.join(dataDir, 'child-a.jsonl')
+  const realD = path.join(dataDir, 'child-d.jsonl')
+  fs.writeFileSync(realA, '{}')
+  fs.writeFileSync(realD, '{}')
   // 实测形状：childSessionFile 悬空，真实路径排在候选后面
-  a.segment.openCandidates = [path.join(dataDir, 'gone.jsonl'), real]
+  a.segment.openCandidates = [path.join(dataDir, 'gone.jsonl'), realA]
   b.segment.openCandidates = [path.join(dataDir, 'gone.jsonl')]
   c.segment.openCandidates = []
-  d.segment.childSessionFile = real
+  d.segment.childSessionFile = realD
 
   state.source.rpc = true
   state.source.mode = 'push'
@@ -144,13 +146,48 @@ test('getState: 打开目标按候选顺序取第一个真实存在的，全不�
   const got = await api.invoke('getState', { sessionFile })
   const byId = Object.fromEntries(got.lineages.flatMap((lineage) => lineage.segments).map((seg) => [seg.runId, seg]))
 
-  assert.equal(byId['run-a'].openTarget, real, '第一个悬空就往下找，不能短路')
+  assert.equal(byId['run-a'].openTarget, realA, '第一个悬空就往下找，不能短路')
   assert.equal(byId['run-a'].openState, 'ok')
   assert.equal(byId['run-b'].openTarget, '')
   assert.equal(byId['run-b'].openState, 'missing', '有候选但都不在 = 会话被清理，按钮置灰')
   assert.equal(byId['run-c'].openState, 'none', '本来就没有会话 = 不出按钮')
-  assert.equal(byId['run-d'].openTarget, real, '旧落盘文件没有 openCandidates，也要能打开')
+  assert.equal(byId['run-d'].openTarget, realD, '旧落盘文件没有 openCandidates，也要能打开')
   assert.equal(byId['run-d'].openState, 'ok')
+})
+
+test('getState: workflow 容器不抢占子步骤的会话（openState=shared）', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
+  const sessionFile = path.join(dataDir, 'sessions', 'wf.jsonl')
+  const sessionKey = sessionKeyOf(sessionFile)
+  const startedAt = Date.now() - 5_000
+  const state = createState({ sessionKey, sessionFile, pid: 9, startedAt })
+  const step = applyStarted(state, { id: 'run-step', agent: 'worker', cwd: 'C:/w' }, startedAt + 100)
+  const container = applyStarted(state, { id: 'run-wf', agent: 'workflow', cwd: 'C:/w' }, startedAt + 200)
+
+  // 实测形状（8a08d1b2 / 370599a9）：容器的 childSessionFile 是猜出来的
+  // `run-0/session.jsonl`，那个路径不存在；候选链落到 steps[0].sessionFile，
+  // 而它正是那一步自己的会话，那一步另有一张卡。
+  const stepSession = path.join(dataDir, 'step-session.jsonl')
+  fs.writeFileSync(stepSession, '{}')
+  step.segment.childSessionFile = stepSession
+  const dangling = path.join(dataDir, 'wf', 'run-0', 'session.jsonl')
+  container.segment.childSessionFile = dangling
+  container.segment.openCandidates = [dangling, stepSession]
+
+  state.source.rpc = true
+  state.source.mode = 'push'
+  state.updatedAt = Date.now()
+  ensureLiveDir(dataDir)
+  writeJsonAtomic(liveFileOf(dataDir, { sessionKey, pid: 9, startedAt }), state)
+
+  const mod = await loadMain()
+  const api = await mod.activate(fakeCtx(dataDir))
+  const got = await api.invoke('getState', { sessionFile })
+  const byId = Object.fromEntries(got.lineages.flatMap((lineage) => lineage.segments).map((seg) => [seg.runId, seg]))
+
+  assert.equal(byId['run-step'].openState, 'ok', '会话是那一步自己的，入口归它')
+  assert.equal(byId['run-wf'].openState, 'shared', '容器没有自己的会话，别给第二个通向同一处的入口')
+  assert.equal(byId['run-wf'].openOwnerRunId, 'run-step')
 })
 
 test('getDiagnostics: 给出数据文件与原始状态', async () => {

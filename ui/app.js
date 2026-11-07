@@ -37,10 +37,37 @@ let snapshot = null
 /** 最后一次失败原因（invoke 抛错 / 桥超时） */
 let lastError = ''
 let busy = false
+/** 请求在飞的时候又要求刷新（切会话）→ 这次结果回来后立刻再问一次，别丢掉 */
+let tickQueued = false
+/**
+ * 桥的 context 是 hello 之后 postMessage 推过来的，界面起来的那一刻还是空对象。
+ * 这时候就发 getState，拿到的是「没有打开会话」——一句假话，还会让用户看见
+ * 「先弹横幅再变卡片」。所以先等上下文，1.5s 兜底（真的没开会话时也得给结果）。
+ */
+let awaitingContext = !String(bridge.context?.sessionFile || '').trim()
+/** @type {any} */
+let contextFallback = null
 /** 用户展开的代际链（按 lineageRoot 记），重绘后恢复 */
 const genOpen = new Set()
 /** 诊断折叠区的展开状态：整块重绘会把它拍回去，必须自己记 */
 let diagOpen = false
+/**
+ * 滚动位置，按「内容归属的会话」记（`state.ownerSessionKey`）。
+ *
+ * 打开子会话后面板上下文变了，但内容还是父会话那条链（只读预览）——同一份内容
+ * 不该被拍回顶部。归属没变就不动滚动位置，变了才换回该会话上次停的地方。
+ * @type {Map<string, number>}
+ */
+const scrollMemo = new Map()
+/** 当前 DOM 里的内容属于哪个会话（ownerSessionKey）；空 = 还没画过 */
+let scrollOwner = ''
+el.addEventListener(
+  'scroll',
+  () => {
+    if (scrollOwner) scrollMemo.set(scrollOwner, el.scrollTop)
+  },
+  { passive: true },
+)
 /** 编辑插话时默认不重绘；改表单自身状态（展开/发送中）时放行一次 */
 let paintOnce = false
 
@@ -392,12 +419,17 @@ function renderActs(segment) {
   }
   // 「打开」指向哪份会话、能不能点，由 main 判定（P8）：顶层 childSessionFile 常常
   // 指向一个不存在的路径，真实的那份在 status.json 的 steps 里。UI 不猜路径。
-  if (segment.openTarget) {
+  if (segment.openState === 'ok' && segment.openTarget) {
     acts.push(`<button data-open-session="${esc(segment.openTarget)}" title="打开它的会话（只读预览）">打开</button>`)
   } else if (segment.openState === 'missing') {
     acts.push(
       '<button disabled title="这段会话的文件已经不在磁盘上了（一次性 run 的目录会被清理）">打开</button>',
     )
+  } else if (segment.openState === 'shared' && segment.openOwnerRunId) {
+    // workflow 容器 run 自己没有会话（childSessionFile 是猜的，实测不存在），
+    // 候选链落到它那一步的会话——那一步在列表里另有卡片，入口归它。
+    // 这里不出按钮，只说明去处，免得两个「打开」通向同一份文件。
+    acts.push(`<span class="hint">容器 · 会话见 ${esc(shortId(segment.openOwnerRunId))}</span>`)
   }
   if (segment.canStop) {
     const confirming = stopConfirm && String(stopConfirm.runId) === String(segment.runId) && Date.now() < stopConfirm.until
@@ -513,7 +545,7 @@ function renderGen(lineage, segment) {
       past.runId,
     )}"></span>${tail}`
     lines.push(
-      past.openTarget
+      past.openState === 'ok' && past.openTarget
         ? `<button class="gen-line" data-open-session="${esc(past.openTarget)}">${inner}<span class="chev">›</span></button>`
         : `<div class="gen-line">${inner}</div>`,
     )
@@ -646,8 +678,23 @@ function patchCards(html) {
   })
 }
 
-function renderHead(data, lineages) {
-  const active = Number(data.activeCount) || 0
+/**
+ * 内容归属（`ownerSessionKey`）变了才恢复滚动位置；没变就一律不碰。
+ *
+ * 打开子会话时归属没变（面板显示的还是父会话那条链），所以滚动位置原地不动；
+ * 从别的会话切回来时换回它上次停的地方。读 `scrollTop` 会强制一次 layout，
+ * 因此只在这里读，不进每秒的心跳。
+ * @param {any} data
+ */
+function syncScroll(data) {
+  const owner = String(data?.ownerSessionKey || data?.sessionKey || '')
+  if (!owner || owner === scrollOwner) return
+  scrollOwner = owner
+  const saved = scrollMemo.get(owner)
+  el.scrollTop = saved == null ? 0 : saved
+}
+
+function renderHead(data, lineages) {  const active = Number(data.activeCount) || 0
   const previewing = Boolean(data.parentSessionFile)
   const back = previewing
     ? `<button class="back" data-open-session="${esc(data.parentSessionFile)}">← 主会话</button>`
@@ -723,6 +770,8 @@ function render() {
         : '',
   )
   setSlot(shell.diag, renderDiag(data))
+  // 内容归属换人了才动滚动位置（同一份内容不拍回顶部）
+  syncScroll(data)
   // 新插入的占位是空的，立刻推一次
   uiPulse()
 }
@@ -955,26 +1004,45 @@ el.addEventListener('click', (/** @type {MouseEvent} */ event) => {
 })
 
 async function tick() {
-  if (busy) return
+  // 正在飞的那次请求问的不是当前会话（刚切会话 / 刚从后台回来）→ 排一次，别丢掉。
+  // 丢掉的话要等下一个轮询周期（1–5s）才会去问新会话，用户看到的就是「卡了一会儿」。
+  if (busy) {
+    tickQueued = true
+    return
+  }
   busy = true
+  const askedFor = String(context?.sessionFile || '')
   try {
-    const sessionFile = String(context?.sessionFile || '')
-    snapshot = await bridge.invoke('getState', { sessionFile })
+    const state = await bridge.invoke('getState', { sessionFile: askedFor })
+    // 期间切了会话：这份结果属于上一个会话，写进去就是串台，丢掉重来
+    if (String(context?.sessionFile || '') !== askedFor) {
+      tickQueued = true
+      return
+    }
+    snapshot = state
     lastError = ''
   } catch (error) {
     lastError = error instanceof Error ? error.message : String(error)
   } finally {
     busy = false
     render()
+    if (tickQueued) {
+      tickQueued = false
+      void tick()
+    }
   }
 }
 
 bridge.on('context', (next) => {
   context = next || {}
-  snapshot = null
-  // 换会话了：骨架留着，五个分区的内容全要重来
-  shell = null
-  el.innerHTML = ''
+  awaitingContext = false
+  if (contextFallback) {
+    clearTimeout(contextFallback)
+    contextFallback = null
+  }
+  // **不在这里清 snapshot / 清 DOM**：清空会让「打开子会话」「从设置页回来」白闪一下，
+  // 而且是两次空态（先「正在读取…」再出卡片）。新数据到达前保留上一帧，
+  // 顶多一瞬间旧内容，比空白好。滚动位置也靠这一点保住（见 syncScroll）。
   lastError = ''
   // 正在编辑的插话指向的 run 已经不在这个会话里——留着只会发错地方
   noteDraft = null
@@ -1041,9 +1109,34 @@ bridge.on('dispose', () => {
   disposed = true
   if (pollTimer) clearTimeout(pollTimer)
   if (pulseTimer) clearInterval(pulseTimer)
+  if (contextFallback) clearTimeout(contextFallback)
   pollTimer = null
   pulseTimer = null
+  contextFallback = null
   noteDraft = null
 })
 
-void tick().then(() => schedulePoll())
+/**
+ * 开局：上下文里有 sessionFile 就直接拉；没有就先画骨架等着。
+ *
+ * 桥在 iframe load 时发 hello，宿主回一条 `plugin-context`——两者之间有个几十到几百
+ * 毫秒的空窗，那时 `bridge.context` 还是 `{}`。在这个空窗里发 getState 会拿到
+ * 「没有打开会话」的横幅，接着再被真数据替换，用户看到的就是「白闪 + 延迟」。
+ * 1.5 秒兜底：真的没开会话时也得给个结果，不能让面板一直停在「正在读取…」。
+ */
+function startTicking() {
+  void tick().then(() => schedulePoll())
+}
+
+if (awaitingContext) {
+  render()
+  contextFallback = setTimeout(() => {
+    contextFallback = null
+    if (!String(context?.sessionFile || '').trim()) {
+      awaitingContext = false
+      startTicking()
+    }
+  }, 1_500)
+} else {
+  startTicking()
+}

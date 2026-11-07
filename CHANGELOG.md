@@ -218,3 +218,37 @@ mock 验证：隐藏后 2.5s 内 `getState` 调用数不变（3→3），恢复�
 `resolveRunTitle` 顺带返回 `rootRunId` / `hops`。
 
 测试 106 例（新增 3：label 优先级与占位符过滤、steps 三字段、openTarget 三种结局）。
+
+## 0.7.2 — 两个「打开」通向同一份会话、切视图时的闪烁与滚动丢失
+
+**A. workflow 容器抢占子步骤的会话。** 实测 `8a08d1b2`（workflow 父 run）和
+`370599a9`（它那一步的 run）的「打开」进的是同一份 `session.jsonl`。
+原因是父 run 是个容器，它压根没有自己的会话：`childSessionFile` 猜出来的
+`<runId>/run-0/session.jsonl` 并不存在（`status.json` 目录里只有
+`events.jsonl` / `mission.json` / `workflow-*.jsonl`），于是候选链落到
+`steps[0].sessionFile`——而那正是那一步自己的会话，它在列表里另有一张卡。
+
+- `decorateOpen` 改两遍：先收集「谁自己的 `childSessionFile` 真实存在」，
+  再逐段定目标；目标属于别人的会话 → `openState = 'shared'` + `openOwnerRunId`；
+- UI 对 `shared` 不出「打开」，只写一行暗字「容器 · 会话见 <runId 尾号>」；
+- 代际链里的历史段同样只认 `openState === 'ok'`，不拿借来的路径当入口。
+
+**B. 切视图时的白闪与滚动丢失。** `context` 事件一到就 `el.innerHTML = ''`，
+把 DOM、滚动位置、以及「上一帧」一起扔掉，于是：
+打开子会话 → 侧栏弹回顶部；本来就在顶部 → 闪一下（空白 → 正在读取 → 卡片）。
+
+- 不再清 DOM、不再清 `snapshot`：新数据到达前保留上一帧，只 patch 变化的区块；
+- **滚动位置按内容归属（`ownerSessionKey`）记忆**：打开子会话时内容还是父会话
+  那条链，归属没变，滚动位置原地不动；切到别的会话才换回它上次停的地方。
+
+**C. 从设置页回来要等一会儿才出卡片。** 两个原因，都在这一版修掉：
+
+- 桥的 `context` 是 hello 之后才 `postMessage` 过来的，界面起来那一刻还是 `{}`。
+  原来的代码立刻 `getState`，拿到「没有打开会话」的假状态并弹横幅，真上下文
+  到了再重画一次——先假后真的两次空态。现在没 `sessionFile` 就先等（1.5s 兜底，
+  真没开会话时照旧给结果）；
+- `tick()` 在请求在飞时直接 `return`，切会话/回前台那次刷新会被悄悄丢掉，
+  要等下一个轮询周期（1–5s）才补上——这就是「明显延迟」。现在排队重跑，
+  并且校验结果是否属于当前会话，串台的结果直接丢弃。
+
+测试 107 例（新增：容器 shared 判定；原有 openState 用例补了互不相同的会话文件）。

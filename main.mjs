@@ -106,26 +106,54 @@ function existsCached(file) {
  * status.json 的 steps[].sessionFile），这里只做存在性判定。放在 main 而不是 UI：
  * UI 不该自己猜路径，也拿不到 fs。
  *
- * `openState` 的三种值决定卡片怎么说：
+ * `openState` 的四种值决定卡片怎么说：
  *   ok      能打开
  *   missing 有候选但都不在磁盘上了（临时目录被清理）→ 按钮置灰，说清原因
  *   none    这条 run 本来就没有自己的会话（前台 run / 启动失败）→ 不出按钮
+ *   shared  候选命中的是**别人的**会话（workflow 容器 run 自己没有会话，
+ *           唯一能用的是它那一步的会话）→ 不出按钮，交回那张卡，见下
+ *
+ * 为什么要多这一种（实测：`8a08d1b2` 与 `370599a9` 打开的是同一个文件）：
+ * workflow 的父 run 是个容器，`childSessionFile` 猜出来的 `run-0/session.jsonl`
+ * 并不存在，于是候选链落到 `steps[0].sessionFile`——而那正是那一步自己的 run
+ * （`370599a9`）的会话，它在列表里另有一张卡。两张卡两个「打开」通向同一份文件，
+ * 用户只会觉得「点错了」。谁自己的会话就由谁来提供入口。
  * @param {any[]} lineages
  */
 function decorateOpen(lineages) {
-  for (const lineage of lineages) {
-    for (const segment of lineage.segments ?? []) {
-      // 旧落盘文件没有 openCandidates（0.7.1 才补）：按老办法就地拼一份，
-      // 否则升级后所有历史卡的「打开」都会消失——比修之前更糟。
-      const candidates = Array.isArray(segment.openCandidates)
-        ? segment.openCandidates
-        : [segment.childSessionFile, ...(segment.children ?? []).map((/** @type {any} */ child) => child?.sessionFile)].filter(
-            Boolean,
-          )
-      const target = candidates.find((file) => file && existsCached(String(file))) || ''
-      segment.openTarget = target
-      segment.openState = target ? 'ok' : candidates.length ? 'missing' : 'none'
+  /** @type {any[]} */
+  const segments = []
+  for (const lineage of lineages) for (const segment of lineage.segments ?? []) segments.push(segment)
+
+  /** 谁的 `childSessionFile` 是真实存在的会话文件：`归一化路径 → runId` @type {Map<string, string>} */
+  const owners = new Map()
+  for (const segment of segments) {
+    const own = String(segment.childSessionFile ?? '').trim()
+    if (!own) continue
+    const key = normalizeSessionPath(own)
+    if (!key || owners.has(key) || !existsCached(own)) continue
+    owners.set(key, String(segment.runId ?? ''))
+  }
+
+  for (const segment of segments) {
+    // 旧落盘文件没有 openCandidates（0.7.1 才补）：按老办法就地拼一份，
+    // 否则升级后所有历史卡的「打开」都会消失——比修之前更糟。
+    const candidates = Array.isArray(segment.openCandidates)
+      ? segment.openCandidates
+      : [segment.childSessionFile, ...(segment.children ?? []).map((/** @type {any} */ child) => child?.sessionFile)].filter(
+          Boolean,
+        )
+    const target = String(candidates.find((file) => file && existsCached(String(file))) || '')
+    const self = String(segment.runId ?? '')
+    const owner = target ? owners.get(normalizeSessionPath(target)) : ''
+    segment.openTarget = target
+    if (target && owner && owner !== self) {
+      segment.openState = 'shared'
+      segment.openOwnerRunId = owner
+      continue
     }
+    segment.openOwnerRunId = ''
+    segment.openState = target ? 'ok' : candidates.length ? 'missing' : 'none'
   }
 }
 

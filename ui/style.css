@@ -230,6 +230,8 @@ html, body {
 .acts button.danger { color: var(--bad); }
 .acts button.danger:hover { background: color-mix(in srgb, var(--bad) 10%, transparent); border-color: color-mix(in srgb, var(--bad) 40%, var(--line)); }
 .acts button.confirm { background: color-mix(in srgb, var(--bad) 12%, transparent); color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, var(--line)); }
+/* 「打开」缺席时的说明（容器 run 自己没有会话，入口在子步骤那张卡上） */
+.acts .hint { align-self: center; color: var(--dim); font-size: 11px; }
 
 /* ---------- A 方案：卡片内联撰写 ---------- */
 .inline {
