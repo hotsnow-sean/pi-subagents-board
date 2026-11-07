@@ -25,6 +25,10 @@
 - pi-app 桌面端 `>= 0.7.7`（需要插件的 `agent` 注入、`ctx.sessions.reveal`、会话实时预览）
 - 宿主里已安装并启用 `pi-subagents` 扩展（`pi install npm:pi-subagents`）
 
+> `engines['pi-desktop']` 写的是 `>=0.7.7-0` 而不是 `>=0.7.7`：宿主 fork 版本号带 prerelease
+> 后缀（如 `0.7.7-fork.3`），在 semver 语义里**小于** `0.7.7`。写成 `>=0.7.7` 会让 fork 版
+> 宿主把插件判成不兼容并静默跳过（设置页只显示一行「不满足版本要求」）。
+
 没有 pi-subagents 时插件不会崩：面板会显示「未连上 pi-subagents」并持续重试握手，装好之后自动恢复。
 
 ## 安装
