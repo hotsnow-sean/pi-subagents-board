@@ -126,6 +126,11 @@ html, body {
   transition: border-color .15s;
 }
 .card.live { border-color: color-mix(in srgb, var(--ok) 30%, var(--line)); }
+/* 你正在看的那张（只读预览子会话时）：淡蓝边 + 底色，配合按钮上的「返回」 */
+.card.viewing {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+  background: color-mix(in srgb, var(--accent) 6%, var(--surface-2));
+}
 
 /* 第一行：点 · 标题 · 状态 · 计时（计时靠右） */
 .row1 { display: flex; align-items: center; gap: 7px; min-width: 0; }

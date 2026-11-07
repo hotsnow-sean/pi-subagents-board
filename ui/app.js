@@ -419,7 +419,16 @@ function renderActs(segment) {
   }
   // 「打开」指向哪份会话、能不能点，由 main 判定（P8）：顶层 childSessionFile 常常
   // 指向一个不存在的路径，真实的那份在 status.json 的 steps 里。UI 不猜路径。
-  if (segment.openState === 'ok' && segment.openTarget) {
+  //
+  // 正在看的那张卡把按钮换成「返回」（main 标 viewing）：点「打开」等于再打开自己，
+  // 没有反馈；换成返回，卡上还多一圈高亮——「我现在在看谁」这个问题当场就有答案。
+  if (segment.viewing && segment.viewBackTo) {
+    acts.push(
+      `<button class="primary on" data-open-session="${esc(
+        segment.viewBackTo,
+      )}" title="你现在看的就是它的会话，点这里回主会话">返回</button>`,
+    )
+  } else if (segment.openState === 'ok' && segment.openTarget) {
     acts.push(`<button data-open-session="${esc(segment.openTarget)}" title="打开它的会话（只读预览）">打开</button>`)
   } else if (segment.openState === 'missing') {
     acts.push(
@@ -575,8 +584,11 @@ function renderCard(lineage) {
   const state = segment.state || lineage.state || 'unknown'
   const live = ACTIVE_STATES.has(String(state))
   const title = titleOf(lineage, segment)
-  // data-card 是增量渲染的锚点：结构没变的卡在下一帧被原样复用（P7）
-  return `<article class="card${live ? ' live' : ''}" data-card="${esc(segment.runId)}">
+  // data-card 是增量渲染的锚点：结构没变的卡在下一帧被原样复用（P7）。
+  // viewing = 你眼前这份内容就是它（只读预览子会话时由 main 标出）。
+  return `<article class="card${live ? ' live' : ''}${segment.viewing ? ' viewing' : ''}" data-card="${esc(
+    segment.runId,
+  )}">
     <div class="row1">
       <span class="dot ${esc(stateClass(state))}" data-dot="${esc(segment.runId)}"></span>
       <span class="agent" title="${esc(String(segment.sessionName || title))}">${esc(title)}</span>

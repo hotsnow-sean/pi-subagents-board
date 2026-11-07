@@ -157,9 +157,36 @@ function decorateOpen(lineages) {
   }
 }
 
+/**
+ * 标出「用户此刻正在看的那张卡」。
+ *
+ * 打开子会话后面板进入只读预览（`parentSessionFile` 非空），列表里那一段正是
+ * 眼前这份内容。给它按「返回」而不是「打开」，用户不用靠路径或标题猜自己在看谁；
+ * 也顺手避免「点打开 → 打开的还是自己」这种无反馈的操作。
+ *
+ * 只标 owner 段（`openState === 'ok'`）：workflow 容器的 `openTarget` 借的是子步骤
+ * 的会话（见 decorateOpen 的 shared），它不该抢这个标记。
+ * @param {any[]} lineages
+ * @param {string} currentFile 面板当前的会话文件（预览时 = 子会话）
+ * @param {string} parentSessionFile 非空才有「返回」可去
+ */
+function markViewing(lineages, currentFile, parentSessionFile) {
+  const current = normalizeSessionPath(currentFile)
+  for (const lineage of lineages) {
+    for (const segment of lineage.segments ?? []) {
+      const viewing =
+        Boolean(parentSessionFile) &&
+        Boolean(current) &&
+        segment.openState === 'ok' &&
+        normalizeSessionPath(segment.openTarget) === current
+      segment.viewing = viewing
+      segment.viewBackTo = viewing ? parentSessionFile : ''
+    }
+  }
+}
+
 /** @param {string} sessionFile */
-function stateFor(sessionFile) {
-  const file = String(sessionFile ?? '').trim()
+function stateFor(sessionFile) {  const file = String(sessionFile ?? '').trim()
   if (!file) {
     return emptyState({
       kind: 'no-session',
@@ -187,6 +214,7 @@ function stateFor(sessionFile) {
   const degrade = describeDegrade(state, liveness)
   const lineages = state ? listLineages(state) : []
   decorateOpen(lineages)
+  markViewing(lineages, file, parentSessionFile)
   return {
     ok: true,
     sessionFile: file,

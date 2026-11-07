@@ -190,6 +190,46 @@ test('getState: workflow 容器不抢占子步骤的会话（openState=shared）
   assert.equal(byId['run-wf'].openOwnerRunId, 'run-step')
 })
 
+test('getState: 预览子会话时，你正看的那张卡标成 viewing 并给出返回落点', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
+  const sessionFile = path.join(dataDir, 'sessions', 'parent.jsonl')
+  const sessionKey = sessionKeyOf(sessionFile)
+  const startedAt = Date.now() - 5_000
+  const state = createState({ sessionKey, sessionFile, pid: 11, startedAt })
+  const a = applyStarted(state, { id: 'run-a', agent: 'worker', cwd: 'C:/w' }, startedAt + 100)
+  const b = applyStarted(state, { id: 'run-b', agent: 'worker', cwd: 'C:/w' }, startedAt + 200)
+
+  const child = path.join(dataDir, 'sessions', 'child.jsonl')
+  const other = path.join(dataDir, 'sessions', 'other.jsonl')
+  fs.mkdirSync(path.dirname(child), { recursive: true })
+  fs.writeFileSync(child, '{}')
+  fs.writeFileSync(other, '{}')
+  a.segment.childSessionFile = child
+  b.segment.childSessionFile = other
+
+  state.source.rpc = true
+  state.source.mode = 'push'
+  state.updatedAt = Date.now()
+  ensureLiveDir(dataDir)
+  writeJsonAtomic(liveFileOf(dataDir, { sessionKey, pid: 11, startedAt }), state)
+
+  const mod = await loadMain()
+  const api = await mod.activate(fakeCtx(dataDir))
+  const got = await api.invoke('getState', { sessionFile: child })
+  const byId = Object.fromEntries(got.lineages.flatMap((lineage) => lineage.segments).map((seg) => [seg.runId, seg]))
+
+  assert.equal(got.parentSessionFile, sessionFile, '预览子会话时链属于父会话')
+  assert.equal(byId['run-a'].viewing, true, '你眼前就是它的会话')
+  assert.equal(byId['run-a'].viewBackTo, sessionFile, '「返回」回父会话')
+  assert.equal(byId['run-b'].viewing, false, '别人的卡不受影响')
+
+  // 回到主会话后不该再有任何卡自称被看
+  const back = await api.invoke('getState', { sessionFile })
+  const backById = Object.fromEntries(back.lineages.flatMap((lineage) => lineage.segments).map((seg) => [seg.runId, seg]))
+  assert.equal(backById['run-a'].viewing, false)
+  assert.equal(backById['run-a'].viewBackTo, '')
+})
+
 test('getDiagnostics: 给出数据文件与原始状态', async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
   const sessionFile = path.join(dataDir, 'sessions', 'c.jsonl')
