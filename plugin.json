@@ -1,0 +1,20 @@
+{
+  "id": "subagents-board",
+  "name": "子代理",
+  "version": "0.1.0",
+  "description": "在右栏观测 pi-subagents 的后台运行：谁在跑、跑到哪、什么时候结束。",
+  "icon": "Users",
+  "engines": { "pi-desktop": ">=0.7.7" },
+  "agent": { "entry": "agent.mjs" },
+  "main": "main.mjs",
+  "panels": [
+    {
+      "id": "fleet",
+      "title": "子代理",
+      "description": "当前会话的子代理运行记录",
+      "icon": "Users",
+      "entry": "ui/index.html"
+    }
+  ],
+  "tools": []
+}

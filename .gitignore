@@ -1,0 +1,13 @@
+# 编辑器 / 系统杂物
+.DS_Store
+Thumbs.db
+*.log
+
+# 插件运行时数据（正常不会落在这里，防手滑）
+live/
+cmd/
+cmd-processing/
+cmd-result/
+
+# 依赖（本插件零依赖，留着防以后误装）
+node_modules/
