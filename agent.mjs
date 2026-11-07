@@ -24,6 +24,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
+import { CLAIM_DIR, CMD_DIR, REPLY_WAIT_MS, RESULT_DIR, buildResult, isExpired, parseCommandFileName } from './lib/cmd-queue.mjs'
 import { applyComplete, applyStarted, createState, mergeStatus } from './lib/lineage.mjs'
 import { ensureLiveDir, liveFileOf, writeJsonAtomic } from './lib/live-store.mjs'
 import { childSessionFile, sessionKeyOf } from './lib/session-key.mjs'
@@ -38,6 +39,10 @@ const HEARTBEAT_POLL_MS = 2_000
 /** 握手重试间隔表：先密后疏，封顶 20s。pi-subagents 没装时会一直重试 */
 const RETRY_DELAYS = [2_000, 5_000, 10_000, 20_000]
 const MAX_STATUS_FAILURES = 3
+/** 命令队列扫描间隔（fs.watch 在 Windows 上偶发丢事件，轮询是兜底而不是备选） */
+const CMD_POLL_MS = 500
+/** 插话/停止的 RPC 超时：比 status 宽一点，扩展要排队投递 */
+const COMMAND_TIMEOUT_MS = 10_000
 
 /**
  * @param {import('@earendil-works/pi-coding-agent').ExtensionAPI} pi
@@ -114,6 +119,7 @@ export default function subagentsBoard(pi, ctx) {
     dirtyTimer = null
     heartbeatTimer = null
     flushTimer = null
+    stopCommands()
   }
 
   /**
@@ -157,6 +163,9 @@ export default function subagentsBoard(pi, ctx) {
         resolve(result)
       }
       const timer = setTimeout(() => finish({ ok: false, timedOut: true, error: { code: 'timeout', message: `no reply to ${method}` } }), timeoutMs)
+      // 不 unref 的话：握手失败正在重试的会话会让进程一直「有事可做」——
+      // 会话已经关了、扩展也没装，进程却退不出去（测试里表现为整套跑完不退出）。
+      if (typeof timer.unref === 'function') timer.unref()
 
       try {
         pi.events.on(`subagents:rpc:v1:reply:${requestId}`, (/** @type {any} */ reply) => {
@@ -298,6 +307,10 @@ export default function subagentsBoard(pi, ctx) {
       state.source.mode = state.source.mode === 'poll' ? 'poll' : 'push'
       const capabilities = /** @type {any} */ (reply.data)?.capabilities
       state.source.capabilities = capabilities && typeof capabilities === 'object' ? Object.keys(capabilities) : []
+      // capabilities 只存了键名，值丢了；而「能不能插话」要看值（老版本扩展没有 steer）
+      state.source.supports = capabilities && typeof capabilities === 'object'
+        ? { steer: capabilities.steer === true, stop: capabilities.stop === true }
+        : null
       subscribeEvents(capabilities?.events)
       subscribeEvents(readyEvents?.events)
       readyEvents = null
@@ -319,6 +332,143 @@ export default function subagentsBoard(pi, ctx) {
     if (handshakeTimer) clearTimeout(handshakeTimer)
     handshakeTimer = setTimeout(() => void handshake('retry'), delay)
     if (typeof handshakeTimer.unref === 'function') handshakeTimer.unref()
+  }
+
+  // ---------- 命令队列（steer / stop） ----------
+
+  const cmdRoot = path.join(ctx.dataDir, CMD_DIR)
+  const claimRoot = path.join(ctx.dataDir, CLAIM_DIR)
+  const resultRoot = path.join(ctx.dataDir, RESULT_DIR)
+  let cmdWatcher = /** @type {any} */ (null)
+  let cmdPoll = /** @type {any} */ (null)
+  let scanning = false
+
+  function stopCommands() {
+    if (cmdWatcher) {
+      try {
+        cmdWatcher.close()
+      } catch {
+        /* 已经关了 */
+      }
+      cmdWatcher = null
+    }
+    if (cmdPoll) {
+      clearInterval(cmdPoll)
+      cmdPoll = null
+    }
+  }
+
+  function startCommands() {
+    try {
+      for (const dir of [cmdRoot, claimRoot, resultRoot]) fs.mkdirSync(dir, { recursive: true })
+    } catch (error) {
+      ctx.log('cmd dirs unavailable:', error instanceof Error ? error.message : error)
+      return
+    }
+    try {
+      // fs.watch 只是「快一点」：Windows 上偶尔丢事件，所以轮询才是主路。
+      // unref 是必须的：watcher 会一直挂着事件循环，会话结束/测试进程都不该被它拖住。
+      cmdWatcher = fs.watch(cmdRoot, () => void scanCommands())
+      if (typeof cmdWatcher.unref === 'function') cmdWatcher.unref()
+    } catch (error) {
+      ctx.log('cmd watch failed, polling only:', error instanceof Error ? error.message : error)
+    }
+    cmdPoll = setInterval(() => void scanCommands(), CMD_POLL_MS)
+    if (typeof cmdPoll.unref === 'function') cmdPoll.unref()
+    void scanCommands()
+  }
+
+  /**
+   * 扫一次命令目录。只看**文件名以本会话 sessionKey 开头**的：多个会话的 agent 同时
+   * 在扫同一个目录，不按前缀过滤就会互相抢命令（把 A 会话的插话发到 B 的子代理上）。
+   */
+  async function scanCommands() {
+    if (scanning || stale || disposed) return
+    const key = state.sessionKey
+    if (!key || key === 'unknown') return
+    scanning = true
+    try {
+      /** @type {string[]} */
+      let names = []
+      try {
+        names = fs.readdirSync(cmdRoot)
+      } catch {
+        return
+      }
+      for (const name of names) {
+        const parsed = parseCommandFileName(name)
+        if (!parsed || parsed.sessionKey !== key) continue
+        const claimed = path.join(claimRoot, name)
+        try {
+          // rename 是原子的：抢不到说明另一个实例已经拿走了
+          fs.renameSync(path.join(cmdRoot, name), claimed)
+        } catch {
+          continue
+        }
+        await runCommand(claimed)
+      }
+    } finally {
+      scanning = false
+    }
+  }
+
+  /** @param {string} claimedFile */
+  async function runCommand(claimedFile) {
+    /** @type {any} */
+    let command = null
+    try {
+      command = JSON.parse(fs.readFileSync(claimedFile, 'utf8'))
+    } catch (error) {
+      ctx.log('bad command file:', error instanceof Error ? error.message : error)
+      try {
+        fs.rmSync(claimedFile, { force: true })
+      } catch {
+        /* 清理失败由 TTL 兜底 */
+      }
+      return
+    }
+
+    try {
+      // main 5s 就超时返回了；这里再执行只会「用户以为没发出去，其实插进去了」。
+      // 用 REPLY_WAIT_MS 而不是 CMD_TTL_MS：窗口必须和 UI 侧一致。
+      if (isExpired(command, Date.now(), REPLY_WAIT_MS)) {
+        writeCommandResult(buildResult(command, { ok: false, error: { code: 'expired', message: '命令已过期' } }, Date.now()))
+        return
+      }
+      /** @type {Record<string, unknown>} */
+      const params = { id: command.runId }
+      if (Number.isFinite(command.index)) params.index = command.index
+      if (command.action === 'steer') {
+        params.message = command.message
+        params.mode = command.mode || 'steer'
+      }
+      const reply = await request(command.action, params, COMMAND_TIMEOUT_MS)
+      writeCommandResult(buildResult(command, reply, Date.now()))
+      ctx.log(`command ${command.action} ${command.runId}: ${reply.ok ? 'accepted' : 'failed'}`)
+      // stop 的回执只是「受理」，真实终态要靠 status 收敛——立刻读一次，别等心跳
+      if (command.action === 'stop' && reply.ok) void readStatus('after-stop')
+      if (command.action === 'steer' && reply.ok) markDirty()
+    } catch (error) {
+      ctx.log('command failed:', error instanceof Error ? error.message : error)
+    } finally {
+      try {
+        fs.rmSync(claimedFile, { force: true })
+      } catch {
+        /* 清不掉也没关系：claim 目录不参与逻辑 */
+      }
+    }
+  }
+
+  /** @param {any} result */
+  function writeCommandResult(result) {
+    const file = path.join(resultRoot, `${result.id}.json`)
+    try {
+      const tmp = `${file}.tmp`
+      fs.writeFileSync(tmp, JSON.stringify(result, null, 2))
+      fs.renameSync(tmp, file)
+    } catch (error) {
+      ctx.log('cmd result write failed:', error instanceof Error ? error.message : error)
+    }
   }
 
   // ---------- 会话 ----------
@@ -363,6 +513,7 @@ export default function subagentsBoard(pi, ctx) {
   }
 
   void handshake('boot')
+  startCommands()
   // 兜底心跳：即使一次事件都没来过，也让 main 知道「这个实例还活着」
   restartHeartbeat(HEARTBEAT_PUSH_MS)
   flushNow()

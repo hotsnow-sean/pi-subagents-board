@@ -6,6 +6,8 @@ import test from 'node:test'
 import { pathToFileURL } from 'node:url'
 
 import { readLiveFiles } from '../lib/live-store.mjs'
+import { commandFileName } from '../lib/cmd-queue.mjs'
+import { sessionKeyOf } from '../lib/session-key.mjs'
 
 const entry = pathToFileURL(path.join(import.meta.dirname, '..', 'agent.mjs')).href
 
@@ -56,16 +58,31 @@ function fakeServer(harness, options = {}) {
   }
   let pingCount = 0
   let statusCount = 0
+  /** @type {any[]} */
+  const commands = []
   harness.pi.events.on('subagents:rpc:v1:request', (request) => {
     const replyName = `subagents:rpc:v1:reply:${request.requestId}`
     if (request.method === 'ping') {
       pingCount += 1
-      harness.emit(replyName, { success: true, data: { capabilities: { steer: {}, stop: {}, events } } })
+      harness.emit(replyName, { success: true, data: { capabilities: { steer: true, stop: true, events } } })
       return
     }
     if (request.method === 'status') {
       statusCount += 1
       harness.emit(replyName, { success: true, data: options.status ?? { runs: [] } })
+      return
+    }
+    if (request.method === 'steer') {
+      commands.push({ method: 'steer', params: request.params })
+      harness.emit(replyName, {
+        success: true,
+        data: { deliveryStatus: 'queued', state: 'pending', targets: [{ index: 0, state: 'pending' }] },
+      })
+      return
+    }
+    if (request.method === 'stop') {
+      commands.push({ method: 'stop', params: request.params })
+      harness.emit(replyName, { success: true, data: { state: 'stopping' } })
       return
     }
     harness.emit(replyName, { success: false, error: { code: 'unknown_method', message: request.method } })
@@ -77,10 +94,23 @@ function fakeServer(harness, options = {}) {
     get statuses() {
       return statusCount
     },
+    get commands() {
+      return commands
+    },
   }
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/** 轮询等一个条件成立（文件出现这类跨进程事件，用固定 sleep 会 flaky） */
+async function waitFor(check, timeoutMs = 3_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (check()) return true
+    await sleep(50)
+  }
+  return false
+}
 
 async function boot(options = {}) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-agent-'))
@@ -130,6 +160,7 @@ test('agent: 握手成功后把事件聚合成 live 状态并落盘', async () =
   assert.equal(state.source.rpc, true)
   assert.equal(state.source.mode, 'push')
   assert.equal(state.sessionFile, 'C:/sessions/parent.jsonl')
+  assert.deepEqual(state.source.supports, { steer: true, stop: true }, '能力值要看 boolean，不能只留键名')
   assert.equal(state.lineages.length, 1)
   assert.equal(state.lineages[0].segments[0].runId, 'run-1')
   assert.equal(state.lineages[0].segments[0].state, 'complete')
@@ -181,6 +212,71 @@ test('agent: 没有 pi-subagents 回包时记为未连接并持续重试', async
   assert.equal(state.source.mode, 'none')
   assert.ok(state.source.handshake.attempts >= 1)
   assert.ok(state.source.handshake.lastError)
+})
+
+test('agent: 认领本会话的 steer 命令，调 RPC 并把回执（queued）写回去', async () => {
+  const { dataDir, server } = await boot()
+  await sleep(500)
+  const key = sessionKeyOf('C:/sessions/parent.jsonl')
+  const cmdDir = path.join(dataDir, 'cmd')
+  fs.mkdirSync(cmdDir, { recursive: true })
+  const command = {
+    action: 'steer',
+    runId: 'run-1',
+    sessionKey: key,
+    message: '换个方向',
+    mode: 'follow_up',
+    createdAt: Date.now(),
+    id: 'cmd-1',
+  }
+  const name = commandFileName(key, command.id)
+  fs.writeFileSync(path.join(cmdDir, name), JSON.stringify(command))
+
+  const resultFile = path.join(dataDir, 'cmd-result', 'cmd-1.json')
+  assert.equal(await waitFor(() => fs.existsSync(resultFile)), true, '500ms 内该被扫到并执行')
+
+  const result = JSON.parse(fs.readFileSync(resultFile, 'utf8'))
+  assert.equal(result.ok, true)
+  assert.equal(result.receipt.deliveryStatus, 'queued', 'queued 要原样保留，不能合并成「已发送」')
+  assert.equal(result.runId, 'run-1')
+
+  const sent = server.commands.at(-1)
+  assert.equal(sent.method, 'steer')
+  assert.deepEqual(sent.params, { id: 'run-1', message: '换个方向', mode: 'follow_up' })
+  // 认领过的命令必须从 cmd/ 消失，否则下次启动会被再执行一遍
+  assert.equal(fs.existsSync(path.join(cmdDir, name)), false)
+})
+
+test('agent: stop 命令回执是 stopping，并立刻拉一次 status（不等心跳）', async () => {
+  const { dataDir, server } = await boot()
+  await sleep(500)
+  const key = sessionKeyOf('C:/sessions/parent.jsonl')
+  const cmdDir = path.join(dataDir, 'cmd')
+  fs.mkdirSync(cmdDir, { recursive: true })
+  fs.writeFileSync(
+    path.join(cmdDir, commandFileName(key, 'cmd-stop')),
+    JSON.stringify({ action: 'stop', runId: 'run-2', sessionKey: key, createdAt: Date.now(), id: 'cmd-stop' }),
+  )
+  const resultFile = path.join(dataDir, 'cmd-result', 'cmd-stop.json')
+  assert.equal(await waitFor(() => fs.existsSync(resultFile)), true)
+  const result = JSON.parse(fs.readFileSync(resultFile, 'utf8'))
+  assert.equal(result.receipt.state, 'stopping', '受理 ≠ 已终止，UI 要靠 state 收敛')
+  assert.equal(server.commands.at(-1).method, 'stop')
+})
+
+test('agent: 别的会话的命令不认领（多会话共用一个命令目录，靠文件名前缀分流）', async () => {
+  const { dataDir, server } = await boot()
+  await sleep(500)
+  const cmdDir = path.join(dataDir, 'cmd')
+  fs.mkdirSync(cmdDir, { recursive: true })
+  const foreign = commandFileName('ffffffffffff', 'cmd-2')
+  fs.writeFileSync(
+    path.join(cmdDir, foreign),
+    JSON.stringify({ action: 'stop', runId: 'run-9', sessionKey: 'ffffffffffff', createdAt: Date.now(), id: 'cmd-2' }),
+  )
+  await sleep(1_200)
+  assert.equal(fs.existsSync(path.join(cmdDir, foreign)), true, '不属于自己的命令要留着，别顺手删掉')
+  assert.equal(server.commands.length, 0)
 })
 
 test('agent: 没有 pi.events 时立刻落一份说明原因的状态', async () => {

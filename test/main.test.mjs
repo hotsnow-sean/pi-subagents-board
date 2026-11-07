@@ -21,6 +21,16 @@ async function loadMain() {
   return mod
 }
 
+/** 轮询等一个条件（命令是跨目录的异步投递，固定 sleep 会 flaky） */
+async function waitFor(check, timeoutMs = 3_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (check()) return true
+    await new Promise((resolve) => setTimeout(resolve, 40))
+  }
+  return false
+}
+
 function fakeCtx(dataDir, opts = {}) {
   const logs = []
   /** @type {any[]} */
@@ -49,6 +59,7 @@ function seedLive(dataDir, sessionFile) {
   state.source.rpc = true
   state.source.mode = 'push'
   state.source.capabilities = ['steer', 'stop']
+  state.source.supports = { steer: true, stop: true }
   state.updatedAt = Date.now()
   ensureLiveDir(dataDir)
   writeJsonAtomic(liveFileOf(dataDir, { sessionKey, pid: 999, startedAt }), state)
@@ -242,4 +253,134 @@ test('信箱: 激活时只通知「刚结束」的 run，历史终态段记进�
   await mod.activate(ctx2)
   assert.equal(ctx2.inbox.length, 0, '已通知过的 run 不许重播')
   assert.ok(fs.existsSync(path.join(dataDir, 'notified.json')))
+})
+
+test('干预能力：canSteer / canStop 跟着段状态与扩展能力走（UI 照着置灰，不是点了才报错）', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
+  const sessionFile = path.join(dataDir, 'sessions', 'cap.jsonl')
+  const { sessionKey } = seedLive(dataDir, sessionFile)
+  const mod = await loadMain()
+  const api = await mod.activate(fakeCtx(dataDir))
+
+  const running = await api.invoke('getState', { sessionFile })
+  assert.equal(running.lineages[0].segments[0].canSteer, true)
+  assert.equal(running.lineages[0].segments[0].canStop, true)
+
+  // 终态段不能干预（child-scoped stop 对已终态目标会报错，先置灰）
+  const live = path.join(dataDir, 'live')
+  for (const name of fs.readdirSync(live)) {
+    const file = path.join(live, name)
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
+    parsed.lineages[0].segments[0].state = 'complete'
+    fs.writeFileSync(file, JSON.stringify(parsed))
+  }
+  const done = await api.invoke('getState', { sessionFile })
+  assert.equal(done.lineages[0].segments[0].canSteer, false)
+  assert.equal(done.lineages[0].segments[0].canStop, false)
+
+  // 老版本扩展没有 steer / stop 能力：整体置灰
+  for (const name of fs.readdirSync(live)) {
+    const file = path.join(live, name)
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
+    parsed.lineages[0].segments[0].state = 'running'
+    parsed.source.supports = { steer: false, stop: false }
+    fs.writeFileSync(file, JSON.stringify(parsed))
+  }
+  const unsupported = await api.invoke('getState', { sessionFile })
+  assert.equal(unsupported.lineages[0].segments[0].canSteer, false)
+  assert.equal(unsupported.lineages[0].segments[0].canStop, false)
+  assert.equal(sessionKey, sessionKeyOf(sessionFile))
+})
+
+test('steer: 命令进 cmd/ 队列（文件名带 sessionKey 前缀），拿到回执原样返回', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
+  const sessionFile = path.join(dataDir, 'sessions', 'e.jsonl')
+  const { sessionKey } = seedLive(dataDir, sessionFile)
+  const mod = await loadMain()
+  const api = await mod.activate(fakeCtx(dataDir))
+
+  const pending = api.invoke('steer', { sessionKey, runId: 'run-1', message: ' 换个方向 ', mode: 'follow_up' })
+  const cmdDir = path.join(dataDir, 'cmd')
+  assert.equal(await waitFor(() => fs.existsSync(cmdDir) && fs.readdirSync(cmdDir).filter((n) => n.endsWith('.json')).length > 0), true)
+
+  const name = fs.readdirSync(cmdDir).find((n) => n.endsWith('.json'))
+  assert.ok(name.startsWith(`${sessionKey}--`), `命令文件名要带会话前缀，实际：${name}`)
+  const command = JSON.parse(fs.readFileSync(path.join(cmdDir, name), 'utf8'))
+  assert.equal(command.action, 'steer')
+  assert.equal(command.runId, 'run-1')
+  assert.equal(command.message, '换个方向', '两端空白要修掉')
+  assert.equal(command.mode, 'follow_up')
+
+  // 模拟 worker 里的 agent 写回执
+  const resultDir = path.join(dataDir, 'cmd-result')
+  fs.mkdirSync(resultDir, { recursive: true })
+  fs.writeFileSync(
+    path.join(resultDir, `${command.id}.json`),
+    JSON.stringify({ id: command.id, action: 'steer', runId: 'run-1', ok: true, receipt: { deliveryStatus: 'queued', state: 'pending', targets: [] }, error: null, timedOut: false }),
+  )
+  const result = await pending
+  assert.equal(result.ok, true)
+  assert.equal(result.receipt.deliveryStatus, 'queued', 'queued 不能被 UI 当成「已读到」')
+  // 结果文件读走即删，别在盘上越积越多
+  assert.equal(fs.existsSync(path.join(resultDir, `${command.id}.json`)), false)
+})
+
+test('steer / stop: 参数不合格直接拒，不进队列（UI 传来的东西一律当不可信输入）', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
+  const sessionFile = path.join(dataDir, 'sessions', 'bad.jsonl')
+  const { sessionKey } = seedLive(dataDir, sessionFile)
+  const mod = await loadMain()
+  const api = await mod.activate(fakeCtx(dataDir))
+
+  const noRun = await api.invoke('steer', { sessionKey, message: 'x' })
+  assert.equal(noRun.ok, false)
+  assert.equal(noRun.error.code, 'bad_request')
+
+  const noKey = await api.invoke('stop', { runId: 'run-1' })
+  assert.equal(noKey.ok, false)
+
+  const blank = await api.invoke('steer', { sessionKey, runId: 'run-1', message: '   ' })
+  assert.equal(blank.ok, false)
+  assert.match(blank.error.message, /说点什么/)
+
+  const badMode = await api.invoke('steer', { sessionKey, runId: 'run-1', message: 'x', mode: 'shout' })
+  assert.equal(badMode.ok, false)
+
+  const cmdDir = path.join(dataDir, 'cmd')
+  const leftovers = fs.existsSync(cmdDir) ? fs.readdirSync(cmdDir).filter((n) => n.endsWith('.json')) : []
+  assert.deepEqual(leftovers, [], '被拒的命令不能留在队列里等某个 agent 执行')
+})
+
+test('命令超时：5 秒没人认领就撤回，并如实说「会话不活跃」（不能悄悄生效）', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
+  const sessionFile = path.join(dataDir, 'sessions', 'slow.jsonl')
+  const { sessionKey } = seedLive(dataDir, sessionFile)
+  const mod = await loadMain()
+  const api = await mod.activate(fakeCtx(dataDir))
+
+  const startedAt = Date.now()
+  const result = await api.invoke('stop', { sessionKey, runId: 'run-1' })
+  const elapsed = Date.now() - startedAt
+  assert.equal(result.ok, false)
+  assert.equal(result.error.code, 'timeout')
+  assert.match(result.error.message, /不活跃/)
+  assert.ok(elapsed >= 4_500 && elapsed < 8_000, `等待窗口应当是 5s，实际 ${elapsed}ms`)
+
+  const cmdDir = path.join(dataDir, 'cmd')
+  const leftovers = fs.existsSync(cmdDir) ? fs.readdirSync(cmdDir).filter((n) => n.endsWith('.json')) : []
+  assert.deepEqual(leftovers, [], '超时后必须撤回，否则几秒后子代理真的被停了，用户却以为没生效')
+})
+
+test('activate: 启动时清理过期命令（陈旧命令不能被下次启动执行）', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
+  const cmdDir = path.join(dataDir, 'cmd')
+  fs.mkdirSync(cmdDir, { recursive: true })
+  const old = path.join(cmdDir, 'abcdef123456--old.json')
+  fs.writeFileSync(old, JSON.stringify({ action: 'stop', runId: 'run-9', sessionKey: 'abcdef123456', createdAt: 1, id: 'old' }))
+  const past = new Date(Date.now() - 10 * 60 * 1000)
+  fs.utimesSync(old, past, past)
+
+  const mod = await loadMain()
+  await mod.activate(fakeCtx(dataDir))
+  assert.equal(fs.existsSync(old), false)
 })

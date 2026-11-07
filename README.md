@@ -11,8 +11,19 @@
 - 终止态的原因：成功 / 失败 / 被停止，以及扩展给出的摘要
 - 代际链：`resume` 出来的新一段会挂在同一张卡上（「已从第 N 段继续」），不会变成两张卡
 - **点一下子代理行 → 只读预览那段子会话**（不绑 worker、不能发消息；想接手自己从侧栏切过去）
+- **插手**：对**后台 run** 插话（立刻生效 / 本轮结束后再说）与停止；回执区分「已送达」与「已排队」
 - **信箱**：run 结束时投一条「worker 已完成」到顶栏信箱，点开回到产出它的会话 + 右栏面板
 - **这份数据能不能信**：推送 / 轮询 / 未连上 / 心跳过期，各有一套明确文案
+
+## 干预的边界
+
+- 只对**后台**（async）run 有效。前台子代理没有 async id，只能用 Esc 停整轮——面板上不会出现按钮。
+- 已终态 / 已停止的段也不出现按钮：先置灰，别让用户点了才看到报错。
+- **插话的 `queued` 不等于「它已经看到」**：只说明排上了队，子代理本轮结束才会读到；
+  排队中的插话也不会取消正在跑的 shell 命令。
+- **停止不可逆**：`stopped` 的 run 不能 resume（扩展明确），只能重新派一个。回执的
+  `state: "stopping"` 只代表受理，真正终止要靠 status 收敛，所以面板会自己再拉一次状态。
+- 命令 5 秒内没人认领就作废：说明那个会话已经不活跃了，界面会直说，不会悄悄生效。
 
 ## 它不显示什么
 
@@ -58,22 +69,24 @@ PI_PLUGINS_DIR=/path/to/pi-plugins-dev npm run dev
 ```
 pi-subagents (worker 进程内)
       ↕ eventBus RPC（subagents:rpc:v1:*）
-        读：ping / status / 事件
+        读：ping / status / 事件        写：steer / stop
 agent.mjs（worker 进程，宿主注入的 pi extension）
       ↓ 原子写 <dataDir>/live/<sessionKey>-<pid>-<startedAt>.json
+      ↑ 认领 <dataDir>/cmd/<sessionKey>--<id>.json，执行后写 cmd-result/<id>.json
 main.mjs（main 进程）
-      ↕ 插件面板通过 pi.invoke('getState', { sessionFile }) 每秒读
+      ↕ 插件面板通过 pi.invoke('getState' | 'steer' | 'stop', …) 每秒读 / 按需写
 ui/（sandbox iframe）
 ```
 
-main 与 worker 之间没有插件可用的 IPC 通道，所以读方向走文件。文件名带实例后缀是必需的：会话切换会让插件扩展**换代**（工厂重新调用、state 清空），共用文件名会把上一代结果覆盖成空白。
+main 与 worker 之间没有插件可用的 IPC 通道，所以两个方向都走文件。文件名带实例后缀是必需的：会话切换会让插件扩展**换代**（工厂重新调用、state 清空），共用文件名会把上一代结果覆盖成空白。命令文件名带会话前缀同理：多个 worker 在扫同一个 `cmd/` 目录，不按前缀分流就会把 A 会话的插话发给 B 的子代理。
 
 ## 路线图
 
 - [x] P2-a 数据打通：RPC 客户端、分文件落盘、降级与重连
 - [x] P2-b 面板完善：代际链展开、打开会话（只读预览）、信箱
-- [ ] P2-c 干预：插话（steer）与停止（stop），回执区分 `delivered` / `queued`
+- [x] P2-c 干预：插话（steer）与停止（stop），回执区分 `delivered` / `queued`
 - [ ] P2-d 分发：README、安装验证
+- [ ] 交互与视觉打磨：卡片信息分层（有效信息被淹没）、返回按钮位置（出现/消失会让内容跳一下）
 
 ## 许可
 

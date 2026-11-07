@@ -1,5 +1,24 @@
 # CHANGELOG
 
+## 0.4.0
+
+P2-c：干预（steer / stop）。
+
+- **命令队列**：main 写 `<dataDir>/cmd/<sessionKey>--<id>.json` → worker 里的 agent 认领
+  （`rename` 原子认领）→ 调 RPC → 写 `cmd-result/<id>.json` → main 读回执。
+  文件名带会话前缀：多个会话的 agent 共用一个目录时按前缀分流，不会抢别人的命令。
+- **5 秒死线**：超时撤回命令并如实说「会话不活跃」，agent 侧用同一窗口判过期——
+  不会出现「面板说没送达，几秒后子代理真的被插了话」。
+- **插话**：`delivered`（这一轮就能看到）与 `queued`（本轮结束后才看到）分开显示；
+  mode 可选「立刻插话 / 本轮结束后再说」。
+- **停止**：二次确认，文案写明 stopped 不能 resume；回执只代表受理（`state: stopping`），
+  终态靠 status 收敛。
+- **置灰而不是点了报错**：`canSteer` / `canStop` 由数据层按段状态 + `ping.capabilities`
+  计算，终态段、老版本扩展都不出现按钮；前台 run 不在 `status` 里，本来就不会有按钮。
+- **干预坞**：输入框放在 body 下独立的 `#dock`（不参与每秒重绘），否则打一个字就被重建。
+- 修掉一个真 bug：RPC 的请求超时定时器没 `unref`，握手中不断重试的会话会让进程退不出去。
+- 75 例测试（新增 15：cmd-queue 7、main 干预/超时/清理 5、agent 命令认领 3）。
+
 ## 0.3.0
 
 实测复验的三处修正 + 一个宿主新能力：

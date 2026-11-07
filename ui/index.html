@@ -8,6 +8,12 @@
 </head>
 <body>
 <div id="app"></div>
+<!--
+  干预坞：独立于 #app 的节点，**不参与每秒重绘**。
+  输入框放在 #app 里的话，用户每打一个字就被重建一次 DOM（焦点、光标、内容全丢），
+  这是 P2-a「诊断展开被拍回」的同一个坑。
+-->
+<div id="dock" hidden></div>
 <script src="pi-plugin://__host/bridge.js"></script>
 <script src="app.js"></script>
 </body>

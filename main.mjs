@@ -8,8 +8,13 @@
  *
  * 契约：
  *   invoke('getState', { sessionFile }) →
- *     { ok, sessionFile, sessionKey, liveness, degrade, source, lineages, activeCount, now }
+ *     { ok, sessionFile, sessionKey, ownerSessionKey, liveness, degrade, source, lineages, activeCount, now }
  *   invoke('getDiagnostics', { sessionFile }) → 原始 live 状态（面板的「诊断」折叠区用）
+ *   invoke('openSession', { sessionFile }) → { ok }（宿主 activate：主会话可写、子会话预览）
+ *   invoke('steer', { sessionKey, runId, index?, message, mode? }) → { ok, receipt, error }
+ *   invoke('stop', { sessionKey, runId, index? }) → { ok, receipt, error }
+ *     （steer/stop 走文件命令队列：写 cmd/ → worker 里的 agent 认领执行 → 写 cmd-result/，
+ *       main 等 5s。详见 lib/cmd-queue.mjs）
  *
  * ── 多文件结构与热重载 ─────────────────────────────────────────────────────
  *
@@ -30,6 +35,7 @@ const { normalizeSessionPath, sessionKeyOf } = await imp('session-key')
 const { listLineages, activeCount } = await imp('lineage')
 const { describeDegrade } = await imp('degrade')
 const { buildInboxItem, pruneLedger, seedLedger, selectNewCompletions } = await imp('inbox-watch')
+const { CMD_DIR, CLAIM_DIR, RESULT_DIR, REPLY_WAIT_MS, buildCommand, commandFileName } = await imp('cmd-queue')
 
 /** 面板 id：与 manifest `panels[].id` 一致，信箱条目的落点 */
 const PANEL_ID = 'fleet'
@@ -53,6 +59,7 @@ function emptyState(degrade) {
     ok: true,
     sessionFile: '',
     sessionKey: '',
+    ownerSessionKey: '',
     liveness: { alive: false, ageMs: null, updatedAt: 0 },
     degrade,
     source: null,
@@ -95,6 +102,11 @@ function stateFor(sessionFile) {
     ok: true,
     sessionFile: file,
     sessionKey,
+    /**
+     * 数据所属的会话 key（≠ sessionKey 时说明当前是子会话预览，链是父会话的）。
+     * 命令队列按它投递：插话要发给「跑着这条链的那个会话进程」，不是被预览的子会话。
+     */
+    ownerSessionKey: state?.sessionKey ?? sessionKey,
     /** 非空 = 当前视图是子会话预览；UI 据此显示「返回主会话」 */
     parentSessionFile,
     liveness,
@@ -133,6 +145,117 @@ function findOwnerOf(dataDir, sessionFile) {
 /** @param {any} ctx */
 function ledgerPath(ctx) {
   return path.join(ctx.dataDir, LEDGER_FILE)
+}
+
+/** 三个命令目录的绝对路径 @param {any} ctx */
+function cmdDirs(ctx) {
+  return {
+    cmd: path.join(ctx.dataDir, CMD_DIR),
+    claim: path.join(ctx.dataDir, CLAIM_DIR),
+    result: path.join(ctx.dataDir, RESULT_DIR),
+  }
+}
+
+/**
+ * 清理命令目录：未认领的、认领后没写完的、没人读的结果。
+ *
+ * 不清理的话，下次启动时那条陈旧命令会被某个 agent 扫到并**执行**——
+ * 用户早就不记得自己点过什么了（计划 §5.5 的 30s 规则）。
+ * @param {any} ctx
+ * @param {number} now
+ */
+function pruneCommandDirs(ctx, now) {
+  const dirs = cmdDirs(ctx)
+  let removed = 0
+  for (const [dir, ttlMs] of /** @type {[string, number][]} */ ([
+    [dirs.cmd, 30_000],
+    [dirs.claim, 30_000],
+    [dirs.result, 120_000],
+  ])) {
+    let names = []
+    try {
+      names = fs.readdirSync(dir)
+    } catch {
+      continue
+    }
+    for (const name of names) {
+      try {
+        const full = path.join(dir, name)
+        if (now - fs.statSync(full).mtimeMs > ttlMs) {
+          fs.rmSync(full, { force: true })
+          removed += 1
+        }
+      } catch {
+        /* 正被别的进程动：跳过 */
+      }
+    }
+  }
+  return removed
+}
+
+let commandSeq = 0
+
+/**
+ * 投一条命令给 worker 里的 agent，等它带回收执。
+ *
+ * 死线是 `REPLY_WAIT_MS`（5s）：超时后**把命令撤掉**，否则会出现
+ * 「面板说没送达，几秒后子代理却真的被插了话」——这种不可解释的行为比失败更糟。
+ * agent 侧用同一个窗口校验（`isExpired(..., REPLY_WAIT_MS)`），两端口径一致。
+ * @param {any} ctx
+ * @param {any} input
+ */
+async function dispatchCommand(ctx, input) {
+  const built = buildCommand(input, Date.now())
+  if (!built.ok) return { ok: false, error: { code: 'bad_request', message: built.error } }
+  const command = built.command
+  commandSeq += 1
+  command.id = `${Date.now().toString(36)}-${commandSeq.toString(36)}-${Math.random().toString(36).slice(2, 6)}`
+
+  const dirs = cmdDirs(ctx)
+  const name = commandFileName(command.sessionKey, command.id)
+  const resultFile = path.join(dirs.result, `${command.id}.json`)
+  try {
+    for (const dir of [dirs.cmd, dirs.claim, dirs.result]) fs.mkdirSync(dir, { recursive: true })
+    const tmp = path.join(dirs.cmd, `${name}.tmp`)
+    fs.writeFileSync(tmp, JSON.stringify(command, null, 2))
+    fs.renameSync(tmp, path.join(dirs.cmd, name))
+  } catch (error) {
+    return { ok: false, error: { code: 'queue_failed', message: error instanceof Error ? error.message : String(error) } }
+  }
+
+  const deadline = Date.now() + REPLY_WAIT_MS
+  while (Date.now() < deadline) {
+    try {
+      if (fs.existsSync(resultFile)) {
+        const result = JSON.parse(fs.readFileSync(resultFile, 'utf8'))
+        try {
+          fs.rmSync(resultFile, { force: true })
+        } catch {
+          /* 留着由 TTL 清 */
+        }
+        return result
+      }
+    } catch {
+      /* 还没写完（半份 JSON）：下一轮再看 */
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+
+  // 超时：撤掉还没被认领的那份（已被认领的撤不掉，但 agent 会用同一个窗口判过期）
+  try {
+    fs.rmSync(path.join(dirs.cmd, name), { force: true })
+  } catch {
+    /* 已被认领 */
+  }
+  return {
+    ok: false,
+    action: command.action,
+    runId: command.runId,
+    error: {
+      code: 'timeout',
+      message: '该子代理所属的会话已经不活跃，命令没能送达（切回那个会话再试一次）',
+    },
+  }
 }
 
 /** 读台账；坏了就重来（丢的是「已通知」标记，最坏结果是重复通知一次） @param {any} ctx */
@@ -216,6 +339,19 @@ async function handleInvoke(method, params) {
       const revealed = await jump(target)
       return { ok: Boolean(revealed), sessionFile: target }
     }
+    case 'steer':
+    case 'stop': {
+      // 干预只作用于后台 async run（计划 §5.7）。字段校验全在 buildCommand 里做：
+      // UI 传来的东西一律当作不可信输入。
+      return dispatchCommand(rt.ctx, {
+        action: method,
+        sessionKey: params?.sessionKey,
+        runId: params?.runId,
+        index: params?.index,
+        message: params?.message,
+        mode: params?.mode,
+      })
+    }
     default:
       throw new Error(`unknown method: ${method}`)
   }
@@ -230,6 +366,7 @@ export async function activate(pluginContext) {
   }
   rt = { ctx: pluginContext }
   const removed = pruneLiveFiles(pluginContext.dataDir)
+  const staleCommands = pruneCommandDirs(pluginContext, Date.now())
   // 先巡检一次：把历史终态段记进台账（不发通知），之后只发新增的
   sweepInbox(pluginContext)
   sweepTimer = setInterval(() => {
@@ -241,7 +378,11 @@ export async function activate(pluginContext) {
     }
   }, INBOX_SWEEP_MS)
   if (typeof sweepTimer.unref === 'function') sweepTimer.unref()
-  pluginContext.log(`subagents-board active, dataDir=${pluginContext.dataDir}${removed ? `, pruned ${removed} stale file(s)` : ''}`)
+  pluginContext.log(
+    `subagents-board active, dataDir=${pluginContext.dataDir}${removed ? `, pruned ${removed} stale live file(s)` : ''}${
+      staleCommands ? `, pruned ${staleCommands} stale command file(s)` : ''
+    }`,
+  )
   return { invoke: handleInvoke }
 }
 
