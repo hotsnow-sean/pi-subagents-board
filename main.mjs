@@ -34,7 +34,7 @@ const imp = (name) => import(pathToFileURL(path.join(import.meta.dirname, 'lib',
 
 const { latestForSession, livenessOf, pruneLiveFiles, readLiveFiles, liveDirOf } = await imp('live-store')
 const { normalizeSessionPath, sessionKeyOf } = await imp('session-key')
-const { listLineages, activeCount } = await imp('lineage')
+const { listLineages, activeCount, isActiveState } = await imp('lineage')
 const { describeDegrade } = await imp('degrade')
 const { buildInboxItem, pruneLedger, seedLedger, selectNewCompletions } = await imp('inbox-watch')
 const { INBOX_DIR, NOTE_TTL_MS, RECEIPT_DIR, buildNote, pruneMail } = await imp('note-queue')
@@ -158,6 +158,126 @@ function decorateOpen(lineages) {
 }
 
 /**
+ * 链上任意一段所属的父容器 run。
+ *
+ * resume 出来的新段自己没有 `stepOf`（父容器的 `steps[]` 里只有原 run 的 id），
+ * 但同一条链属于同一个父——所以沿整条链找，不是只看最后一段。
+ * @param {any} lineage
+ * @param {Map<string, string>} parentOf
+ */
+function ownerOf(lineage, parentOf) {
+  for (const segment of lineage.segments ?? []) {
+    const owner = parentOf.get(String(segment.runId ?? ''))
+    if (owner) return owner
+  }
+  return ''
+}
+
+/** @param {any} lineage */
+function lastRunIdOf(lineage) {
+  const segments = lineage.segments ?? []
+  return String(segments[segments.length - 1]?.runId ?? '')
+}
+
+/**
+ * 把 workflow 容器和它各步骤的 run 认成父子，并把子卡排到父卡后面。
+ *
+ * 依据是磁盘上的事实：容器的 `status.json` 里 `steps[].runId` 就是那一步的 run id，
+ * 而那个 run 在列表里是独立一张卡（扩展对每一步都单独发 started / completed）。
+ * 不按 agent 名推断（父与子可能同名），也不靠「容器借了谁的会话」——fanout 多步时
+ * 那样只能认出一个。
+ *
+ * 打标：
+ *   父段 `containerOf = [子 runId…]`、`containerDone = 已结束的步数`
+ *   子段 `stepOf = 父 runId`、`stepLabel = 那一步的名字`
+ *
+ * 排序：子卡紧跟父卡。用户读的是「这个 workflow 干了什么」，子卡散在时间序里
+ * 就得靠 sessionName 猜它们是一伙的。
+ *
+ * 父卡不在列表里（跨代际 live 文件、只收到子 run 的事件）时子卡保持顶层，
+ * 只是没有缩进——降级好过凭空造一个空壳父卡。
+ * @param {any[]} lineages
+ */
+function linkContainers(lineages) {
+  /** @type {Map<string, any>} */
+  const byRun = new Map()
+  for (const lineage of lineages) {
+    for (const segment of lineage.segments ?? []) {
+      if (segment.runId) byRun.set(String(segment.runId), segment)
+    }
+  }
+
+  /** 子 runId → 父 runId @type {Map<string, string>} */
+  const parentOf = new Map()
+  for (const [runId, segment] of byRun) {
+    if (!segment.asyncDir) continue
+    const snap = readRunSnapshot(segment.asyncDir)
+    if (!snap || snap.mode !== 'workflow') continue
+    /** @type {string[]} */
+    const kids = []
+    for (const step of snap.steps ?? []) {
+      const id = String(step.runId ?? '').trim()
+      if (id && id !== runId && byRun.has(id) && !kids.includes(id)) kids.push(id)
+    }
+    if (!kids.length) continue
+    segment.containerOf = kids
+    segment.containerDone = kids.filter((id) => !isActiveState(byRun.get(id)?.state)).length
+    for (const [index, id] of kids.entries()) {
+      const kid = byRun.get(id)
+      kid.stepOf = runId
+      // 步骤序号：子卡按它排，不按「谁最后说话」——workflow 的读法是先做了什么
+      kid.stepIndex = index
+      parentOf.set(id, runId)
+    }
+  }
+
+  /** 子链在父的 steps[] 里的位置（resume 出来的新段自己没有，沿链找） */
+  const stepOrderOf = (/** @type {any} */ lineage) => {
+    for (const segment of lineage.segments ?? []) {
+      if (Number.isFinite(segment.stepIndex)) return Number(segment.stepIndex)
+    }
+    return Number.MAX_SAFE_INTEGER
+  }
+
+  /** 父 runId → 子链 @type {Map<string, any[]>} */
+  const childrenOf = new Map()
+  for (const lineage of lineages) {
+    const owner = ownerOf(lineage, parentOf)
+    if (!owner) continue
+    const list = childrenOf.get(owner) ?? []
+    list.push(lineage)
+    childrenOf.set(owner, list)
+  }
+  for (const list of childrenOf.values()) list.sort((a, b) => stepOrderOf(a) - stepOrderOf(b))
+
+  /** @type {any[]} */
+  const ordered = []
+  const emitted = new Set()
+  /** 递归展开：workflow 里再开 workflow 时，孙卡要跟着自己的父走，不能掉到末尾 */
+  const emit = (/** @type {any} */ lineage) => {
+    if (emitted.has(lineage)) return
+    ordered.push(lineage)
+    emitted.add(lineage)
+    for (const child of childrenOf.get(lastRunIdOf(lineage)) ?? []) emit(child)
+  }
+  /**
+   * 组的锚点是「组内最新活动」而不是父卡自己的时间：父先启动、子步骤刚跑完的
+   * workflow 不该因为父卡旧而沉到列表底部。同值时保持 listLineages 的原顺序。
+   */
+  const activityOf = (/** @type {any} */ lineage) => {
+    let best = Number(lineage.lastActivityAt) || 0
+    for (const child of childrenOf.get(lastRunIdOf(lineage)) ?? []) best = Math.max(best, activityOf(child))
+    return best
+  }
+  const roots = lineages.filter((lineage) => !ownerOf(lineage, parentOf))
+  roots.sort((a, b) => activityOf(b) - activityOf(a))
+  for (const lineage of roots) emit(lineage)
+  // 父卡不可见的子卡：保持原时间序追加，不能因为认不出父就藏起来
+  for (const lineage of lineages) if (!emitted.has(lineage)) ordered.push(lineage)
+  lineages.splice(0, lineages.length, ...ordered)
+}
+
+/**
  * 标出「用户此刻正在看的那张卡」。
  *
  * 打开子会话后面板进入只读预览（`parentSessionFile` 非空），列表里那一段正是
@@ -214,6 +334,9 @@ function stateFor(sessionFile) {  const file = String(sessionFile ?? '').trim()
   const degrade = describeDegrade(state, liveness)
   const lineages = state ? listLineages(state) : []
   decorateOpen(lineages)
+  // 父子关系与排序放在打开判定之后：shared 判定要先按「谁自己的会话」跑一遍，
+  // linkContainers 只改层级标记和顺序，不动 openTarget。
+  linkContainers(lineages)
   markViewing(lineages, file, parentSessionFile)
   return {
     ok: true,

@@ -559,6 +559,67 @@ test('getState: 排队回执会被事后核对——扩展说失败了就必须�
   assert.equal(byId.keyless.state, 'queued', '没有 requestId 就无从核对，保持原样（不猜）')
 })
 
+test('getState: workflow 容器认领各步骤的 run，并把子卡排在父卡后面', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
+  const sessionFile = path.join(dataDir, 'sessions', 'tree.jsonl')
+  const sessionKey = sessionKeyOf(sessionFile)
+  const startedAt = Date.now() - 5_000
+  const containerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-wf-'))
+  const stepDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-step-'))
+
+  // 容器的 status.json：`steps[].runId` 就是每一步那个 run——父子关系的事实来源
+  fs.writeFileSync(
+    path.join(containerDir, 'status.json'),
+    JSON.stringify({
+      runId: 'run-p',
+      mode: 'workflow',
+      state: 'complete',
+      steps: [
+        { runId: 'run-a', agent: 'delegate', label: '第一步-取数', status: 'complete' },
+        { runId: 'run-b', agent: 'delegate', label: '第二步-乘法', status: 'running' },
+      ],
+    }),
+  )
+  // 步骤自己的快照：它是普通 delegate，label 属于它自己
+  fs.writeFileSync(
+    path.join(stepDir, 'status.json'),
+    JSON.stringify({
+      runId: 'run-a',
+      mode: 'delegate',
+      state: 'complete',
+      steps: [{ agent: 'delegate', label: '第一步-取数', sessionName: 'delegate: 用 bash 执行 echo 7', status: 'complete' }],
+    }),
+  )
+
+  const state = createState({ sessionKey, sessionFile, pid: 77, startedAt })
+  // 故意让子卡先开始、父卡最后才开始：排序不该被事件到达顺序带偏
+  applyStarted(state, { id: 'run-a', agent: 'delegate', cwd: 'C:/w', asyncDir: stepDir }, startedAt + 300)
+  applyComplete(
+    state,
+    { id: 'run-a', state: 'complete', success: true, timestamp: startedAt + 900, durationMs: 600 },
+    startedAt + 900,
+  )
+  applyStarted(state, { id: 'run-b', agent: 'delegate', cwd: 'C:/w' }, startedAt + 400)
+  applyStarted(state, { id: 'run-p', agent: 'workflow', cwd: 'C:/w', asyncDir: containerDir }, startedAt + 100)
+  state.source.rpc = true
+  state.source.mode = 'push'
+  state.updatedAt = Date.now()
+  ensureLiveDir(dataDir)
+  writeJsonAtomic(liveFileOf(dataDir, { sessionKey, pid: 77, startedAt }), state)
+
+  const mod = await loadMain()
+  const api = await mod.activate(fakeCtx(dataDir))
+  const got = await api.invoke('getState', { sessionFile })
+  const order = got.lineages.map((lineage) => lineage.segments[lineage.segments.length - 1].runId)
+  assert.deepEqual(order, ['run-p', 'run-a', 'run-b'], '父卡在前，两条子卡紧跟')
+
+  const parent = got.lineages[0].segments[0]
+  assert.deepEqual(parent.containerOf, ['run-a', 'run-b'])
+  assert.equal(parent.containerDone, 1, '一步完成、一步还在跑')
+  assert.equal(got.lineages[1].segments[0].stepOf, 'run-p')
+  assert.equal(got.lineages[2].segments[0].stepOf, 'run-p')
+})
+
 test('activate: 清理隔夜的留言与回执（昨天留的言不该在开机时突然起一轮）', async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
   const inboxDir = path.join(dataDir, 'inbox', 'abcdef123456')

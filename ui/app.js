@@ -220,6 +220,11 @@ function taskTitle(sessionName) {
  */
 function titleOf(lineage, segment) {
   const segments = lineage.segments || []
+  // 容器没有自己的名字：`label` 属于第一步、`sessionName` 是子代理的任务首句。
+  // 父子卡并排时用哪个都会撞名，直接给「角色 · 尾号」。
+  if ((segment?.containerOf || []).length) {
+    return `${String(lineage.agent || segment?.agent || '子代理')} · ${shortId(segment?.runId)}`
+  }
   for (let index = segments.length - 1; index >= 0; index -= 1) {
     const label = String(segments[index]?.label || '').trim()
     if (label) return taskTitle(label) || label
@@ -438,7 +443,10 @@ function renderActs(segment) {
     // workflow 容器 run 自己没有会话（childSessionFile 是猜的，实测不存在），
     // 候选链落到它那一步的会话——那一步在列表里另有卡片，入口归它。
     // 这里不出按钮，只说明去处，免得两个「打开」通向同一份文件。
-    acts.push(`<span class="hint">容器 · 会话见 ${esc(shortId(segment.openOwnerRunId))}</span>`)
+    // 已经有缩进子卡时就不用说了：入口就在下面，明摆着。
+    if (!(segment.containerOf || []).length) {
+      acts.push(`<span class="hint">容器 · 会话见 ${esc(shortId(segment.openOwnerRunId))}</span>`)
+    }
   }
   if (segment.canStop) {
     const confirming = stopConfirm && String(stopConfirm.runId) === String(segment.runId) && Date.now() < stopConfirm.until
@@ -452,12 +460,22 @@ function renderActs(segment) {
   return acts.length ? `<div class="acts">${acts.join('')}</div>` : ''
 }
 
-/** 身份行：角色名 · run id 尾号 · 回合数 · 续跑来源。同角色并发时靠这一行分人 */
+/** 身份行：角色名 · run id 尾号 · 回合数 · 步骤数 · 续跑来源。同角色并发时靠这一行分人 */
 function renderIdent(lineage, segment, title) {
   const parts = []
   const agent = String(lineage.agent || segment.agent || '')
-  if (agent && agent !== title) parts.push({ html: `<span class="who">${esc(agent)}</span>` })
-  if (segment.runId) parts.push({ html: `<code>${esc(shortId(segment.runId))}</code>` })
+  const steps = (segment.containerOf || []).length
+  // 容器卡的标题就是「角色 · 尾号」（它没有自己的名字），身份行再写一遍纯属重复
+  if (!steps) {
+    if (agent && agent !== title) parts.push({ html: `<span class="who">${esc(agent)}</span>` })
+    if (segment.runId) parts.push({ html: `<code>${esc(shortId(segment.runId))}</code>` })
+  }
+  if (steps) {
+    // 容器卡：子卡就在下面缩进着，这里只说「几步、跑完几步」——
+    // 会话入口归子卡自己，容器不提供「打开」（见 renderActs）
+    const done = Number(segment.containerDone) || 0
+    parts.push({ html: `<span class="steps">${done >= steps ? `${steps} 步` : `${steps} 步 · ${done}/${steps} 完成`}</span>` })
+  }
   const turns = Number(segment.activity?.turnCount)
   if (Number.isFinite(turns) && turns > 0) parts.push({ html: `${turns} 回合` })
   if (segment.revivedFrom) {
@@ -584,11 +602,14 @@ function renderCard(lineage) {
   const state = segment.state || lineage.state || 'unknown'
   const live = ACTIVE_STATES.has(String(state))
   const title = titleOf(lineage, segment)
+  const container = (segment.containerOf || []).length > 0
+  const step = Boolean(segment.stepOf)
   // data-card 是增量渲染的锚点：结构没变的卡在下一帧被原样复用（P7）。
   // viewing = 你眼前这份内容就是它（只读预览子会话时由 main 标出）。
-  return `<article class="card${live ? ' live' : ''}${segment.viewing ? ' viewing' : ''}" data-card="${esc(
-    segment.runId,
-  )}">
+  // container / step 决定缩进与连接线：容器是「大框的头」，步骤卡缩进挂在它下面。
+  return `<article class="card${live ? ' live' : ''}${segment.viewing ? ' viewing' : ''}${
+    container ? ' container' : ''
+  }${step ? ' step' : ''}" data-card="${esc(segment.runId)}">
     <div class="row1">
       <span class="dot ${esc(stateClass(state))}" data-dot="${esc(segment.runId)}"></span>
       <span class="agent" title="${esc(String(segment.sessionName || title))}">${esc(title)}</span>
@@ -603,6 +624,47 @@ function renderCard(lineage) {
     ${renderMailChip(segment)}
     ${renderGen(lineage, segment)}
   </article>`
+}
+
+/** 一张链最后那段的 run id（卡片显示的就是这一段） */
+function cardRunId(lineage) {
+  const segments = lineage.segments || []
+  return String(segments[segments.length - 1]?.runId || '')
+}
+
+/** 这张卡是不是 `parentRunId` 那一步：链上任意一段标了 stepOf 就算（resume 段也一样） */
+function isChildCard(lineage, parentRunId) {
+  return (lineage.segments || []).some((segment) => String(segment.stepOf || '') === parentRunId)
+}
+
+/**
+ * 列表：容器卡 + 一束缩进的子卡，连接线由 CSS 画。
+ *
+ * main 已经把子卡排在父卡后面，这里只需顺着看「紧跟的这几张是不是我的子」。
+ * 递归是为了嵌套容器（workflow 里再开 workflow）：子卡自己也带一束，缩进自然叠一层。
+ * 子卡不是「另一种卡」——插话、停止、打开都照旧，只是视觉上归属父卡。
+ */
+function renderList(lineages) {
+  const out = []
+  let index = 0
+  while (index < lineages.length) {
+    const lineage = lineages[index]
+    const segments = lineage.segments || []
+    const runId = cardRunId(lineage)
+    out.push(renderCard(lineage))
+    index += 1
+    if (!(segments[segments.length - 1]?.containerOf || []).length) continue
+    const kids = []
+    while (index < lineages.length && isChildCard(lineages[index], runId)) {
+      kids.push(lineages[index])
+      index += 1
+    }
+    // 子卡不在紧跟位置时（数据缺口），它们会以缩进卡的形式留在原位——不藏起来
+    if (kids.length) {
+      out.push(`<div class="subtree" data-card="sub:${esc(runId)}">${renderList(kids)}</div>`)
+    }
+  }
+  return out.join('')
 }
 
 function renderBanner(degrade) {
@@ -706,10 +768,15 @@ function syncScroll(data) {
   el.scrollTop = saved == null ? 0 : saved
 }
 
-function renderHead(data, lineages) {  const active = Number(data.activeCount) || 0
+/**
+ * 顶栏。返回按钮只有图标：这一行本来就窄，「← 主会话」四个字占的位置比
+ * 「子代理 · 本会话」还多；图标 + `title` 足够，卡上那个「返回」才是带字的。
+ */
+function renderHead(data, lineages) {
+  const active = Number(data.activeCount) || 0
   const previewing = Boolean(data.parentSessionFile)
   const back = previewing
-    ? `<button class="back" data-open-session="${esc(data.parentSessionFile)}">← 主会话</button>`
+    ? `<button class="back" data-open-session="${esc(data.parentSessionFile)}" title="返回主会话" aria-label="返回主会话"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M9.9 3.4 5.1 8l4.8 4.6" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></button>`
     : ''
   return `<div class="head">
     ${back}
@@ -776,7 +843,7 @@ function render() {
   setSlot(shell.banner, renderBanner(data.degrade))
   patchCards(
     lineages.length
-      ? lineages.map((lineage) => renderCard(lineage)).join('')
+      ? renderList(lineages)
       : data.degrade?.kind === 'ok'
         ? '<div class="empty"><strong>这个会话还没有子代理运行记录</strong><span>派一个后台子代理，它跑起来就会出现在这里。</span></div>'
         : '',

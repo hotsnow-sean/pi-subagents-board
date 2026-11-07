@@ -80,14 +80,18 @@ html, body {
 .head .back {
   all: unset;
   cursor: pointer;
-  font-size: 11.5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 22px;
+  height: 22px;
+  margin: 0 -2px 0 -5px;
+  border-radius: 6px;
   color: var(--accent);
-  padding: 1px 6px;
-  margin-left: -6px;
-  border-radius: 5px;
-  white-space: nowrap;
 }
 .head .back:hover { background: var(--accent-weak); }
+.head .back:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent); outline-offset: 1px; }
 
 /* ---------- 降级提示：只在「数据不可信」时出现 ---------- */
 .banner {
@@ -130,6 +134,38 @@ html, body {
 .card.viewing {
   border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
   background: color-mix(in srgb, var(--accent) 6%, var(--surface-2));
+}
+
+/* ---------- 容器（workflow）与它的步骤卡 ----------
+ * 「大框包小框」在 ~360px 的侧栏里会把子卡挤到 300px 出头，摘要两行提前截断，
+ * 而且 fanout 多步时大框会长到两三屏。所以用「缩进 + 连接线」：父卡是这一组的头，
+ * 子卡缩进挂在它下面，一条细线从父卡左下角垂下来——读到哪一步、哪几步是一伙，
+ * 一眼就有答案，代价只有 12px 宽度。
+ *
+ * 容器卡底色压深一档：它是「一次编排」而不是「一次执行」，不该和真正跑事的卡同级。
+ * 子卡的插话 / 停止 / 打开照旧，它只是换了位置。 */
+.card.container { background: var(--surface-3); }
+.card.step { padding: 9px 10px 8px; }
+
+.subtree {
+  position: relative;
+  margin: -6px 0 8px 13px;
+  padding-left: 12px;
+  border-left: 1.5px solid color-mix(in srgb, var(--accent) 40%, var(--line));
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.subtree > .card { margin-bottom: 0; }
+/* 拐角：竖线顶端向右拐进第一张子卡 */
+.subtree::before {
+  content: "";
+  position: absolute;
+  left: -1.5px;
+  top: 18px;
+  width: 12px;
+  height: 1.5px;
+  background: color-mix(in srgb, var(--accent) 40%, var(--line));
 }
 
 /* 第一行：点 · 标题 · 状态 · 计时（计时靠右） */
@@ -183,6 +219,7 @@ html, body {
   flex-wrap: wrap;
 }
 .ident .who { color: var(--muted); }
+.ident .steps { color: var(--muted); }
 .ident code { font-family: var(--mono); font-size: 10.5px; }
 .ident .sep { opacity: .55; }
 /* 续跑标记：跟原卡同名，靠它区分「这是又一次」 */

@@ -1,7 +1,7 @@
 {
   "id": "subagents-board",
   "name": "子代理",
-  "version": "0.7.3",
+  "version": "0.7.4",
   "description": "在右栏观测 pi-subagents 的后台运行：谁在跑、跑到哪、什么时候结束。",
   "icon": "Users",
   "engines": {

@@ -260,6 +260,28 @@ test('stepLabel / resolveRunTitle: workflow 的步骤名优先，等于 workflow
   assert.equal(resolveRunTitle(path.join(root, 'run-y')).title, '第一步-取数', 'label 排在 sessionName 前面')
 })
 
+test('容器（mode=workflow）不拿第一步的 label 当自己的标题，但 steps[].runId 照常解析', () => {
+  clearRunSnapshotCache()
+  const root = runsRoot({
+    'run-p': {
+      runId: 'run-p',
+      mode: 'workflow',
+      steps: [
+        { runId: 'run-a', label: '第一步-取数', sessionName: 'delegate: 用 bash 执行 echo 7' },
+        { runId: 'run-b', label: '第二步-乘法', sessionName: 'delegate: 算乘法' },
+      ],
+    },
+  })
+  const snap = readRunSnapshot(path.join(root, 'run-p'))
+  assert.deepEqual(
+    snap.steps.map((step) => step.runId),
+    ['run-a', 'run-b'],
+    '父子关系就靠它（面板据此把子卡挂在父卡下面）',
+  )
+  assert.equal(stepLabel(snap), '', '第一步的名字属于子卡，父卡拿去用就撞名了')
+  assert.equal(resolveRunTitle(path.join(root, 'run-p')).title, '', '父卡标题交给 UI 兜底成「角色 · 尾号」')
+})
+
 test('readRunSnapshot: steps 带上 label / workflowKey / sessionFile（P6 + P8 的数据源）', () => {
   clearRunSnapshotCache()
   const dir = tmpRunDir({
