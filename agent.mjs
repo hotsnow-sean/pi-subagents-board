@@ -28,7 +28,7 @@ import path from 'node:path'
 import { applyComplete, applyStarted, createState, isActiveState, mergeStatus } from './lib/lineage.mjs'
 import { INBOX_DIR, RECEIPT_DIR, isFresh, parseNoteFileName } from './lib/note-queue.mjs'
 import { ensureLiveDir, liveFileOf, writeJsonAtomic } from './lib/live-store.mjs'
-import { readRunSnapshot, describeSteerFailure } from './lib/run-snapshot.mjs'
+import { describeSteerFailure, isReviveNoise, readRunSnapshot, resolveRunTitle } from './lib/run-snapshot.mjs'
 import { childSessionFile, sessionKeyOf } from './lib/session-key.mjs'
 
 const RPC_VERSION = 1
@@ -275,16 +275,36 @@ export default function subagentsBoard(pi, ctx) {
     for (const lineage of state.lineages ?? []) {
       for (const segment of lineage.segments ?? []) {
         if (!segment.asyncDir) continue
-        if (!isActiveState(segment.state) && segment.state !== 'stopping') continue
+        const active = isActiveState(segment.state) || segment.state === 'stopping'
+        // 终态段的数据不会再变，但「名字缺失 / 名字是 resume 的模板废话」得补一次——
+        // 补完 sessionName 就有值了，之后每次心跳都跳过，不会长期占 IO。
+        if (!active && segment.sessionName && !isReviveNoise(segment.sessionName)) continue
         const snap = readRunSnapshot(segment.asyncDir)
         if (!snap) continue
 
-        const first = snap.steps?.[0]
-        const name = String(first?.sessionName ?? '').trim()
-        if (name && name !== segment.sessionName) {
-          segment.sessionName = name
+        // 标题：resume 段的 sessionName 是运行时的模板首句，顺着 revivedFrom 读原 run 才拿得到真名字
+        const resolved = resolveRunTitle(segment.asyncDir, snap)
+        if (resolved.revivedFrom && segment.revivedFrom !== resolved.revivedFrom) {
+          segment.revivedFrom = resolved.revivedFrom
           changed = true
         }
+        if (resolved.title && resolved.title !== segment.sessionName) {
+          segment.sessionName = resolved.title
+          changed = true
+        }
+
+        // 模型 / 思考档位：卡片上不需要点开明细就能看见（报告 P3 的可视化那一半）
+        const first = snap.steps?.[0]
+        if (first?.model && first.model !== segment.model) {
+          segment.model = first.model
+          changed = true
+        }
+        if (first?.thinking && first.thinking !== segment.thinking) {
+          segment.thinking = first.thinking
+          changed = true
+        }
+        if (!active) continue
+
         if (snap.steering && JSON.stringify(snap.steering) !== JSON.stringify(segment.steering)) {
           segment.steering = snap.steering
           changed = true
@@ -293,7 +313,7 @@ export default function subagentsBoard(pi, ctx) {
         for (const child of segment.children ?? []) {
           const step = snap.steps?.find((/** @type {any} */ item) => item.index === (Number(child.index) || 0))
           if (!step) continue
-          if (step.sessionName && !child.sessionName) {
+          if (step.sessionName && !child.sessionName && !isReviveNoise(step.sessionName)) {
             child.sessionName = step.sessionName
             changed = true
           }

@@ -175,6 +175,8 @@ html, body {
 .ident .who { color: var(--muted); }
 .ident code { font-family: var(--mono); font-size: 10.5px; }
 .ident .sep { opacity: .55; }
+/* 续跑标记：跟原卡同名，靠它区分「这是又一次」 */
+.ident .revive { color: var(--warn, var(--muted)); opacity: .9; }
 
 .summary {
   margin: 7px 0 0;
@@ -198,6 +200,7 @@ html, body {
   flex-wrap: wrap;
 }
 .meta .tool { color: var(--muted); font-family: var(--mono); font-size: 10.5px; }
+.meta .model { font-family: var(--mono); font-size: 10.5px; color: var(--dim); }
 /* 插话计数里有失败时整条变红：这是「有一条真的没投进去」，不是装饰 */
 .meta .bad { color: var(--bad); }
 

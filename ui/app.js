@@ -304,7 +304,7 @@ function describeMail(mail, segment) {
   if (!mail.confirmed) {
     const age = Date.now() - Number(mail.at || 0)
     if (age < RECEIPT_PATIENCE_MS) {
-      return { text: kind === 'stop' ? '停止请求已发出…' : '正插进去…', tone: 'sent' }
+      return { text: kind === 'stop' ? '停止请求已发出…' : '正在投递…', tone: 'sent' }
     }
     return {
       text:
@@ -321,9 +321,9 @@ function describeMail(mail, segment) {
   // 停在 queued：扩展受理了，但还没走到回合边界。它要是先结束了，这条就永远进不去——
   // 别让卡片一直说「等它这一步结束」，那是在骗人（P2′）
   if (segment && !ACTIVE_STATES.has(String(segment.state))) {
-    return { text: '已排队，但它先结束了 · 这条可能没进去', tone: 'warn' }
+    return { text: '已受理，但它先结束了 · 这条可能没进去', tone: 'warn' }
   }
-  return { text: `已排队，等它这一步结束 · ${fmtClock(mail.at)}`, tone: 'sent' }
+  return { text: `已受理，它这一步做完才插进去 · ${fmtClock(mail.at)}`, tone: 'sent' }
 }
 
 const CHIP_ICON = { read: '✓', bad: '✕', warn: '!', sent: '↑' }
@@ -384,7 +384,7 @@ function renderActs(segment) {
   return acts.length ? `<div class="acts">${acts.join('')}</div>` : ''
 }
 
-/** 身份行：角色名 · run id 尾号 · 回合数。同角色并发时靠这一行分人 */
+/** 身份行：角色名 · run id 尾号 · 回合数 · 续跑来源。同角色并发时靠这一行分人 */
 function renderIdent(lineage, segment, title) {
   const parts = []
   const agent = String(lineage.agent || segment.agent || '')
@@ -392,6 +392,14 @@ function renderIdent(lineage, segment, title) {
   if (segment.runId) parts.push({ html: `<code>${esc(shortId(segment.runId))}</code>` })
   const turns = Number(segment.activity?.turnCount)
   if (Number.isFinite(turns) && turns > 0) parts.push({ html: `${turns} 回合` })
+  if (segment.revivedFrom) {
+    // resume 的卡跟原卡同名，不给个标记就分不清「这是新的那次」
+    parts.push({
+      html: `<span class="revive" title="接着 ${esc(String(segment.revivedFrom))} 继续跑的">↻ 续 ${esc(
+        shortId(segment.revivedFrom),
+      )}</span>`,
+    })
+  }
   if (!parts.length) return ''
   return `<div class="ident">${parts.map((part) => part.html).join('<span class="sep">·</span>')}</div>`
 }
@@ -415,10 +423,25 @@ function steeringText(steering) {
   return { text: `插话 ${requested} 次`, bad: false, tip }
 }
 
+/**
+ * 模型 / 思考档位：报告 P3 里「调用参数 > agent frontmatter > 全局默认」的分层，
+ * 用户得能在卡上直接确认自己这层生效了。只显示，不解释。
+ */
+function modelText(segment) {
+  const model = String(segment.model || '').trim()
+  if (!model) return ''
+  const thinking = String(segment.thinking || '').trim()
+  // 模型名常常很长（`deepseek/deepseek-v4-pro`）：去掉 provider 前缀，留最后一段
+  const short = model.includes('/') ? model.slice(model.lastIndexOf('/') + 1) : model
+  return thinking ? `${short} · ${thinking}` : short
+}
+
 function renderMeta(segment) {
   const items = []
   const childCount = (segment.children || []).length
   if (childCount > 1) items.push(`<span>${childCount} 个子代理</span>`)
+  const model = modelText(segment)
+  if (model) items.push(`<span class="model" title="${esc(String(segment.model || ''))}">${esc(model)}</span>`)
   // 「它正在跑什么」——占位留空，内容由 tickTimings 填，免得每秒重算 HTML
   if (segment.state === 'running' && (segment.children || []).some((child) => child.currentTool)) {
     items.push(`<span class="tool" data-tool="${esc(segment.runId)}"></span>`)

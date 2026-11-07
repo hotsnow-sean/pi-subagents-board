@@ -159,3 +159,27 @@ P2-a：数据层打通。
 
 新增 `lib/run-snapshot.mjs`（只读、mtime 缓存、坏文件/超大文件一律 null）。
 读的是扩展私有产物，全部容错——读不到就退回旧行为。测试 95 例。
+
+## 0.7.0 — resume 标题回原 run 取 + 模型档位上卡（实测报告 v6）
+
+**P1″ 结论 2（resume 标题是模板句）**：
+
+- 报告给的三条路里选了**方案 1（面板读原 run）**：resume 段的 `status.json` 带
+  `revivedFrom`，顺着它去同父目录读原 run 的 `status.json` 就有真标题，零后端改动；
+  连环 resume 最多回追 4 跳。原 run 目录被清理时退回角色名，不编。
+  不选方案 2（读 events 里的 `Follow-up:`）是因为那等于绕开上游对 prompt 的有意脱敏。
+- **不依赖代际链**：链是按事件/子会话文件拼的，插件中途启动或跨会话 resume 时可能缺段；
+  `revivedFrom` 是文件里的硬事实。UI 沿链回退保留作兜底（两道保险，mock 的 `?raw=1` 验过）。
+- 卡片身份行加 **`↻ 续 <runId 前 8 位>`**：resume 卡与原卡同名，不给标记分不清是哪一次。
+
+**P1′（`options.name` 被上游静默忽略）**：`run-snapshot` 现在读 `status.json.name`——
+扩展哪天把它落地，面板零改动直接把人给的名字当标题（优先于 sessionName）。
+
+**P3 可视化那一半**：卡片 meta 行显示实际用的模型与思考档位（`deepseek-v4-pro · high`），
+调用参数 > frontmatter > 全局默认的分层在卡上直接可查，不用再翻 status。
+
+**P2′ 建议 2（回执文案不用完成态口吻）**：queued 的 chip 从「已排队，等它这一步结束」
+改成「已受理，它这一步做完才插进去」；投递中改「正在投递…」。
+
+其余（P0 workflow Windows 启动、P1′ 的 `name` 落地、P2′ 后端亚秒窗口、P3 默认模型）
+都在 pi-subagents 上游，插件侧无能为力。测试 103 例。

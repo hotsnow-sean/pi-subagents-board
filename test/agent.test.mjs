@@ -349,6 +349,42 @@ test('agent: 运行中从 run 的 status.json 补标题与 steering 计数（RPC
   assert.equal(segment.steering?.pending, 1)
 })
 
+test('agent: resume 段的标题回原 run 取，且带上「续」的标记（报告 P1″ 结论 2）', async () => {
+  const { dataDir, harness } = await boot()
+  await sleep(400)
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'board-runs-'))
+  const originId = 'origin-1'
+  const resumeId = 'resume-1'
+  fs.mkdirSync(path.join(root, originId))
+  fs.writeFileSync(
+    path.join(root, originId, 'status.json'),
+    JSON.stringify({ runId: originId, state: 'complete', steps: [{ agent: 'delegate', sessionName: 'delegate: 约 25 秒任务：写一行时间' }] }),
+  )
+  fs.mkdirSync(path.join(root, resumeId))
+  fs.writeFileSync(
+    path.join(root, resumeId, 'status.json'),
+    JSON.stringify({
+      runId: resumeId,
+      state: 'running',
+      revivedFrom: originId,
+      steps: [{ agent: 'delegate', sessionName: 'delegate: You are reviving a previous subagent conversation. Origin...' }],
+    }),
+  )
+
+  harness.emit('subagent:async-started', {
+    id: resumeId,
+    agent: 'delegate',
+    cwd: 'C:/w',
+    asyncDir: path.join(root, resumeId),
+    revivedFrom: originId,
+    sessionId: 'C:/sessions/parent.jsonl',
+  })
+
+  const segmentOf = () => readState(dataDir)?.lineages?.at(-1)?.segments?.at(-1)
+  assert.equal(await waitFor(() => segmentOf()?.sessionName === 'delegate: 约 25 秒任务：写一行时间'), true)
+  assert.equal(segmentOf()?.revivedFrom, originId, '续跑来源要留在段上，卡片拿来标「续」')
+})
+
 test('agent: 没有 pi.events 时立刻落一份说明原因的状态', async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-agent-'))
   const { default: factory } = await import(entry)

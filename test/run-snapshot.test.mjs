@@ -7,8 +7,10 @@ import test from 'node:test'
 import {
   clearRunSnapshotCache,
   describeSteerFailure,
+  isReviveNoise,
   normalizeSteering,
   readRunSnapshot,
+  resolveRunTitle,
   steeringEntry,
 } from '../lib/run-snapshot.mjs'
 
@@ -44,6 +46,16 @@ function tmpRunDir(files = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-snap-'))
   for (const [name, body] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), body)
   return dir
+}
+
+/** 造一个 runs 根目录：`<root>/<runId>/status.json`，形状与扩展的 async-subagent-runs 一致 */
+function runsRoot(runs = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'board-runs-'))
+  for (const [runId, body] of Object.entries(runs)) {
+    fs.mkdirSync(path.join(root, runId))
+    fs.writeFileSync(path.join(root, runId, 'status.json'), JSON.stringify(body))
+  }
+  return root
 }
 
 test('normalizeSteering: 只留面板要的字段，messagePreview 这类不上车', () => {
@@ -143,8 +155,7 @@ test('readRunSnapshot: 文件没变就复用解析结果（面板每秒一次 ge
   assert.equal(second, first, 'mtime + size 都没变时应当命中缓存（同一个对象）')
 })
 
-test('readRunSnapshot: 缺文件 / 空路径 / 坏 JSON / 超大文件 → null，不抛', () => {
-  clearRunSnapshotCache()
+test('readRunSnapshot: 缺文件 / 空路径 / 坏 JSON / 超大文件 → null，不抛', () => {  clearRunSnapshotCache()
   assert.equal(readRunSnapshot(''), null)
   assert.equal(readRunSnapshot(null), null)
   assert.equal(readRunSnapshot(path.join(os.tmpdir(), 'board-nope-does-not-exist')), null)
@@ -154,4 +165,78 @@ test('readRunSnapshot: 缺文件 / 空路径 / 坏 JSON / 超大文件 → null�
 
   const huge = tmpRunDir({ 'status.json': JSON.stringify({ pad: 'x'.repeat(600 * 1024) }) })
   assert.equal(readRunSnapshot(huge), null, 'workflow 大 run 的文件不值得读')
+})
+
+/* ---------- 标题解析（报告 P1″ 结论 2 / P1′） ---------- */
+
+const REAL_RESUME_NAME =
+  'delegate: You are reviving a previous subagent conversation. Origin...'
+const REAL_ORIGIN_NAME = 'delegate: 约 25 秒任务：往 playground/name-probe/a.md 写一行当前时间，sleep 15，再写...'
+
+test('isReviveNoise: 认得出实测那句模板话，正常任务名不算', () => {
+  assert.equal(isReviveNoise(REAL_RESUME_NAME), true)
+  assert.equal(isReviveNoise(REAL_ORIGIN_NAME), false)
+  assert.equal(isReviveNoise(''), false)
+  assert.equal(isReviveNoise(null), false)
+})
+
+test('resolveRunTitle: 普通 run 用自己的 sessionName', () => {
+  clearRunSnapshotCache()
+  const root = runsRoot({ 'run-a': { runId: 'run-a', state: 'running', steps: [{ agent: 'worker', sessionName: REAL_ORIGIN_NAME }] } })
+  const got = resolveRunTitle(path.join(root, 'run-a'))
+  assert.equal(got.title, REAL_ORIGIN_NAME)
+  assert.equal(got.revivedFrom, null)
+})
+
+test('resolveRunTitle: resume 段的标题去原 run 取，模板废话不上卡', () => {
+  clearRunSnapshotCache()
+  const root = runsRoot({
+    'run-a': { runId: 'run-a', state: 'complete', steps: [{ agent: 'delegate', sessionName: REAL_ORIGIN_NAME }] },
+    'run-b': {
+      runId: 'run-b',
+      state: 'running',
+      revivedFrom: 'run-a',
+      steps: [{ agent: 'delegate', sessionName: REAL_RESUME_NAME }],
+    },
+  })
+  const got = resolveRunTitle(path.join(root, 'run-b'))
+  assert.equal(got.title, REAL_ORIGIN_NAME, '拿到的必须是原任务名')
+  assert.equal(got.revivedFrom, 'run-a', 'revivedFrom 同时要带出来，卡片上要标「续」')
+})
+
+test('resolveRunTitle: 连环 resume 一路往回追', () => {
+  clearRunSnapshotCache()
+  const root = runsRoot({
+    'run-a': { runId: 'run-a', steps: [{ agent: 'delegate', sessionName: REAL_ORIGIN_NAME }] },
+    'run-b': { runId: 'run-b', revivedFrom: 'run-a', steps: [{ sessionName: REAL_RESUME_NAME }] },
+    'run-c': { runId: 'run-c', revivedFrom: 'run-b', steps: [{ sessionName: REAL_RESUME_NAME }] },
+  })
+  const got = resolveRunTitle(path.join(root, 'run-c'))
+  assert.equal(got.title, REAL_ORIGIN_NAME)
+  assert.equal(got.revivedFrom, 'run-b', 'revivedFrom 只报直接来源，追到哪一层是内部事')
+})
+
+test('resolveRunTitle: 原 run 目录已被清理 → 没有标题，但 revivedFrom 照样带出来', () => {
+  clearRunSnapshotCache()
+  const root = runsRoot({
+    'run-b': { runId: 'run-b', revivedFrom: 'run-gone', steps: [{ sessionName: REAL_RESUME_NAME }] },
+  })
+  const got = resolveRunTitle(path.join(root, 'run-b'))
+  assert.equal(got.title, '', '读不到就退回角色名，不编')
+  assert.equal(got.revivedFrom, 'run-gone')
+})
+
+test('resolveRunTitle: status.json 里若有 name（扩展将来落地 P1′）就优先用它', () => {
+  clearRunSnapshotCache()
+  const root = runsRoot({
+    'run-a': { runId: 'run-a', name: '命名探测-甲', steps: [{ sessionName: 'delegate: 随便什么任务首行' }] },
+  })
+  assert.equal(resolveRunTitle(path.join(root, 'run-a')).title, '命名探测-甲')
+})
+
+test('resolveRunTitle: 空路径 / 目录不存在 → 空标题，不抛', () => {
+  clearRunSnapshotCache()
+  assert.deepEqual(resolveRunTitle(''), { title: '', revivedFrom: null })
+  assert.deepEqual(resolveRunTitle(null), { title: '', revivedFrom: null })
+  assert.equal(resolveRunTitle(path.join(os.tmpdir(), 'board-nope-runs')).title, '')
 })
