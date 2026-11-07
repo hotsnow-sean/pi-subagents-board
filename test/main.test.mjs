@@ -122,6 +122,8 @@ test('getState: 打开目标按候选顺序取第一个真实存在的，全不�
   const a = applyStarted(state, { id: 'run-a', agent: 'worker', cwd: 'C:/w' }, startedAt + 100)
   const b = applyStarted(state, { id: 'run-b', agent: 'worker', cwd: 'C:/w' }, startedAt + 200)
   const c = applyStarted(state, { id: 'run-c', agent: 'worker', cwd: 'C:/w' }, startedAt + 300)
+  // 旧落盘文件（0.7.0 及以前）没有 openCandidates，只有 childSessionFile
+  const d = applyStarted(state, { id: 'run-d', agent: 'worker', cwd: 'C:/w' }, startedAt + 400)
 
   const real = path.join(dataDir, 'child-real.jsonl')
   fs.writeFileSync(real, '{}')
@@ -129,6 +131,7 @@ test('getState: 打开目标按候选顺序取第一个真实存在的，全不�
   a.segment.openCandidates = [path.join(dataDir, 'gone.jsonl'), real]
   b.segment.openCandidates = [path.join(dataDir, 'gone.jsonl')]
   c.segment.openCandidates = []
+  d.segment.childSessionFile = real
 
   state.source.rpc = true
   state.source.mode = 'push'
@@ -146,6 +149,8 @@ test('getState: 打开目标按候选顺序取第一个真实存在的，全不�
   assert.equal(byId['run-b'].openTarget, '')
   assert.equal(byId['run-b'].openState, 'missing', '有候选但都不在 = 会话被清理，按钮置灰')
   assert.equal(byId['run-c'].openState, 'none', '本来就没有会话 = 不出按钮')
+  assert.equal(byId['run-d'].openTarget, real, '旧落盘文件没有 openCandidates，也要能打开')
+  assert.equal(byId['run-d'].openState, 'ok')
 })
 
 test('getDiagnostics: 给出数据文件与原始状态', async () => {

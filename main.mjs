@@ -115,7 +115,13 @@ function existsCached(file) {
 function decorateOpen(lineages) {
   for (const lineage of lineages) {
     for (const segment of lineage.segments ?? []) {
-      const candidates = Array.isArray(segment.openCandidates) ? segment.openCandidates : []
+      // 旧落盘文件没有 openCandidates（0.7.1 才补）：按老办法就地拼一份，
+      // 否则升级后所有历史卡的「打开」都会消失——比修之前更糟。
+      const candidates = Array.isArray(segment.openCandidates)
+        ? segment.openCandidates
+        : [segment.childSessionFile, ...(segment.children ?? []).map((/** @type {any} */ child) => child?.sessionFile)].filter(
+            Boolean,
+          )
       const target = candidates.find((file) => file && existsCached(String(file))) || ''
       segment.openTarget = target
       segment.openState = target ? 'ok' : candidates.length ? 'missing' : 'none'
