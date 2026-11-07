@@ -27,6 +27,8 @@
   --bad: var(--pi-destructive, light-dark(#cf222e, #f85149));
   --warn: light-dark(#9a6700, #d29922);
   --dim: color-mix(in srgb, var(--muted) 82%, var(--surface));
+  /* 父子卡片之间那条线：比边框显眼一点，但不该抢标题视线 */
+  --tree-line: color-mix(in srgb, var(--accent) 42%, var(--line));
   --radius: var(--pi-radius, 10px);
   --mono: ui-monospace, "Cascadia Mono", "Consolas", "Courier New", monospace;
 }
@@ -147,26 +149,35 @@ html, body {
 .card.container { background: var(--surface-3); }
 .card.step { padding: 9px 10px 8px; }
 
+/* 连接线：每张子卡自带一段「肘线」——从上一张卡底边垂下来、到标题行高度
+ * 向右拐进卡里。线跟着卡走，最后一张之后自然就没有线，不用去猜整组有多高
+ * （父容器上一条 border-left 做不到这件事：它只能一路画到底，读者会以为
+ * 「下面还有一张」）。
+ * 首张卡顶边上提 8px 贴住父卡的底边（父卡 margin-bottom: 8px），线从父卡
+ * 底边直接长出来；后面的卡各自往回补 8px，把中间那道 7px 的缝接上。 */
 .subtree {
   position: relative;
-  margin: -6px 0 8px 13px;
-  padding-left: 12px;
-  border-left: 1.5px solid color-mix(in srgb, var(--accent) 40%, var(--line));
+  margin: -8px 0 8px 12px;
+  padding-left: 14px;
   display: flex;
   flex-direction: column;
-  gap: 7px;
 }
-.subtree > .card { margin-bottom: 0; }
-/* 拐角：竖线顶端向右拐进第一张子卡 */
-.subtree::before {
+.subtree > .card { position: relative; margin-bottom: 0; }
+.subtree > .card + .card { margin-top: 7px; }
+.subtree > .card::before {
   content: "";
   position: absolute;
-  left: -1.5px;
-  top: 18px;
-  width: 12px;
-  height: 1.5px;
-  background: color-mix(in srgb, var(--accent) 40%, var(--line));
+  left: -14px;
+  /* 往上多吃 1px：分数像素下（125%/150% 缩放）接缝会露白，压 1px 盖住 */
+  top: -1px;
+  width: 14px;
+  height: 19px;
+  border-left: 1px solid var(--tree-line);
+  border-bottom: 1px solid var(--tree-line);
+  border-bottom-left-radius: 7px;
+  pointer-events: none;
 }
+.subtree > .card + .card::before { top: -9px; height: 27px; }
 
 /* 第一行：点 · 标题 · 状态 · 计时（计时靠右） */
 .row1 { display: flex; align-items: center; gap: 7px; min-width: 0; }

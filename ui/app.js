@@ -529,7 +529,10 @@ function modelText(segment) {
 function renderMeta(segment) {
   const items = []
   const childCount = (segment.children || []).length
-  if (childCount > 1) items.push(`<span>${childCount} 个子代理</span>`)
+  // 容器卡不写「N 个子代理」：它的子代理就是下面缩进着的那几张卡，
+  // 身份行已经有「N 步」，再报一次人数只是重复
+  const container = (segment.containerOf || []).length > 0
+  if (childCount > 1 && !container) items.push(`<span>${childCount} 个子代理</span>`)
   const model = modelText(segment)
   if (model) items.push(`<span class="model" title="${esc(String(segment.model || ''))}">${esc(model)}</span>`)
   // 「它正在跑什么」——占位留空，内容由 tickTimings 填，免得每秒重算 HTML
@@ -560,7 +563,10 @@ function renderSummary(segment) {
 function renderGen(lineage, segment) {
   const segments = lineage.segments || []
   const earlier = segments.slice(0, -1)
-  const children = segment.children || []
+  // 容器卡的子代理已经是下面那些缩进的卡了：明细表只是在同样的内容上再念一遍，
+  // 而且点进去还是同一份会话。容器不展开这张表（续跑历史照旧保留）。
+  const container = (segment.containerOf || []).length > 0
+  const children = container ? [] : segment.children || []
   if (!earlier.length && children.length < 2) return ''
   const open = genOpen.has(lineage.lineageRoot)
   const label = earlier.length ? `前 ${earlier.length} 段已折叠 · 共 ${segments.length} 段` : `子代理明细 · ${children.length} 个`
