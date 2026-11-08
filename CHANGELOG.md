@@ -449,7 +449,7 @@ writer 会让人以为它能改文件，比不猜更糟。
 111 例测试（+1：`activityState` 解析；沿用 agent 测试断言它落进 live 状态）。mock 实
 测浅/深两版：等待卡琥珀环静止、运行卡绿环呼吸，两张并排不会抢彼此的注意力。
 
-**留给后端的两条（报告 P12 / P13，面板侧补不了）**：排队中的 workflow child 没有
+**留给后端的两条（面板侧补不了）**：排队中的 workflow child 没有
 `runId`、`status` 仍报 `running`，面板连卡片都建不出来；超出并发上限是直接拒绝
 （`Active async run capacity exhausted`），run 根本没启动，面板无从显示。
 
@@ -983,7 +983,7 @@ live 文件一个字节都没动。于是带回来的旧戳和算出来的一样
   回答」并在 tooltip 说明分不清——猜成「无响应」会让人去停一个正在思考的 run。
 - **计时换真值**：等待起点用控制事件自己的 `ts`，无响应用 status.json 的
   `lastActivityAt`，都不再依赖本地时钟（`attentionSince` 退居兜底）。status.json 顺带
-  补读 `hasDeadline`——**续跑 run 实测全都没有超时保护**（P18），等待/无响应的 tooltip
+  补读 `hasDeadline`——**续跑 run 实测全都没有超时保护**，等待/无响应的 tooltip
   会如实说「这次运行没有超时保护，不会自己结束」。
 - **提问看得见了**（P20）：子代理的提问不进会话流，但 `contact_supervisor` 的
   `tool_execution_start/end` 在事件流里按 toolCallId 配对——问题原文与回答（带耗时）
@@ -1088,7 +1088,7 @@ agent / sessionId / asyncDir…），卡片只能先按孤段建出来，标题�
 
 - 新增 `readLaunchDescriptor` / `resumeSourceOf`（lib/run-snapshot.mjs，mtime 缓存）：
   判据只有一条——描述符的 `sessionFile` 不是本 run 自己的路径。没有用「续跑没有
-  `deadlineAt`」（报告 P18 那个特征也对，但那是上游的 bug，哪天补上判据就静默失效；
+  `deadlineAt`」（续跑 run 没有 deadline 那个特征也对，但那是上游的 bug，哪天补上判据就静默失效；
   文件路径是结构事实）。
 - `asyncStarted` 之后改走 `adoptStarted()`：续跑**当场**接链并回原 run 取标题（复用
   `resolveRunTitle`），再写盘——第一次上屏就是最终形态，没有中间态可看。线索优先
