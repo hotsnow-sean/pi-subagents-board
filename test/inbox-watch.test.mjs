@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { buildInboxItem, ledgerKey, pruneLedger, seedLedger, selectNewCompletions } from '../lib/inbox-watch.mjs'
+import { buildInboxItem, ledgerKey, pruneLedgerAgainst, seedLedger, selectNewCompletions } from '../lib/inbox-watch.mjs'
+import { TERMINAL_STATES } from '../lib/lineage.mjs'
 
 const NOW = 1_700_000_000_000
 
@@ -19,7 +20,7 @@ test('selectNewCompletions: 只挑终态、跳过未知会话、跳过台账里�
     fileOf([seg('r1', 'complete', NOW), seg('r2', 'running', 0), seg('r3', 'failed', NOW)]),
     fileOf([seg('r4', 'complete', NOW)], 'unknown'),
   ]
-  const out = selectNewCompletions(files, { [ledgerKey('sess-a', 'r1')]: NOW })
+  const out = selectNewCompletions(files, { [ledgerKey('sess-a', 'r1')]: NOW }, TERMINAL_STATES)
   assert.deepEqual(
     out.map((entry) => entry.segment.runId),
     ['r3'],
@@ -28,7 +29,7 @@ test('selectNewCompletions: 只挑终态、跳过未知会话、跳过台账里�
 
 test('selectNewCompletions: 按结束时间升序（早的先通知）', () => {
   const files = [fileOf([seg('late', 'complete', NOW), seg('early', 'complete', NOW - 60_000)])]
-  const out = selectNewCompletions(files, {})
+  const out = selectNewCompletions(files, {}, TERMINAL_STATES)
   assert.deepEqual(
     out.map((entry) => entry.segment.runId),
     ['early', 'late'],
@@ -38,7 +39,7 @@ test('selectNewCompletions: 按结束时间升序（早的先通知）', () => {
 test('seedLedger: 只把「超过宽限期」的历史段记账，返回新增条数', () => {
   const segments = [seg('old', 'complete', NOW - 300_000), seg('fresh', 'complete', NOW - 5_000)]
   const ledger = {}
-  const added = seedLedger([fileOf(segments)], ledger, NOW)
+  const added = seedLedger([fileOf(segments)], ledger, NOW, TERMINAL_STATES)
   assert.equal(added, 1)
   assert.ok(ledger[ledgerKey('sess-a', 'old')])
   assert.equal(ledger[ledgerKey('sess-a', 'fresh')], undefined, '刚结束的留着发通知')
@@ -46,7 +47,7 @@ test('seedLedger: 只把「超过宽限期」的历史段记账，返回新增�
 
 test('seedLedger: 已在台账里的不重复记账', () => {
   const ledger = { [ledgerKey('sess-a', 'old')]: 1 }
-  const added = seedLedger([fileOf([seg('old', 'complete', NOW - 300_000)])], ledger, NOW)
+  const added = seedLedger([fileOf([seg('old', 'complete', NOW - 300_000)])], ledger, NOW, TERMINAL_STATES)
   assert.equal(added, 0)
 })
 
@@ -84,8 +85,23 @@ test('buildInboxItem: 失败/停止用 error/warn，摘要截断到 120 字', ()
   assert.equal(stopped.body, undefined)
 })
 
-test('pruneLedger: 清掉超过 7 天的，保留新的', () => {
-  const ledger = { old: NOW - 8 * 24 * 60 * 60 * 1000, recent: NOW - 1_000 }
-  assert.equal(pruneLedger(ledger, NOW), 1)
-  assert.deepEqual(Object.keys(ledger), ['recent'])
+test('selectNewCompletions: lost（进程已死、被判中断）也要通知', () => {
+  const files = [fileOf([seg('dead', 'lost', NOW)])]
+  const out = selectNewCompletions(files, {}, TERMINAL_STATES)
+  assert.deepEqual(
+    out.map((entry) => entry.segment.runId),
+    ['dead'],
+    '终态集合只有一份，少了 lost 就等于「子代理丢了却不告诉用户」',
+  )
+})
+
+test('pruneLedgerAgainst: 只删 live 里已经不存在的段，与通知时间无关', () => {
+  const ledger = {
+    [ledgerKey('sess-a', 'kept')]: NOW - 400 * 24 * 60 * 60 * 1000,
+    [ledgerKey('sess-a', 'gone')]: NOW - 1_000,
+    'sess-a|bad-stamp': NaN,
+  }
+  const removed = pruneLedgerAgainst(ledger, new Set([ledgerKey('sess-a', 'kept')]))
+  assert.equal(removed, 2)
+  assert.deepEqual(Object.keys(ledger), [ledgerKey('sess-a', 'kept')], '段还在就必须留着，否则会重复通知')
 })

@@ -99,7 +99,15 @@ export default function subagentsBoard(pi, ctx) {
 
   let sessionFile = ''
   let liveFile = ''
-  let disposed = false
+  /**
+   * 本实例是否已经作废（会话换代 / 重载）。
+   *
+   * **没有 dispose 钩子。** pi 的 `InlineExtension` 只有 `{ name, hidden, factory }`，
+   * factory 返回值也不带清理函数，所以这里曾经有个 `disposed` 标志——它声明为 false、
+   * 从没被置 true，却挂在十几处守卫里，只是让人误以为有条清理路径。删掉它：唯一的
+   * 死亡信号是「继续用 `pi` 会抛 stale」（见 markStale），在那之前定时器只能继续跑。
+   * 上游那句文案是判死的唯一依据，改文案就失效——这是个已知脆弱点，记在 TODO 里。
+   */
   let stale = false
   let seq = 0
   let statusFailures = 0
@@ -177,7 +185,6 @@ export default function subagentsBoard(pi, ctx) {
       clearTimeout(flushTimer)
       flushTimer = null
     }
-    if (disposed) return
     // 首帧还压在探测窗口里（见 holdFlushUntil）：孤卡不能上屏。
     // 这里而不是 flush() 拦，是因为 flush 只是排定时器；定时器到点时
     // 状态可能已经变了，判断得放在真正写盘这一刻。
@@ -209,7 +216,6 @@ export default function subagentsBoard(pi, ctx) {
 
   /** 节流：200ms 内的多次变更合成一次写 */
   function flush() {
-    if (disposed) return
     if (flushTimer) return
     flushTimer = setTimeout(flushNow, 200)
     if (typeof flushTimer.unref === 'function') flushTimer.unref()
@@ -366,7 +372,7 @@ export default function subagentsBoard(pi, ctx) {
    * @param {any} payload
    */
   function onEvent(key, _name, payload) {
-    if (stale || disposed) return
+    if (stale) return
     const at = Date.now()
     if (key === 'asyncStarted') {
       const started = applyStarted(state, payload, at)
@@ -535,7 +541,7 @@ export default function subagentsBoard(pi, ctx) {
     let timer = null
     const tick = () => {
       if (timer) taskProbes.delete(timer)
-      if (stale || disposed) return
+      if (stale) return
       const segment = findLocalSegment(runId)
       if (!segment) return
       // 已经有名字（status 抢先落盘，或这条其实接上了链）就别改它
@@ -591,7 +597,7 @@ export default function subagentsBoard(pi, ctx) {
    * @param {string} runId @param {string} asyncDir
    */
   function probeRevive(runId, asyncDir) {
-    if (stale || disposed) return
+    if (stale) return
     if (linkedRuns.has(runId)) {
       reviveProbes.delete(runId)
       releaseFlush()
@@ -821,7 +827,7 @@ export default function subagentsBoard(pi, ctx) {
 
   /** 读一次 status 并并进状态；连续失败会切到轮询模式 */
   async function readStatus(/** @type {string} */ why) {
-    if (stale || disposed) return null
+    if (stale) return null
     const reply = await request('status', {}, 8_000)
     if (reply.ok) {
       statusFailures = 0
@@ -847,7 +853,7 @@ export default function subagentsBoard(pi, ctx) {
   function restartHeartbeat(/** @type {number} */ intervalMs) {
     if (heartbeatTimer) clearInterval(heartbeatTimer)
     heartbeatTimer = setInterval(() => {
-      if (stale || disposed) {
+      if (stale) {
         stopTimers()
         return
       }
@@ -862,7 +868,7 @@ export default function subagentsBoard(pi, ctx) {
    * @param {string} why
    */
   async function handshake(why) {
-    if (stale || disposed) return
+    if (stale) return
     state.source.handshake.attempts = (Number(state.source.handshake.attempts) || 0) + 1
     const reply = await request('ping', {}, 4_000)
     if (reply.ok) {
@@ -892,7 +898,7 @@ export default function subagentsBoard(pi, ctx) {
     state.source.handshake.ping = false
     state.source.handshake.lastError = reply.error?.message ?? (reply.timedOut ? 'ping 无回复' : 'ping 失败')
     flush()
-    if (stale || disposed) return
+    if (stale) return
     const previous = Number(state.source.handshake.attempts) || 1
     const delay = RETRY_DELAYS[Math.min(previous - 1, RETRY_DELAYS.length - 1)]
     if (handshakeTimer) clearTimeout(handshakeTimer)
@@ -960,7 +966,7 @@ export default function subagentsBoard(pi, ctx) {
    * 也就不需要 rename 认领（认领是为了在共享目录里抢命令，这里根本没有共享）。
    */
   async function scanNotes() {
-    if (scanning || stale || disposed) return
+    if (scanning || stale) return
     const key = state.sessionKey
     if (!key || key === 'unknown') return
     scanning = true
@@ -1125,7 +1131,7 @@ export default function subagentsBoard(pi, ctx) {
   // 监听 + 主动 ping。错过 ready 时 ping 是唯一还活着的证据。
   try {
     pi.events.on('subagents:rpc:v1:ready', (/** @type {any} */ payload) => {
-      if (stale || disposed) return
+      if (stale) return
       state.source.handshake.ready = true
       state.source.handshake.at = Date.now()
       // 事件名公告在这里；先存着，handshake 成功后一起订阅

@@ -58,9 +58,10 @@ const {
   lastRunIdOf,
   groupStartedAt,
   relinkOrphans,
+  TERMINAL_STATES,
 } = await imp('lineage')
 const { describeDegrade } = await imp('degrade')
-const { buildInboxItem, pruneLedger, seedLedger, selectNewCompletions } = await imp('inbox-watch')
+const { buildInboxItem, pruneLedgerAgainst, seedLedger, selectNewCompletions } = await imp('inbox-watch')
 const { INBOX_DIR, NOTE_TTL_MS, RECEIPT_DIR, buildNote, pruneMail } = await imp('note-queue')
 const { readRunSnapshot, isProcessAlive, steeringEntry, describeSteerFailure } = await imp('run-snapshot')
 
@@ -995,9 +996,22 @@ function sweepInbox(ctx) {
   for (const key of listSessionKeys(ctx.dataDir)) files.push(...readLiveFiles(ctx.dataDir, key))
   if (!files.length) return
   const ledger = readLedger(ctx)
+  // 台账清理的基准：当前 live 里还剩哪些 run。段被 30 天保留期裁掉后条目自动消失，
+  // 不需要（也不该）按时间删——那会被同一轮的 seedLedger 抵消。
+  /** @type {Set<string>} */
+  const liveKeys = new Set()
+  for (const { state } of files) {
+    const sessionKey = state?.sessionKey
+    if (!sessionKey || sessionKey === 'unknown') continue
+    for (const lineage of state.lineages ?? []) {
+      for (const segment of lineage.segments ?? []) {
+        if (segment?.runId) liveKeys.add(`${sessionKey}|${segment.runId}`)
+      }
+    }
+  }
   // 启动/热重载时把「早就结束」的段记进台账，不发通知：否则每次重启都会把历史重播一遍
-  const seeded = seedLedger(files, ledger, Date.now())
-  const pending = selectNewCompletions(files, ledger)
+  const seeded = seedLedger(files, ledger, Date.now(), TERMINAL_STATES)
+  const pending = selectNewCompletions(files, ledger, TERMINAL_STATES)
   for (const entry of pending) {
     try {
       inbox(buildInboxItem(entry, ctx.pluginId, PANEL_ID))
@@ -1006,7 +1020,7 @@ function sweepInbox(ctx) {
       ctx.log('inbox push failed:', error instanceof Error ? error.message : error)
     }
   }
-  const pruned = pruneLedger(ledger, Date.now())
+  const pruned = pruneLedgerAgainst(ledger, liveKeys)
   if (pending.length || seeded || pruned) writeLedger(ctx, ledger)
 }
 

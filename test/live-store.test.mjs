@@ -279,3 +279,43 @@ test('livenessOf: 30s 内有心跳算活，超时算陈旧', () => {
   assert.equal(livenessOf({}, now).alive, false)
   assert.equal(livenessOf({}, now).ageMs, null)
 })
+
+test('读侧版本校验：不认的 schema 跳过，缺省（老文件）仍读', () => {
+  const dir = tmpDir()
+  const key = 'k1'
+  const sessionDir = sessionDirOf(dir, key)
+  fs.mkdirSync(sessionDir, { recursive: true })
+
+  fs.writeFileSync(path.join(sessionDir, '100-1.json'), JSON.stringify({ ...stateOf(key, 1, 'from-future'), schema: 99 }))
+  // schema: undefined 会被 JSON.stringify 丢掉 —— 正好等于「0.9 之前写的文件」
+  fs.writeFileSync(path.join(sessionDir, '101-2.json'), JSON.stringify({ ...stateOf(key, 2, 'legacy'), schema: undefined }))
+  fs.writeFileSync(path.join(sessionDir, '102-3.json'), JSON.stringify(stateOf(key, 3, 'current')))
+
+  const runIds = readLiveFiles(dir, key)
+    .map((item) => item.state.lineages[0].segments[0].runId)
+    .sort()
+  assert.deepEqual(runIds, ['current', 'legacy'], '未来版本跳过，没有版本号的照读')
+})
+
+test('archiveSessions / pruneLiveFiles: 不认版本的归档原样保留，分区也搬不走', () => {
+  const dir = tmpDir()
+  const key = 'k1'
+  ensureLiveDir(dir)
+  const archiveFile = archiveFileOf(dir, key)
+  writeJsonAtomic(archiveFile, { version: 99, sessionKey: key, lineages: [{ segments: [{ runId: 'future' }] }] })
+  const partition = liveFileOf(dir, { sessionKey: key, pid: 424242, startedAt: 1 })
+  writeJsonAtomic(partition, { ...stateOf(key, 1, 'r1'), schema: 99 })
+
+  const archived = archiveSessions(dir, { now: Date.now() + ARCHIVE_IDLE_MS + 60_000 })
+  assert.equal(archived.archived, 0, '归档认不得就不该装订')
+  assert.equal(JSON.parse(fs.readFileSync(archiveFile, 'utf8')).version, 99, '新版归档必须一个字都不动')
+  assert.ok(fs.existsSync(partition), '分区也不该被搬走')
+
+  // 再把两者都做成「超期」，确认清理路径同样不碰
+  const old = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000)
+  fs.utimesSync(archiveFile, old, old)
+  fs.utimesSync(partition, old, old)
+  pruneLiveFiles(dir, Date.now())
+  assert.ok(fs.existsSync(archiveFile), '超期但版本不认的归档留着')
+  assert.ok(fs.existsSync(partition), '超期但版本不认的分区留着')
+})
