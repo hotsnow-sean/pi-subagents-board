@@ -183,7 +183,7 @@ test('agent: started 阶段就推导子会话路径，complete 前对话流可�
     asyncDir: 'C:/tmp/async-r',
     sessionId: 'C:/sessions/parent.jsonl',
   })
-  await sleep(600)
+  await sleep(1_200) // 首帧压在探测窗口里：asyncDir 不存在要等 8 次重试放弃（≈0.96s）
   const state = readState(dataDir)
   const segment = state.lineages[0].segments[0]
   assert.equal(segment.state, 'running')
@@ -330,7 +330,14 @@ test('agent: 运行中从 run 的 status.json 补标题与 steering 计数（RPC
       runId: 'run-t',
       state: 'running',
       steering: { requested: 1, pending: 1, delivered: 0, failed: 0, recent: [{ id: 'rq', targets: [{ index: 0, state: 'pending' }] }] },
-      steps: [{ agent: 'delegate', sessionName: 'delegate: 【实时标题探测】工作目录: C:/w', status: 'running' }],
+      steps: [
+        {
+          agent: 'delegate',
+          sessionName: 'delegate: 【实时标题探测】工作目录: C:/w',
+          status: 'running',
+          activityState: 'needs_attention',
+        },
+      ],
     }),
   )
   harness.emit('subagent:async-started', {
@@ -347,6 +354,8 @@ test('agent: 运行中从 run 的 status.json 补标题与 steering 计数（RPC
   assert.equal(segment.sessionName, 'delegate: 【实时标题探测】工作目录: C:/w')
   assert.equal(segment.steering?.requested, 1, '插话计数也要落进 live 状态，卡片才有数')
   assert.equal(segment.steering?.pending, 1)
+  // 报告 P10：state 还是 running，但它在等人回答——面板靠这一项才画得出「等待回答」
+  assert.equal(segment.activityState, 'needs_attention')
 })
 
 test('agent: resume 段的标题回原 run 取，且带上「续」的标记（报告 P1″ 结论 2）', async () => {
@@ -385,6 +394,153 @@ test('agent: resume 段的标题回原 run 取，且带上「续」的标记（�
   assert.equal(segmentOf()?.revivedFrom, originId, '续跑来源要留在段上，卡片拿来标「续」')
 })
 
+test('agent: async-started 不带 revivedFrom 时，靠 run 目录的 status.json 当场接回原链（0.9.9）', async () => {
+  const { dataDir, harness } = await boot()
+  await sleep(400)
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'board-runs-'))
+  const originId = 'origin-3'
+  const resumeId = 'resume-3'
+  const shared = path.join(root, 'shared-session.jsonl')
+  fs.writeFileSync(shared, '{}')
+  fs.mkdirSync(path.join(root, originId))
+  fs.writeFileSync(
+    path.join(root, originId, 'status.json'),
+    JSON.stringify({ runId: originId, state: 'complete', steps: [{ agent: 'delegate', sessionFile: shared }] }),
+  )
+  fs.mkdirSync(path.join(root, resumeId))
+  // 实测形状：run 一启动，status.json 里就有 revivedFrom 与共享的 sessionFile
+  fs.writeFileSync(
+    path.join(root, resumeId, 'status.json'),
+    JSON.stringify({ runId: resumeId, state: 'running', revivedFrom: originId, steps: [{ agent: 'delegate', sessionFile: shared }] }),
+  )
+
+  harness.emit('subagent:async-started', {
+    id: originId,
+    agent: 'delegate',
+    cwd: 'C:/w',
+    asyncDir: path.join(root, originId),
+    sessionId: 'C:/sessions/parent.jsonl',
+  })
+  assert.equal(await waitFor(() => (readState(dataDir)?.lineages?.length ?? 0) === 1), true)
+
+  // 关键：这个事件里**没有** revivedFrom（上游 emit 的字段清单里没有它）
+  harness.emit('subagent:async-started', {
+    id: resumeId,
+    agent: 'delegate',
+    cwd: 'C:/w',
+    asyncDir: path.join(root, resumeId),
+    sessionId: 'C:/sessions/parent.jsonl',
+  })
+
+  const merged = () => {
+    const state = readState(dataDir)
+    const lineages = state?.lineages ?? []
+    return lineages.length === 1 && (lineages[0].segments ?? []).length === 2
+  }
+  assert.equal(await waitFor(merged), true, '应在秒级内并成一条链，而不是等 async-complete')
+  const state = readState(dataDir)
+  const segment = state.lineages[0].segments[1]
+  assert.equal(segment.revivedFrom, originId)
+  assert.equal(segment.reviveHops, 1)
+  assert.equal(segment.childSessionFile, shared, '真实会话文件要以 status.json 为准，不能用按新 runId 猜的那条')
+})
+
+test('agent: resume 的那段从不上屏成孤卡（首帧压到接链之后）', async () => {
+  const { dataDir, harness } = await boot()
+  await sleep(400)
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'board-runs-'))
+  const originId = 'origin-4'
+  const resumeId = 'resume-4'
+  const shared = path.join(root, 'shared-session.jsonl')
+  fs.writeFileSync(shared, '{}')
+  fs.mkdirSync(path.join(root, originId))
+  fs.writeFileSync(
+    path.join(root, originId, 'status.json'),
+    JSON.stringify({ runId: originId, mode: 'single', state: 'complete', steps: [{ agent: 'delegate', sessionFile: shared }] }),
+  )
+  fs.mkdirSync(path.join(root, resumeId))
+  // status.json 要等子进程初始化完才落盘——**这段延迟正是孤卡窗口的成因**。
+  // 预写好的话探测第一个 tick 就命中，测不出「先上屏再变标题」。
+  const writeResumeStatus = () =>
+    fs.writeFileSync(
+      path.join(root, resumeId, 'status.json'),
+      JSON.stringify({ runId: resumeId, mode: 'single', state: 'running', revivedFrom: originId, steps: [{ agent: 'delegate', sessionFile: shared }] }),
+    )
+
+  harness.emit('subagent:async-started', {
+    id: originId,
+    agent: 'delegate',
+    cwd: 'C:/w',
+    asyncDir: path.join(root, originId),
+    sessionId: 'C:/sessions/parent.jsonl',
+  })
+  assert.equal(await waitFor(() => (readState(dataDir)?.lineages?.length ?? 0) === 1), true)
+
+  harness.emit('subagent:async-started', {
+    id: resumeId,
+    agent: 'delegate',
+    cwd: 'C:/w',
+    asyncDir: path.join(root, resumeId),
+    sessionId: 'C:/sessions/parent.jsonl',
+  })
+
+  // 采样整个接链窗口：任何一份落盘的 live 文件里都不该出现「只有 resume 段」的链。
+  // 出现就说明它先以孤卡上屏了——标题会先变成 `delegate · resume-4` 再变回去。
+  let orphanAt = null
+  const startedAt = Date.now()
+  let wroteStatus = false
+  for (let i = 0; i < 60; i += 1) {
+    if (!wroteStatus && Date.now() - startedAt > 700) {
+      writeResumeStatus()
+      wroteStatus = true
+    }
+    for (const lineage of readState(dataDir)?.lineages ?? []) {
+      const segments = lineage.segments ?? []
+      if (segments.some((segment) => segment.runId === resumeId) && segments.length === 1) orphanAt = i
+    }
+    await sleep(30)
+  }
+  assert.equal(orphanAt, null, `resume 段必须先接回原链再上屏（在第 ${orphanAt} 次采样看到了孤链）`)
+  const segments = readState(dataDir)?.lineages?.[0]?.segments ?? []
+  assert.deepEqual(
+    segments.map((segment) => segment.runId),
+    [originId, resumeId],
+  )
+})
+
+test('agent: 普通 run 第一次上屏就带真标题（不等下一次 heartbeat）', async () => {
+  const { dataDir, harness } = await boot()
+  await sleep(400)
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'board-runs-'))
+  const runId = 'plain-1'
+  fs.mkdirSync(path.join(root, runId))
+  fs.writeFileSync(
+    path.join(root, runId, 'status.json'),
+    JSON.stringify({
+      runId,
+      mode: 'single',
+      state: 'running',
+      steps: [{ agent: 'delegate', sessionName: '把测试报告整理成 markdown' }],
+    }),
+  )
+  harness.emit('subagent:async-started', {
+    id: runId,
+    agent: 'delegate',
+    cwd: 'C:/w',
+    asyncDir: path.join(root, runId),
+    sessionId: 'C:/sessions/parent.jsonl',
+  })
+  // 关键：第一份写出来的 live 文件里 sessionName 就该在。以前要等下一次 status
+  // 轮询（1s 心跳），中间那段时间卡片标题是 `delegate · plain-1`。
+  assert.equal(
+    await waitFor(() => {
+      const segment = readState(dataDir)?.lineages?.[0]?.segments?.[0]
+      return String(segment?.sessionName ?? '').includes('整理成 markdown')
+    }),
+    true,
+  )
+})
+
 test('agent: 没有 pi.events 时立刻落一份说明原因的状态', async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-agent-'))
   const { default: factory } = await import(entry)
@@ -398,4 +554,289 @@ test('agent: 没有 pi.events 时立刻落一份说明原因的状态', async ()
   assert.ok(state)
   assert.equal(state.source.rpc, false)
   assert.match(state.source.lastError, /pi\.events/)
+})
+
+test('agent: needs_attention 的 reason 从事件流读出来——等人回答 vs 无响应（报告 P19/P20）', async () => {
+  const { dataDir, harness } = await boot()
+  await sleep(400)
+
+  const idleDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-idle-'))
+  fs.writeFileSync(
+    path.join(idleDir, 'status.json'),
+    JSON.stringify({
+      runId: 'run-idle',
+      state: 'running',
+      // 续跑 run 实测没有这两个字段：挂死就不会自愈
+      lastActivityAt: 1794120000000,
+      steps: [{ agent: 'delegate', status: 'running', activityState: 'needs_attention', sessionName: 'delegate: 卡住的那个' }],
+    }),
+  )
+  fs.writeFileSync(
+    path.join(idleDir, 'events.jsonl'),
+    `${JSON.stringify({
+      type: 'subagent.control',
+      event: { type: 'needs_attention', ts: 1794120055464, message: 'no observed activity for 60s', reason: 'idle', elapsedMs: 60236 },
+    })}\n`,
+  )
+
+  const askDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-ask-'))
+  fs.writeFileSync(
+    path.join(askDir, 'status.json'),
+    JSON.stringify({
+      runId: 'run-ask',
+      state: 'running',
+      lastActivityAt: 1794120100000,
+      steps: [{ agent: 'delegate', status: 'running', activityState: 'needs_attention', sessionName: 'delegate: 提问的那个' }],
+    }),
+  )
+  fs.writeFileSync(
+    path.join(askDir, 'events.jsonl'),
+    [
+      JSON.stringify({
+        type: 'tool_execution_start',
+        toolCallId: 'c1',
+        toolName: 'contact_supervisor',
+        args: { reason: 'need_decision', message: '请选择 A 还是 B' },
+        observedAt: 1794120100500,
+      }),
+      JSON.stringify({
+        type: 'subagent.control',
+        event: { type: 'needs_attention', reason: 'supervisor_request', ts: 1794120100600, currentTool: 'contact_supervisor' },
+      }),
+      JSON.stringify({
+        type: 'tool_execution_end',
+        toolCallId: 'c1',
+        toolName: 'contact_supervisor',
+        result: { content: [{ type: 'text', text: '**Reply from supervisor:**\nA' }] },
+        durationMs: 42_000,
+        observedAt: 1794120142000,
+      }),
+    ].join('\n'),
+  )
+
+  harness.emit('subagent:async-started', {
+    id: 'run-idle',
+    agent: 'delegate',
+    cwd: 'C:/w',
+    asyncDir: idleDir,
+    sessionId: 'C:/sessions/parent.jsonl',
+  })
+  harness.emit('subagent:async-started', {
+    id: 'run-ask',
+    agent: 'delegate',
+    cwd: 'C:/w',
+    asyncDir: askDir,
+    sessionId: 'C:/sessions/parent.jsonl',
+  })
+
+  const segmentOf = (runId) => {
+    for (const lineage of readState(dataDir)?.lineages ?? []) {
+      for (const segment of lineage.segments ?? []) if (segment.runId === runId) return segment
+    }
+    return null
+  }
+
+  assert.equal(await waitFor(() => segmentOf('run-idle')?.attentionReason === 'idle'), true, 'idle 才是「无响应」')
+  assert.equal(await waitFor(() => segmentOf('run-ask')?.attentionReason === 'supervisor_request'), true, '等人回答是另一回事')
+
+  const idle = segmentOf('run-idle')
+  assert.equal(idle.attentionSince, 1794120055464, '等待起点用控制事件的 ts，不用我们自己的时钟')
+  assert.equal(idle.hasDeadline, false, '续跑 run 没有超时保护，卡面要能说出来')
+  assert.equal(idle.lastActivityAt, 1794120000000, '无活动时长用磁盘上的真实时刻')
+  assert.equal(idle.attentionAsk ?? null, null, 'idle 没有提问可显示')
+
+  const ask = segmentOf('run-ask')
+  assert.equal(ask.attentionAsk?.question, '请选择 A 还是 B')
+  assert.equal(ask.attentionAsk?.answer, 'A')
+  assert.equal(ask.attentionAsk?.durationMs, 42_000)
+})
+
+test('agent: 描述符比 status.json 早——resume 段不等子进程落盘就并回原链（0.10.4）', async () => {
+  const { dataDir, harness } = await boot()
+  await sleep(400)
+  // 实测形状：<root>/async-subagent-runs/<runId>，launches 是同级目录
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'board-launch-'))
+  const runsRoot = path.join(root, 'async-subagent-runs')
+  const launchesRoot = path.join(root, 'async-subagent-launches')
+  const originId = '6dec8284-4058-456c-ae66-df2da5922efa'
+  const resumeId = 'bc779a16-fed5-4afc-9530-526077153ec9'
+  const shared = path.join(root, 'sessions', originId, 'run-0', 'session.jsonl')
+  fs.mkdirSync(path.dirname(shared), { recursive: true })
+  fs.writeFileSync(shared, '{}')
+  fs.mkdirSync(path.join(launchesRoot, resumeId), { recursive: true })
+  fs.mkdirSync(path.join(runsRoot, originId), { recursive: true })
+  fs.mkdirSync(path.join(runsRoot, resumeId), { recursive: true })
+
+  // 原 run 的 status.json 早就在了：真标题在这里
+  fs.writeFileSync(
+    path.join(runsRoot, originId, 'status.json'),
+    JSON.stringify({
+      runId: originId,
+      mode: 'single',
+      state: 'complete',
+      steps: [{ agent: 'delegate', sessionName: 'delegate: 【单链测试】工作目录: C:/w' }],
+    }),
+  )
+  // 续跑的描述符在 spawn 前就写好了，直接指向来源的会话文件
+  fs.writeFileSync(
+    path.join(launchesRoot, resumeId, 'recovery-descriptor.json'),
+    JSON.stringify({ sourceRunId: resumeId, agent: 'delegate', sessionFile: shared }),
+  )
+  // **关键**：续跑自己的 status.json 一直不写（模拟子进程冷启动比探测窗口更久）。
+  // 0.10.1~0.10.3 在这种情况下只能写出一张「角色 · id」的孤卡，几百毫秒后才接上。
+
+  harness.emit('subagent:async-started', {
+    id: originId,
+    agent: 'delegate',
+    cwd: 'C:/w',
+    asyncDir: path.join(runsRoot, originId),
+    sessionId: 'C:/sessions/parent.jsonl',
+  })
+  assert.equal(await waitFor(() => (readState(dataDir)?.lineages?.length ?? 0) === 1), true)
+
+  harness.emit('subagent:async-started', {
+    id: resumeId,
+    agent: 'delegate',
+    cwd: 'C:/w',
+    asyncDir: path.join(runsRoot, resumeId),
+    sessionId: 'C:/sessions/parent.jsonl',
+  })
+
+  // 全程采样：任何一份落盘状态里都不该出现只含 resume 段的链
+  let orphanAt = null
+  for (let i = 0; i < 40; i += 1) {
+    for (const lineage of readState(dataDir)?.lineages ?? []) {
+      const segments = lineage.segments ?? []
+      if (segments.some((segment) => segment.runId === resumeId) && segments.length === 1) orphanAt = i
+    }
+    await sleep(30)
+  }
+  assert.equal(orphanAt, null, `不该先上孤卡（第 ${orphanAt} 次采样看到了）`)
+
+  const segments = readState(dataDir)?.lineages?.[0]?.segments ?? []
+  assert.deepEqual(
+    segments.map((segment) => segment.runId),
+    [originId, resumeId],
+  )
+  const resume = segments[1]
+  assert.equal(resume.revivedFrom, originId)
+  assert.equal(resume.reviveHops, 1)
+  assert.equal(resume.childSessionFile, shared, '会话文件用描述符里那份，不是按新 runId 猜的')
+  assert.match(String(resume.sessionName), /单链测试/, '标题回原 run 取，不等自己的 status.json')
+})
+
+test('agent: 普通 run 立刻上屏，任务名从 events.jsonl 补——不等 23 秒的 status.json（0.10.5）', async () => {
+  const { dataDir, harness } = await boot()
+  await sleep(400)
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'board-task-'))
+  const runsRoot = path.join(root, 'async-subagent-runs')
+  const launchesRoot = path.join(root, 'async-subagent-launches')
+  const runId = 'cfdcee75-cefb-4a11-97a5-0f2aa4241801'
+  const runDir = path.join(runsRoot, runId)
+  fs.mkdirSync(runDir, { recursive: true })
+  fs.mkdirSync(path.join(launchesRoot, runId), { recursive: true })
+  // 描述符指向自己的会话文件 = 普通 run。它在 spawn 前就写好了（实测比 run.started 早 3s）
+  fs.writeFileSync(
+    path.join(launchesRoot, runId, 'recovery-descriptor.json'),
+    JSON.stringify({
+      sourceRunId: runId,
+      agent: 'delegate',
+      sessionFile: path.join(root, 'sessions', runId, 'run-0', 'session.jsonl'),
+    }),
+  )
+  // 关键：status.json 全程不落盘（实测它要 23 秒才出现），事件流 1~2 秒就有任务原文
+  fs.writeFileSync(path.join(runDir, 'events.jsonl'), `${JSON.stringify({ type: 'subagent.run.started', runId })}\n`)
+
+  const at = Date.now()
+  harness.emit('subagent:async-started', {
+    id: runId,
+    agent: 'delegate',
+    cwd: 'C:/w',
+    asyncDir: runDir,
+    sessionId: 'C:/sessions/parent.jsonl',
+  })
+
+  // 首帧：不再压 1.2s 的探测窗口——写盘节流 200ms，最迟几百毫秒就该看见卡
+  let appearedAt = 0
+  for (let i = 0; i < 20; i += 1) {
+    if ((readState(dataDir)?.lineages?.length ?? 0) > 0) {
+      appearedAt = Date.now() - at
+      break
+    }
+    await sleep(50)
+  }
+  assert.ok(appearedAt > 0, '卡片必须出现（不能「点了没反应」）')
+  assert.ok(appearedAt < 900, `普通 run 不该再压首帧（实测 ${appearedAt}ms 才出现，旧逻辑要等 1.2s）`)
+  assert.ok(
+    !readState(dataDir)?.lineages?.[0]?.segments?.[0]?.sessionName,
+    '首帧确实还没有名字——由 UI 显示「启动中」，不再摆假名字',
+  )
+
+  // 1 秒后 runner 把第一条 user 消息写进事件流
+  fs.appendFileSync(
+    path.join(runDir, 'events.jsonl'),
+    `${JSON.stringify({
+      type: 'message_start',
+      message: { role: 'user', content: [{ type: 'text', text: 'Task: 【单链测试】工作目录: C:/w' }] },
+    })}\n`,
+  )
+  assert.equal(
+    await waitFor(() => Boolean(readState(dataDir)?.lineages?.[0]?.segments?.[0]?.sessionName)),
+    true,
+    '任务名该从事件流补上，不用等 status.json',
+  )
+  assert.equal(readState(dataDir)?.lineages?.[0]?.segments?.[0]?.sessionName, '【单链测试】工作目录: C:/w')
+  assert.equal(fs.existsSync(path.join(runDir, 'status.json')), false, '整条链路都不该依赖 status.json')
+
+  // 23 秒后 status.json 终于落盘：它给的是压缩版（首行 + 「步骤：…」压成一行）。
+  // 不能把事件流那句更干净的标题顶掉——否则用户会看到标题「又变了一次」。
+  fs.writeFileSync(
+    path.join(runDir, 'status.json'),
+    JSON.stringify({
+      runId,
+      state: 'running',
+      steps: [{ agent: 'delegate', sessionName: 'delegate: 这是一次子代理功能测试 步骤： 1. 用 bash…' }],
+    }),
+  )
+  harness.emit('subagent:jobs-changed', {})
+  await sleep(1_600)
+  assert.equal(
+    readState(dataDir)?.lineages?.[0]?.segments?.[0]?.sessionName,
+    '【单链测试】工作目录: C:/w',
+    'titleFromTask 一旦立住，status 的压缩版不该覆盖它',
+  )
+})
+
+test('agent: 普通 run 的 events.jsonl 里拿不到任务名时，卡片照旧出现（只是标题留在「启动中」）', async () => {
+  const { dataDir, harness } = await boot()
+  await sleep(400)
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'board-task-'))
+  const runsRoot = path.join(root, 'async-subagent-runs')
+  const launchesRoot = path.join(root, 'async-subagent-launches')
+  const runId = '70163ad0-c082-48e6-9532-9f9134e89d9f'
+  const runDir = path.join(runsRoot, runId)
+  fs.mkdirSync(runDir, { recursive: true })
+  fs.mkdirSync(path.join(launchesRoot, runId), { recursive: true })
+  fs.writeFileSync(
+    path.join(launchesRoot, runId, 'recovery-descriptor.json'),
+    JSON.stringify({ sessionFile: path.join(root, 'sessions', runId, 'run-0', 'session.jsonl') }),
+  )
+  // 只有 system 消息：上游哪天改了事件形状，也不该让卡片消失
+  fs.writeFileSync(
+    path.join(runDir, 'events.jsonl'),
+    `${JSON.stringify({ type: 'message_start', message: { role: 'system', content: 'S' } })}\n`,
+  )
+
+  harness.emit('subagent:async-started', {
+    id: runId,
+    agent: 'delegate',
+    cwd: 'C:/w',
+    asyncDir: runDir,
+    sessionId: 'C:/sessions/parent.jsonl',
+  })
+  assert.equal(await waitFor(() => (readState(dataDir)?.lineages?.length ?? 0) === 1), true)
+  await sleep(600)
+  const segment = readState(dataDir)?.lineages?.[0]?.segments?.[0]
+  assert.equal(segment?.state, 'running')
+  assert.ok(!segment?.sessionName, '没有名字就不写，让 UI 用「启动中」兜底')
 })

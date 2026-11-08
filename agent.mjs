@@ -25,10 +25,21 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
-import { applyComplete, applyStarted, createState, isActiveState, mergeStatus } from './lib/lineage.mjs'
+import { applyComplete, applyStarted, createState, isActiveState, linkRevived, mergeStatus } from './lib/lineage.mjs'
 import { INBOX_DIR, RECEIPT_DIR, isFresh, parseNoteFileName } from './lib/note-queue.mjs'
 import { ensureLiveDir, liveFileOf, writeJsonAtomic } from './lib/live-store.mjs'
-import { describeSteerFailure, isReviveNoise, readRunSnapshot, resolveRunTitle, stepLabel } from './lib/run-snapshot.mjs'
+import {
+  describeSteerFailure,
+  isReviveNoise,
+  launchKindOf,
+  pendingStepsOf,
+  readRunEvents,
+  readRunSnapshot,
+  readRunTaskText,
+  resolveRunTitle,
+  resumeSourceOf,
+  stepLabel,
+} from './lib/run-snapshot.mjs'
 import { childSessionFile, sessionKeyOf } from './lib/session-key.mjs'
 
 const RPC_VERSION = 1
@@ -41,6 +52,33 @@ const HEARTBEAT_POLL_MS = 2_000
 /** 握手重试间隔表：先密后疏，封顶 20s。pi-subagents 没装时会一直重试 */
 const RETRY_DELAYS = [2_000, 5_000, 10_000, 20_000]
 const MAX_STATUS_FAILURES = 3
+/**
+ * 「需要关注」的那一档（报告 P10/P19）。`status` 在「跑着」和「卡在等人 / 卡住」时
+ * 都是 `running`，只有这一项会变成 `needs_attention`。
+ */
+const WAITING_ACTIVITY = 'needs_attention'
+/**
+ * 首帧探测的节奏。
+ *
+ * `async-started` 到达时 runner 才刚 spawn，`status.json` 要等子进程冷启动完才落盘
+ * （实测 run.started 到 agent_start 隔了 1.5s）。读到就补齐标题、接上链；读不到就每
+ * 120ms 再试，10 次约 1.2s 后放弃——此时照常上屏（名字回落到 `角色 · id`），绝不
+ * 「点了没反应」。
+ *
+ * 续跑**不走这条路**：launch 描述符在 spawn 时就写好了，当场就能接链（见 adoptStarted）。
+ * 这个窗口只服务「普通 run 等标题」和「描述符缺失时的兜底」。
+ */
+const REVIVE_PROBE_MS = 120
+const REVIVE_PROBE_TRIES = 10
+/**
+ * 普通 run 的任务名：从 `events.jsonl` 的第一条 user 消息取。
+ *
+ * 实测这段文字在 run 开始后 1~2 秒就可读，而 `status.json` 要 23 秒——卡片已经上屏了，
+ * 名字却在二十秒后才到，中间那段只能显示「启动中」。150ms × 20 ≈ 3 秒够覆盖冷启动，
+ * 拿不到就交给 status 正常补齐（不重试、不占 IO）。
+ */
+const TASK_TEXT_MS = 150
+const TASK_TEXT_TRIES = 20
 /** 留言扫描间隔：面板不再等回执，500ms 只是「点完就投」的手感 */
 const NOTE_POLL_MS = 500
 /** stop 的 RPC 超时：扩展要中断子进程并收敛状态 */
@@ -74,6 +112,30 @@ export default function subagentsBoard(pi, ctx) {
   const subscribed = new Set()
 
   let flushTimer = /** @type {any} */ (null)
+  /**
+   * 续跑接链的探测定时器：runId → { tries, timer }。
+   * 只用于 resume 起点那几百毫秒，接上（或放弃）就从表里删掉。
+   */
+  const reviveProbes = new Map()
+  /** 已经认回来源段的 runId。幂等保护，避免每轮 status 都重算一遍 */
+  const linkedRuns = new Set()
+  /**
+   * 普通 run 的「补标题」定时器集合。每个 run 最多一个，拿到任务原文（或试满）就退场；
+   * 实例换代时由 stopTimers 一次性清掉。
+   */
+  const taskProbes = new Set()
+  /**
+   * 首帧延迟上屏：**只在没法判断这是不是续跑时**使用（描述符缺失，见 adoptStarted）。
+   *
+   * 早先它被用来「等普通 run 的标题」——那是时序赌博：`status.json` 实测要 23 秒才落盘，
+   * 而压制窗口只有 1.2 秒，窗口先到点就写出一张 `delegate · abc12345` 的卡。
+   * 现在普通 run 一律立刻上屏（标题显示「启动中」），任务名另走 events.jsonl 补齐；
+   * 留着这条路径只为「老版本 pi-subagents 没有描述符、又可能正在续跑」的保守兜底。
+   *
+   * 上限就是探测窗口本身；探测有结论立刻释放，不能无限期压着——那就成了「点了没反应」。
+   */
+  let holdFlushUntil = 0
+  let holdTimer = /** @type {any} */ (null)
 
   // ---------- 落盘 ----------
 
@@ -84,6 +146,10 @@ export default function subagentsBoard(pi, ctx) {
       flushTimer = null
     }
     if (disposed) return
+    // 首帧还压在探测窗口里（见 holdFlushUntil）：孤卡不能上屏。
+    // 这里而不是 flush() 拦，是因为 flush 只是排定时器；定时器到点时
+    // 状态可能已经变了，判断得放在真正写盘这一刻。
+    if (Date.now() < holdFlushUntil) return
     state.updatedAt = Date.now()
     try {
       ensureLiveDir(ctx.dataDir)
@@ -114,10 +180,44 @@ export default function subagentsBoard(pi, ctx) {
     if (typeof flushTimer.unref === 'function') flushTimer.unref()
   }
 
+  /**
+   * 压住上屏，最多 `ms` 毫秒。已有更晚的截止时间就不缩短。
+   * @param {number} ms
+   */
+  function holdFlush(ms) {
+    const until = Date.now() + ms
+    if (until <= holdFlushUntil) return
+    holdFlushUntil = until
+    if (holdTimer) clearTimeout(holdTimer)
+    holdTimer = setTimeout(() => {
+      holdTimer = null
+      holdFlushUntil = 0
+      // 兜底：探测因为任何原因没给结论（比如 status.json 一直不落盘），
+      // 卡片也必须出现——宁可名字回落到 `角色 · id`，不能「点了没反应」。
+      flushNow()
+    }, ms)
+    if (typeof holdTimer.unref === 'function') holdTimer.unref()
+  }
+
+  /**
+   * 探测有结论了：立刻把这一次完整状态写出去（数据已经补齐，不用再等 200ms 节流）。
+   * @returns {boolean} 这次是否真的解除了压制
+   */
+  function releaseFlush() {
+    if (!holdTimer && !holdFlushUntil) return false
+    holdFlushUntil = 0
+    if (holdTimer) {
+      clearTimeout(holdTimer)
+      holdTimer = null
+    }
+    flushNow()
+    return true
+  }
+
   // ---------- 实例生命周期 ----------
 
   function stopTimers() {
-    for (const timer of [handshakeTimer, dirtyTimer, heartbeatTimer, flushTimer]) {
+    for (const timer of [handshakeTimer, dirtyTimer, heartbeatTimer, flushTimer, holdTimer]) {
       if (!timer) continue
       clearTimeout(timer)
       clearInterval(timer)
@@ -126,6 +226,14 @@ export default function subagentsBoard(pi, ctx) {
     dirtyTimer = null
     heartbeatTimer = null
     flushTimer = null
+    holdTimer = null
+    holdFlushUntil = 0
+    for (const entry of reviveProbes.values()) {
+      if (entry?.timer) clearTimeout(entry.timer)
+    }
+    reviveProbes.clear()
+    for (const timer of taskProbes) clearTimeout(timer)
+    taskProbes.clear()
     stopNotes()
   }
 
@@ -236,13 +344,18 @@ export default function subagentsBoard(pi, ctx) {
         started.segment.childSessionFile = childSessionFile(sessionFile, runId, 0)
       }
       markDirty()
-      flush()
+      // 载荷里没有 revivedFrom / sessionName，但**launch 描述符**里有线索（见
+      // lib/run-snapshot.mjs 的 resumeSourceOf）：resume 的那一份直接指向来源会话文件。
+      // 所以这里不再「先压住、等 status.json」，而是当场判定、当场接链。
+      if (runId) adoptStarted(started?.segment ?? null, runId, String(payload?.asyncDir ?? ''))
+      else flush()
       return
     }
     if (key === 'asyncComplete') {
       applyComplete(state, { ...payload, childParentSession: readChildParentSession(payload?.sessionFile) }, at)
       markDirty()
-      flush()
+      // 结束事件自带真标题与终态，不用再等探测窗口
+      if (!releaseFlush()) flush()
       return
     }
     // jobsChanged / childStatus / processTerminal 等：只说明「变了」，具体内容靠 status
@@ -259,6 +372,293 @@ export default function subagentsBoard(pi, ctx) {
       void readStatus('dirty')
     }, DIRTY_MERGE_MS)
     if (typeof dirtyTimer.unref === 'function') dirtyTimer.unref()
+  }
+
+  /**
+   * 在 live 状态里找一段（不回内存外的东西，纯查表）。
+   * @param {string} runId
+   */
+  function findLocalSegment(runId) {
+    for (const lineage of state.lineages ?? []) {
+      for (const segment of lineage.segments ?? []) {
+        if (String(segment.runId) === String(runId)) return segment
+      }
+    }
+    return null
+  }
+
+  /**
+   * 用 run 自己的 `status.json` 把这一段认回它的来源段（resume 的「原地复活」）。
+   *
+   * 为什么不等 `async-complete`：那之前的新段是一条孤链，面板上就是「又冒出一张新卡」，
+   * 跑完才并进去，体感上完全不像「它又补了一句」。而 status.json 的第一帧就写了
+   * `revivedFrom`（runner 构造 payload 时就带），读一次的事。
+   *
+   * 只在 `revivedFrom` 存在时才动：普通 run 的 `steps[0].sessionFile` 是它自己的会话，
+   * 拿它去匹配「谁用过这份文件」会把 workflow 容器误搬进第一步的链里。
+   * `sessionFile` 仅作为「revivedFrom 指向的段不在本会话」时的二次线索。
+   *
+   * @param {any} segment
+   * @param {any} snap
+   * @returns {boolean} 这次是否接上了
+   */
+  function linkIfRevived(segment, snap) {
+    if (!segment || !snap) return false
+    const runId = String(segment.runId ?? '')
+    if (!runId) return false
+    if (linkedRuns.has(runId)) return false
+    const revivedFrom = String(snap.revivedFrom ?? '').trim()
+    if (!revivedFrom) return false
+    const file = (snap.steps ?? [])
+      .map((/** @type {any} */ step) => String(step?.sessionFile ?? '').trim())
+      .find(Boolean) || ''
+    const hit = linkRevived(state, runId, { revivedFrom, sessionFile: file || null })
+    if (!hit) return false
+    // 真会话文件以 status 为准：started 阶段按新 runId 猜的那条路径在 resume 时是错的
+    if (file) hit.segment.childSessionFile = file
+    linkedRuns.add(runId)
+    if (hit.merged) state.source.reviveLinks = (Number(state.source.reviveLinks) || 0) + 1
+    ctx.log(`revive link ${runId.slice(0, 8)} ← ${revivedFrom.slice(0, 8)}${hit.merged ? ' (merged into chain)' : ''}`)
+    return true
+  }
+
+  /**
+   * `async-started` 之后的第一步：这次 run 是谁派生的？
+   *
+   * 答案不在事件载荷里，而在 **launch 描述符**（`async-subagent-launches/<runId>/
+   * recovery-descriptor.json`）：它由父进程在 spawn 时就写好，`sessionFile` 直接指向
+   * 这次要写/续写的子会话文件。普通 run 指向自己的新文件，resume 指向**来源 run** 的
+   * 那一份——所以「我续的是谁」在事件到达的同一刻就是可读的，代价只有一次 stat。
+   *
+   * 于是三条路分开走：
+   *   · 续跑：当场并回原链、标题回原 run 取，再写盘。**第一次上屏就是最终形态**，
+   *     不会再有「新卡出现 → 消失 → 旧卡更新」那段过程（0.10.4 修的正是这个）。
+   *   · 普通 run：**立刻上屏**。标题先由 UI 显示「启动中」（不会再有假名字），任务名
+   *     另走 events.jsonl 的 `message_start`（实测 1~2 秒可读，见 watchTaskText——
+   *     `status.json` 要 23 秒，等它等于让「启动中」挂二十秒）。
+   *   · 描述符缺失（老版本 pi-subagents / 目录被清）：没法判断是不是续跑，保守压住
+   *     首帧探测一次（见 holdFlush），接不上再照常出现。
+   * @param {any} segment applyStarted 建/找到的那一段
+   * @param {string} runId
+   * @param {string} asyncDir
+   */
+  function adoptStarted(segment, runId, asyncDir) {
+    const hint = resumeSourceOf(asyncDir, runId)
+    if (!hint) {
+      if (launchKindOf(asyncDir, runId) === 'plain') {
+        // 描述符在、指向自己 → 确定是普通 run。压着首帧毫无收益：名字要 23 秒才到，
+        // 而 UI 已经会用「启动中」占位。立刻出卡，名字走事件流补。
+        flush()
+        watchTaskText(runId, asyncDir)
+        return
+      }
+      holdFlush(REVIVE_PROBE_MS * REVIVE_PROBE_TRIES)
+      probeRevive(runId, asyncDir)
+      return
+    }
+
+    if (segment) {
+      // 线索优先「复用了同一份子会话文件」：一条 resume 链上每一段的 childSessionFile
+      // 都相同，linkRevived 取**链尾**匹配，跳数才对。revivedFrom 只作次选——描述符里的
+      // 路径有时指向链根（实测 8bdba4a7 → aa3ad83d，而真正的上一代是 ad1a7a90）。
+      let hit = linkRevived(state, runId, { sessionFile: hint.sessionFile })
+      if (!hit && hint.sourceRunId) hit = linkRevived(state, runId, { revivedFrom: hint.sourceRunId })
+      if (hit) {
+        // started 阶段按新 runId 猜的路径在 resume 时是错的，换成描述符里的真文件
+        hit.segment.childSessionFile = hint.sessionFile
+        linkedRuns.add(runId)
+        if (hit.merged) state.source.reviveLinks = (Number(state.source.reviveLinks) || 0) + 1
+        ctx.log(`revive link ${runId.slice(0, 8)} ← ${hint.sourceRunId.slice(0, 8) || 'same file'}${hit.merged ? ' (merged into chain)' : ''}`)
+      } else {
+        // 来源段不在本实例的 state 里（插件换代后才续的）：先把事实记在段上，
+        // main 侧拿到的是合并过的全量数据，它那边的 relinkOrphans 能接上。
+        // 接不上也不影响展示——标题照旧回原 run 取，徽标照旧算。
+        segment.childSessionFile = hint.sessionFile
+        if (hint.sourceRunId && !segment.revivedFrom) segment.revivedFrom = hint.sourceRunId
+        ctx.log(`revive pending ${runId.slice(0, 8)} ← ${hint.sourceRunId.slice(0, 8) || 'same file'} (source not in this instance)`)
+      }
+      applyOriginTitle(segment, asyncDir, hint)
+    }
+    enrichFromRunDirs()
+    if (!releaseFlush()) flush()
+  }
+
+  /**
+   * 普通 run 的标题：从 `events.jsonl` 的第一条 user 消息取。
+   *
+   * `async-started` 载荷里的任务字段被上游 redact 成 `PROMPT_REDACTED`，而 `status.json`
+   * 实测要 **23 秒**才落盘——卡片早就上屏了，名字却在二十秒后才到，中间只能显示
+   * 「启动中」。事件流倒是 1~2 秒就把第一条 user 消息写进去了（`Task: <任务首句>`），
+   * 那正是 status 里 `sessionName` 的来源，用它补上，两端对齐。
+   *
+   * 拿到就停；3 秒还没读到就作罢（status 落盘后 enrichFromRunDirs 照常补，不会丢）。
+   * @param {string} runId @param {string} asyncDir
+   */
+  function watchTaskText(runId, asyncDir) {
+    let tries = 0
+    /** @type {any} */
+    let timer = null
+    const tick = () => {
+      if (timer) taskProbes.delete(timer)
+      if (stale || disposed) return
+      const segment = findLocalSegment(runId)
+      if (!segment) return
+      // 已经有名字（status 抢先落盘，或这条其实接上了链）就别改它
+      if (segment.sessionName && !isReviveNoise(segment.sessionName)) return
+      const text = readRunTaskText(asyncDir)
+      if (text) {
+        segment.sessionName = text
+        // 标记来源：status.json 落盘后 enrichFromRunDirs 会把 sessionName 换成
+        // `delegate: 首行 步骤：…` 那种压缩版——用户眼里的标题会「又变一次」。
+        // 事件流给的这句更干净（就是任务首行），留着它。
+        segment.titleFromTask = true
+        flush()
+        return
+      }
+      tries += 1
+      if (tries > TASK_TEXT_TRIES) return
+      timer = setTimeout(tick, TASK_TEXT_MS)
+      if (typeof timer.unref === 'function') timer.unref()
+      taskProbes.add(timer)
+    }
+    timer = setTimeout(tick, TASK_TEXT_MS)
+    if (typeof timer.unref === 'function') timer.unref()
+    taskProbes.add(timer)
+  }
+
+  /**
+   * 续跑段的标题：**回来源 run 取**，而不是等自己的 status.json。
+   *
+   * 续跑 run 的 `sessionName` 是模板废话（`delegate: You are reviving a previous…`），
+   * 自己的 status.json 又要等子进程冷启动才落盘。来源 run 的 status.json 早就写完了，
+   * 顺着 `revivedFrom` 一路往上读，第一帧就能拿到真标题和链的形状（最初那个 run）。
+   * @param {any} segment @param {string} asyncDir @param {{ sessionFile: string, sourceRunId: string }} hint
+   */
+  function applyOriginTitle(segment, asyncDir, hint) {
+    const dir = String(asyncDir ?? '').trim()
+    const sourceDir = hint.sourceRunId && dir ? path.join(path.dirname(dir), hint.sourceRunId) : ''
+    const resolved = sourceDir
+      ? resolveRunTitle(sourceDir)
+      : { title: '', revivedFrom: null, rootRunId: '', hops: 0 }
+    if (resolved.title && !segment.sessionName) segment.sessionName = resolved.title
+    if (resolved.rootRunId && !segment.reviveRoot) segment.reviveRoot = resolved.rootRunId
+    if (hint.sourceRunId && !segment.revivedFrom) segment.revivedFrom = hint.sourceRunId
+    // 跳数：linkRevived 已经按命中的链尾算过就不动它（那是最准的），没命中才自己算
+    if (!Number(segment.reviveHops)) segment.reviveHops = (Number(resolved.hops) || 0) + 1
+  }
+
+  /**
+   * 短轮询：run 刚起来时 status.json 可能还没落盘，读到就接，读不到就过 120ms 再试。
+   * 最多 10 次（≈1.2s）——还没读到，说明进程没起来或扩展换代了，交给 complete 兜底。
+   *
+   * 每一条出口都必须 `releaseFlush()`：上屏被压在探测窗口里（见 holdFlushUntil），
+   * 漏一条就是「卡片永远不出现」。
+   * @param {string} runId @param {string} asyncDir
+   */
+  function probeRevive(runId, asyncDir) {
+    if (stale || disposed) return
+    if (linkedRuns.has(runId)) {
+      reviveProbes.delete(runId)
+      releaseFlush()
+      return
+    }
+    const dir = String(asyncDir ?? '').trim()
+    if (!dir) {
+      releaseFlush()
+      return
+    }
+    const segment = findLocalSegment(runId)
+    const snap = readRunSnapshot(dir)
+    if (snap) {
+      if (segment && linkIfRevived(segment, snap)) {
+        reviveProbes.delete(runId)
+        // 接链只是第一步：标题、可打开的会话候选还在 status 里。顺手补齐，
+        // 卡片第一次上屏就是完整形态（否则「打开」要等下一次 heartbeat 才出现）。
+        enrichFromRunDirs()
+        releaseFlush()
+        return
+      }
+      // 读到了却没有 revivedFrom：这是个普通 run，别再试了（它在首帧就有，没有就是没有）
+      if (!String(snap.revivedFrom ?? '').trim()) {
+        reviveProbes.delete(runId)
+        // 普通 run 也要先把 title / label / openCandidates 从 status 补齐再上屏——
+        // 不然首帧同样是「角色 · id」，下一轮才换成任务名，白闪一次。
+        enrichFromRunDirs()
+        releaseFlush()
+        return
+      }
+    }
+    const tries = (Number(reviveProbes.get(runId)?.tries) || 0) + 1
+    if (tries > REVIVE_PROBE_TRIES) {
+      reviveProbes.delete(runId)
+      releaseFlush()
+      return
+    }
+    const timer = setTimeout(() => probeRevive(runId, dir), REVIVE_PROBE_MS)
+    if (typeof timer.unref === 'function') timer.unref()
+    reviveProbes.set(runId, { tries, timer })
+  }
+
+  /**
+   * 把「需要关注」拆成能看懂的一件事（报告 P19 / P20）。
+   *
+   * `activityState === 'needs_attention'` 在数据里有**三种**来源，卡面必须分开：
+   *
+   *   | reason | 真实含义 | 卡面 |
+   *   |---|---|---|
+   *   | `supervisor_request` | 调了 contact_supervisor，等你回答 | 等待回答 · 问题原文 |
+   *   | `idle` | 60 秒无活动（可能上游请求悬住） | 无响应 · 已 N 分无活动 |
+   *   | （`active_long_running`） | 还在跑，只是慢 | 运行中，不报警 |
+   *
+   * 判据只在事件流里，所以这里顺手读一次 `events.jsonl` 尾部——**只在真的
+   * needs_attention 时读**，正常跑着的 run 一个字节都不多读。读不到（文件正在写、
+   * 行被截断、目录被清理）就保留上一次的值，绝不清空：卡面在两个状态之间来回闪
+   * 比停在旧状态更糟。
+   *
+   * 提问原文同样来自这里：它不进会话流（P20），`contact_supervisor` 的
+   * `tool_execution_start/end` 按 toolCallId 配对是唯一来源，回答还带 `durationMs`。
+   *
+   * @param {any} segment
+   * @param {any} snap readRunSnapshot 的结果
+   * @param {boolean} active 这段还在跑/在停
+   * @param {string} activity 已经归一过的 activityState
+   * @returns {boolean} 是否有字段变化
+   */
+  function applyAttention(segment, snap, active, activity) {
+    let changed = false
+    /** @param {string} key @param {any} next */
+    const put = (key, next) => {
+      if ((segment[key] ?? null) === (next ?? null)) return
+      segment[key] = next
+      changed = true
+    }
+
+    // 「已 N 分无活动」必须用磁盘上的真实时刻；有没有超时保护决定「再等下去有没有意义」
+    put('lastActivityAt', active ? Number(snap?.lastActivityAt) || null : null)
+    put('hasDeadline', active ? Boolean(snap?.hasDeadline) : null)
+
+    if (!active || activity !== WAITING_ACTIVITY) {
+      // 离开「需要关注」：三样一起清，下次再进是新一轮，不能挂着上一轮的问题和起点
+      put('attentionReason', null)
+      put('attentionAt', null)
+      put('attentionAsk', null)
+      put('attentionSince', null)
+      return changed
+    }
+
+    const events = segment.asyncDir ? readRunEvents(segment.asyncDir) : null
+    const reason = String(events?.control?.reason ?? '')
+    const at = Number(events?.control?.at) || null
+    if (reason) put('attentionReason', reason)
+    if (at) put('attentionAt', at)
+    const ask = events?.ask && (events.ask.question || events.ask.answer) ? events.ask : null
+    if (JSON.stringify(ask) !== JSON.stringify(segment.attentionAsk ?? null)) {
+      segment.attentionAsk = ask
+      changed = true
+    }
+    // 起点优先用控制事件自己的 ts（真值），读不到才用本地时钟兜底
+    put('attentionSince', at || Number(segment.attentionSince) || Date.now())
+    return changed
   }
 
   /**
@@ -281,9 +681,15 @@ export default function subagentsBoard(pi, ctx) {
         const needTitle = !segment.sessionName || isReviveNoise(segment.sessionName)
         const needLabel = !segment.label
         const needOpen = !Array.isArray(segment.openCandidates)
-        if (!active && !needTitle && !needLabel && !needOpen) continue
+        // 终态段还挂着「排队占位」= 旧版本写下的脏数据（普通代理的 steps[0] 曾被当成
+        // 待启动的一步）。再读一次把它清掉——只清一次，清完变空就不再进这个分支。
+        const stalePending = !active && (segment.pendingSteps ?? []).length > 0
+        if (!active && !needTitle && !needLabel && !needOpen && !stalePending) continue
         const snap = readRunSnapshot(segment.asyncDir)
         if (!snap) continue
+        // 兜底接链（0.9.9）：probe 的定时器可能被换代清掉，或者 status.json 迟于 1.6s
+        // 才落盘。这里本来每秒就在读同一份 snap，顺手判一次，代价为零。
+        if (linkIfRevived(segment, snap)) changed = true
 
         // 标题：resume 段的 sessionName 是运行时的模板首句，顺着 revivedFrom 读原 run 才拿得到真名字
         const resolved = resolveRunTitle(segment.asyncDir, snap)
@@ -300,7 +706,9 @@ export default function subagentsBoard(pi, ctx) {
           segment.reviveHops = resolved.hops
           changed = true
         }
-        if (resolved.title && resolved.title !== segment.sessionName) {
+        // 标题：优先留事件流给的任务首行（titleFromTask，见 watchTaskText）——
+        // status 里那份是压缩版，换上等于让标题在 23 秒后自己变一次。
+        if (resolved.title && resolved.title !== segment.sessionName && !segment.titleFromTask) {
           segment.sessionName = resolved.title
           changed = true
         }
@@ -333,6 +741,26 @@ export default function subagentsBoard(pi, ctx) {
         }
         if (first?.thinking && first.thinking !== segment.thinking) {
           segment.thinking = first.thinking
+          changed = true
+        }
+
+        // 「跑着」还是「卡在等人 / 卡住」：activityState 只说明「需要关注」，分不出三种
+        // 语义（报告 P10 → P19）。真正的判据是事件流里那条 `subagent.control` 的 reason。
+        const activity = active ? String(first?.activityState || snap.activityState || '') : ''
+        if ((segment.activityState || '') !== activity) {
+          segment.activityState = activity
+          changed = true
+        }
+        if (applyAttention(segment, snap, active, activity)) changed = true
+        // 排队中的步骤（报告 P12）：`steps[]` 里有它，但 `runId` 还是空的——没有 runId
+        // 就建不出卡，容器写着「3 步」下面却只有 1 张，用户只能猜剩下的是没跑还是丢了。
+        // 判定在 lib/run-snapshot.mjs 的 pendingStepsOf 里：**只对容器 run 成立**，
+        // 普通代理（mode: single）的 steps[0] 是它自己，不能当占位（否则会凭空长出
+        // 一张「第 1 步 · 待启动」的子卡片）。
+        // 终态段一律清空：run 都结束了，不存在「还在排队等启动」的步骤。
+        const pending = active ? pendingStepsOf(snap) : []
+        if (JSON.stringify(pending) !== JSON.stringify(segment.pendingSteps ?? [])) {
+          segment.pendingSteps = pending
           changed = true
         }
         if (!active) continue

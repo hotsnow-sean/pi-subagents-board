@@ -15,17 +15,41 @@
   --fg: var(--pi-foreground, #1b1f26);
   --muted: var(--pi-muted-foreground, #626b7a);
   --bg: var(--pi-background, #eef0f4);
-  --surface: var(--pi-card, #ffffff);
-  /* 卡片比面板底色「抬一点」：深色下更亮、浅色下更灰，两边都能分层 */
-  --surface-2: color-mix(in srgb, var(--surface) 94%, var(--fg));
-  --surface-3: color-mix(in srgb, var(--surface) 88%, var(--fg));
-  --line: var(--pi-border, #e1e5ec);
+  --surface: var(--pi-card, transparent);
+  /* 卡片比面板底色「抬一点」：深色下更亮、浅色下更灰，两边都能分层。
+   *
+   * 深色那档是 91% 而不是 88%：卡片越亮，卡片上的字越吃亏。实测宿主 Dark Modern
+   * 下 88% 会把次级灰（#9d9d9d）从 4.93 压到 4.25，掉出 AA；91% 是「卡片浮起来」
+   * 和「正文还在 4.5 以上」的交点（卡片/底 1.33，次级灰 4.59）。
+   * 容器卡（一次编排）再抬一档，和真正跑事的卡分开。 */
+  --surface-2: light-dark(
+    color-mix(in srgb, var(--surface) 94%, var(--fg)),
+    color-mix(in srgb, var(--surface) 91%, var(--fg))
+  );
+  --surface-3: light-dark(
+    color-mix(in srgb, var(--surface) 88%, var(--fg)),
+    color-mix(in srgb, var(--surface) 84%, var(--fg))
+  );
+  /* 边框：宿主给的 --pi-border 在深色下和卡片只差 1.06:1，等于没有边框。深色那档掺
+   * 25% 前景色（→ #535353，vs 卡片 1.62），线的形状才立得住；浅色本来靠阴影就够，不动。 */
+  --line: light-dark(
+    var(--pi-border, #e1e5ec),
+    color-mix(in srgb, var(--fg) 25%, var(--pi-border, #2b2b2b))
+  );
   --line-2: color-mix(in srgb, var(--line) 55%, var(--fg));
   --accent: var(--pi-primary, light-dark(#2f6bf0, #5b8cff));
   --accent-weak: var(--pi-accent, color-mix(in srgb, var(--accent) 12%, transparent));
   --ok: light-dark(#1a7f37, #3fb950);
   --bad: var(--pi-destructive, light-dark(#cf222e, #f85149));
   --warn: light-dark(#9a6700, #d29922);
+  /* 状态 label 的底 / 字：底色浓到能看出形状，字再压一档保证 ≥4.5:1。
+   * 深浅两档的浓淡不同——深色底上同样的 alpha 会比浅色底亮得多。 */
+  --ok-fill: light-dark(color-mix(in srgb, var(--ok) 26%, transparent), color-mix(in srgb, var(--ok) 18%, transparent));
+  --ok-ink: light-dark(color-mix(in srgb, var(--ok) 74%, #000), color-mix(in srgb, var(--ok) 64%, #fff));
+  --bad-fill: light-dark(color-mix(in srgb, var(--bad) 16%, transparent), color-mix(in srgb, var(--bad) 12%, transparent));
+  --bad-ink: light-dark(color-mix(in srgb, var(--bad) 76%, #000), color-mix(in srgb, var(--bad) 58%, #fff));
+  --warn-fill: light-dark(color-mix(in srgb, var(--warn) 22%, transparent), color-mix(in srgb, var(--warn) 18%, transparent));
+  --warn-ink: light-dark(color-mix(in srgb, var(--warn) 78%, #000), color-mix(in srgb, var(--warn) 66%, #fff));
   --dim: color-mix(in srgb, var(--muted) 82%, var(--surface));
   /* 父子卡片之间那条线：比边框显眼一点，但不该抢标题视线 */
   --tree-line: color-mix(in srgb, var(--accent) 42%, var(--line));
@@ -49,7 +73,10 @@ html, body {
 #app {
   height: 100%;
   overflow-y: auto;
-  padding: 10px 10px 16px;
+  /* 顶部不留 padding：留了的话顶栏得先跟着滚 10px 才被 sticky 钉住（滚一下先窜一小段
+   * 再定住）。这段留白交给顶栏自己的 padding-top（见 .head）——它从滚动原点开始站，
+   * 就再也不动了。没有顶栏的瞬间（首帧「正在读取…」）靠 .pad 自己的 padding 撑开。 */
+  padding: 0 10px 16px;
   position: relative;
   scrollbar-width: thin;
 }
@@ -69,28 +96,40 @@ html, body {
 .head {
   display: flex;
   align-items: center;
+  /* 高度按「有返回按钮」那一档定死：22px 按钮 + 上下 padding（12 + 9）= 43px。
+   * 没有按钮时只有一行 13px 文字（行盒 ~20px），点「打开」多出一个 22px 的按钮
+   * 就把这一行顶高 2px，整块内容跟着下沉——看起来像「点了之后版面抖了一下」。
+   * 两态同高，卡片就不会因为顶栏多了个图标而挪位。 */
+  min-height: 43px;
   gap: 7px;
-  padding: 2px 2px 9px;
+  /* padding-top 12px = 原来面板的 10px 留白 + 这一行自己的 2px。留白搬到顶栏内部之后，
+   * 它从滚动原点（y=0）开始站，sticky top:0 一直成立——滚动时顶栏**一点不动**，
+   * 卡片从它下面滚过去。 */
+  padding: 12px 2px 9px;
   position: sticky;
-  top: -10px;
+  top: 0;
   background: var(--bg);
   z-index: 2;
 }
-.head b { font-weight: 600; font-size: 13px; }
-.head-sub { color: var(--dim); font-size: 11.5px; }
 .head .count { color: var(--dim); font-size: 11.5px; white-space: nowrap; }
+/* 返回控件把「回哪儿」写在自己身上：`‹ 主会话`。整块（箭头 + 文字）是一个按钮，
+ * 命中区从 22px 的方图标扩到 ~64×22 —— 顶栏这一行本来就不是精确操作区，
+ * 点偏一点也该生效。主会话态这个元素压根不渲染，所以不存在「标题被推走」。 */
 .head .back {
   all: unset;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
-  justify-content: center;
+  gap: 1px;
   flex: none;
-  width: 22px;
   height: 22px;
-  margin: 0 -2px 0 -5px;
+  padding: 0 8px 0 4px;
+  margin: 0 0 0 -5px;
   border-radius: 6px;
   color: var(--accent);
+  font-size: 12px;
+  line-height: 22px;
+  white-space: nowrap;
 }
 .head .back:hover { background: var(--accent-weak); }
 .head .back:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent); outline-offset: 1px; }
@@ -112,15 +151,28 @@ html, body {
 .banner-info { border-left-color: var(--accent); }
 
 /* ---------- 空态 ---------- */
+/* 「这里暂时没东西」的正常状态（没打开会话 / 还没派过子代理），不是故障，
+ * 所以不摆横幅的色条。视觉跟「后台任务」面板的空列表对齐：虚线框 + 居中两行文字。
+ * 虚线用 --line 而不是 --line-2：--line-2 掺了 55% 前景色，框会抢过卡片本身的边，
+ * 一个空态不该是面板里最显眼的东西。 */
 .empty {
-  border: 1px dashed var(--line-2);
+  /* 深色那档再压一档：--line 本身掺了 25% 前景色（卡片要立起来），但一个空态不该
+   * 是面板里最有存在感的边框。浅色保持 70%——再淡就真看不见了。 */
+  border: 1px dashed light-dark(
+    color-mix(in srgb, var(--line) 72%, transparent),
+    color-mix(in srgb, var(--line) 58%, transparent)
+  );
   border-radius: var(--radius);
-  padding: 26px 16px;
+  padding: 28px 16px;
   text-align: center;
   color: var(--muted);
   font-size: 12px;
+  line-height: 1.6;
 }
-.empty strong { display: block; color: var(--fg); font-weight: 550; margin-bottom: 3px; }
+.empty strong { display: block; color: var(--fg); font-weight: 500; margin-bottom: 4px; }
+.empty span { display: block; }
+/* 第二行：讲「看着不对时可能是什么原因」，语气比主说明更弱一档，不该抢读 */
+.empty-hint { margin-top: 3px; font-size: 11.5px; color: var(--dim); }
 
 /* ---------- 卡片 ---------- */
 .card {
@@ -131,11 +183,34 @@ html, body {
   margin-bottom: 8px;
   transition: border-color .15s;
 }
-.card.live { border-color: color-mix(in srgb, var(--ok) 30%, var(--line)); }
+.card.live { border-color: color-mix(in srgb, var(--ok) 36%, var(--line)); }
 /* 你正在看的那张（只读预览子会话时）：淡蓝边 + 底色，配合按钮上的「返回」 */
 .card.viewing {
   border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
   background: color-mix(in srgb, var(--accent) 6%, var(--surface-2));
+}
+
+/* resume 复活：一次性高亮，播完由 uiPulse 重绘把 class 摘掉（否则第二次不重播）。
+ * 只动颜色，不动 transform：卡片刚刚回到列表前面，再来一个位移会让人分不清
+ * 「是动画」还是「它真的在动」。 */
+.card.revived { animation: card-revive 1.2s ease-out; }
+@keyframes card-revive {
+  0% {
+    border-color: color-mix(in srgb, var(--accent) 60%, var(--line));
+    background: color-mix(in srgb, var(--accent) 13%, var(--surface-2));
+  }
+  100% {
+    border-color: var(--line);
+    background: var(--surface-2);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  /* 不能只写 animation: none：那就真的没有反馈了。换成静态描边，颜色本身在说话 */
+  .card.revived {
+    animation: none;
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+  }
+  .card.viewing.revived { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); }
 }
 
 /* ---------- 容器（workflow）与它的步骤卡 ----------
@@ -148,6 +223,12 @@ html, body {
  * 子卡的插话 / 停止 / 打开照旧，它只是换了位置。 */
 .card.container { background: var(--surface-3); }
 .card.step { padding: 9px 10px 8px; }
+/* 排队中的步骤：不是真卡（没有 runId / 会话 / 计时），虚线边 + 降透明度，
+ * 和旁边那些能点开、能插话的卡一眼分开。opacity 只压到 .72：字还要看得清。 */
+.card.pending {
+  border-style: dashed;
+  opacity: .72;
+}
 
 /* 连接线：`::before` 画竖轨、`::after` 画横枝，最后一张把竖轨截到拐点。
  * 这是树形控件的通行做法（VS Code 的 tree、各种纯 CSS tree 教程都一样）：
@@ -195,7 +276,7 @@ html, body {
   pointer-events: none;
 }
 
-/* 第一行：点 · 标题 · 状态 · 计时（计时靠右） */
+/* 第一行：角色徽章 · 标题 · 状态 · 计时（计时靠右） */
 .row1 { display: flex; align-items: center; gap: 7px; min-width: 0; }
 .row1 .agent {
   font-weight: 600;
@@ -205,16 +286,220 @@ html, body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.state { font-size: 11px; color: var(--dim); white-space: nowrap; flex: none; }
-.state.live { color: var(--ok); }
-.state.bad, .state.stopping { color: var(--bad); }
-.state.warn { color: var(--warn); }
+
+/* ---------- 角色徽章 ----------
+ * 19px 小方块，右下角挂状态点。它替掉了原来那个独立的 7px 圆点：横向只多占
+ * 几像素，但「什么角色」和「还在跑吗」落在同一个符号上，扫一列卡片不用左右对。
+ *
+ * 三个族的颜色对应 pi-subagents 里真实的能力差别（writer / read-only / 编排），
+ * 见 app.js 的 AGENT_LOOK。色系特意和状态色（绿 / 红 / 黄）错开：一张橙锤子卡
+ * 同时挂个绿点，两件事谁都压不住谁。
+ */
+.ico {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 19px;
+  height: 19px;
+  border-radius: 6px;
+  color: var(--tone, var(--muted));
+  background: color-mix(in srgb, var(--tone, var(--muted)) 15%, transparent);
+}
+.ico svg { width: 13px; height: 13px; }
+.tone-act { --tone: light-dark(#b45a09, #e6a563); }
+.tone-read { --tone: light-dark(#0d5a72, #5fbcd9); }
+.tone-orch { --tone: light-dark(#6a45b5, #b092ef); }
+.tone-unknown { --tone: var(--muted); }
+/* 容器卡底色深一档，同样的 13% 会糊成一团：给它加一点 */
+.card.container .ico { background: color-mix(in srgb, var(--tone, var(--muted)) 22%, transparent); }
+
+/* 卡片边框跟着状态转色：绿边让位给琥珀边，一张卡不戴两种颜色 */
+.card.waiting { border-color: color-mix(in srgb, var(--warn) 45%, var(--line)); }
+/* 无响应：同色但虚线——「可能有问题」用不确定的线型，和实线橙（确定在等你）分开 */
+.card.stalled { border-color: color-mix(in srgb, var(--warn) 34%, var(--line)); border-style: dashed; }
+/* 已中断：进程没了。虚线灰，跟「无响应」区分开——那张是「可能卡住」，这张是「已经结束，
+ * 只是没人来写终态」。不做任何强调：它不需要用户做任何事。 */
+.card.lost { border-color: color-mix(in srgb, var(--muted) 30%, var(--line)); border-style: dashed; }
+
+/* 它在问什么（报告 P20）：左侧一道竖线当作「引用」，正文两行就截断，全文在 title 里 */
+.ask {
+  margin: 8px 0 0;
+  padding: 1px 0 1px 9px;
+  border-left: 2px solid color-mix(in srgb, var(--warn) 45%, transparent);
+}
+.ask-q {
+  margin: 0;
+  color: var(--fg);
+  font-size: 12.2px;
+  line-height: 1.55;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+.ask-hint {
+  margin: 3px 0 0;
+  color: var(--dim);
+  font-size: 11px;
+}
+/* 已经答过的提问：卡面不占位，只留一行弱字当时间线的注脚 */
+.asklog {
+  margin: 7px 0 0;
+  color: var(--dim);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---------- 状态标识（label）----------
+ *
+ * 徽章上的环全撤了。环画在 19px 方块外面，不管多淡都容易被读成一个「框」；而它
+ * 要说的话（在跑 / 在等人）本来一个词就说得完——框是形式，label 才是语言。
+ *
+ * 按「值不值得抢注意力」分两档：
+ *   · 已完成 / 已停止 / 未知：**纯灰字**。一屏十几张卡大半是它们，个个戴 label
+ *     等于没有重点。
+ *   · 运行中 / 失败 / 等待回答 / 正在停止：**带底色的 label**，底色是状态色、
+ *     文字是深一档（浅色主题）或亮一档（深色主题）的同色。
+ *
+ * 运行中那份底色**自己呼吸**：最浓那一档 26%（浅）/18%（深），动画只改 opacity，
+ * 走合成层不重排。这是原来那圈绿环的替身——底色比描边粗、比描边近，对比度上得来
+ * 又不会像框。文字色按 `--*-ink` 压过一档，保证呼吸到最浓时仍在 4.5:1 以上。
+ *
+ * 带底色的那几种再加 **1px 同色 45% 描边**：深色下 12% 的底色和卡片只差 1.14:1，
+ * 一坨颜色糊在卡上，看不出是个 label。加浓度不行——label 的字 vs 底已经顶到 4.49，
+ * 再浓就掉到 4.0 以下；描边只加在边缘，不占字和底之间的余量。
+ * 描边占掉 1px，padding 同步减 1px，几种 label 并排时高度才齐。
+ */
+.state {
+  font-size: 10.5px;
+  /* 用宿主的次级灰，不用自造的 --dim：--dim 是「muted 再压 82%」，压完在卡片上只剩
+   * 3.5:1（深色）/ 更浅（浅色），10.5px 的字直接掉出 AA。宿主的 muted 本来就是按
+   * 「卡片上的次级文字」调的，深浅两套都在 4.5 以上。 */
+  color: var(--muted);
+  white-space: nowrap;
+  flex: none;
+  padding: 1px 6px 1.5px;
+  border-radius: 5px;
+  line-height: 1.5;
+}
+/* 运行中：底色 + 右侧一个转圈。
+ *
+ * 「在动」这件事交给转圈（见 `.state.live .spin`），底色不再呼吸。原来那版让底色
+ * opacity 在 .5↔1 之间呼吸，幅度被「字 vs 底」的对比度卡死（再浓就掉出 AA），
+ * 变化量只有一半浓度差，余光里基本看不出来——用户反馈「动感不明显」就是这个原因。
+ */
+.state.live {
+  color: var(--ok-ink);
+  font-weight: 600;
+  padding: 0 4px 0.5px 5px;
+  background: var(--ok-fill);
+  border: 1px solid color-mix(in srgb, var(--ok) 45%, transparent);
+}
+/* 宿主会话条上那个「在转的圆环」的同款：2/4 弧亮、1s 线性旋转（--warning-semantic
+ * 换成这里的 --ok，状态色得跟 label 同族）。9px 内容 + 1.5px 边 = 12px，跟宿主那个
+ * dot 一样大；淡弧给到 42% 而不是 30%——1x 下 30% 只剩一点灰影，看不出是个圈。 */
+.state.live .spin {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  margin-left: 4px;
+  vertical-align: -1px;
+  border-radius: 999px;
+  border: 1.5px solid color-mix(in srgb, var(--ok) 42%, transparent);
+  border-top-color: var(--ok);
+  border-right-color: var(--ok);
+  animation: state-spin 1s linear infinite;
+}
+@keyframes state-spin {
+  to { transform: rotate(360deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  /* 关掉动画时别留一个「静止的缺口圈」——那看着像坏了。补满 4/4，读作「进行中」 */
+  .state.live .spin {
+    animation: none;
+    border-color: var(--ok);
+    opacity: .55;
+  }
+}
+.state.bad {
+  color: var(--bad-ink);
+  font-weight: 600;
+  padding: 0 5px 0.5px;
+  background: var(--bad-fill);
+  border: 1px solid color-mix(in srgb, var(--bad) 45%, transparent);
+}
+/* 未启动：红字，但**空心**。
+ *
+ * 「跑了 6 秒超时」和「workflow 脚本第 17 行报错，一个子代理都没创建出来」在数据里
+ * 都叫 failed，原来都写成实底的「失败」——前者是努力过，后者是根本没上场，用户却
+ * 看不出区别。实底 = 有结果，空心 = 连会话都没留下，一眼能分开，又都还是红字提示。
+ *
+ * 加了描边之后「实心/空心」不再是唯一的区别（两边都有边了），所以这里把边压到 32%、
+ * 并留空底色：失败是「看得见的一团」，未启动只剩一圈浅红。字数本来也不同（失败 /
+ * 未启动），形状只是第二重保险。 */
+.state.launch {
+  color: var(--bad-ink);
+  font-weight: 600;
+  padding: 0 5px 0.5px;
+  border: 1px solid color-mix(in srgb, var(--bad) 32%, transparent);
+}
+.state.stopping {
+  color: var(--bad-ink);
+  padding: 0 5px 0.5px;
+  background: color-mix(in srgb, var(--bad) 9%, transparent);
+  border: 1px solid color-mix(in srgb, var(--bad) 32%, transparent);
+}
+/* 等待回答：全场唯一「你必须做点什么」的状态，给最浓的一档 */
+.state.waiting {
+  color: var(--warn-ink);
+  font-weight: 600;
+  padding: 0 5px 0.5px;
+  background: var(--warn-fill);
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+}
+/* 无响应：同一族的橙，但**空心**。
+ *
+ * idle 有一半是「长思考」而不是故障，做成实心橙等于天天喊「必须处理」，喊多了就被无视；
+ * 而它又确实不是「正常在跑」——绿底和转圈都在撒谎。空心橙夹在中间：颜色提示异常、
+ * 没有底色表示「还没确认是故障」、不转圈表示「它没在动」。
+ * 刻意不加转圈：转圈的意思是「在动」，恰恰相反。
+ */
+.state.stalled {
+  color: var(--warn-ink);
+  padding: 0 5px 0.5px;
+  border: 1px dashed color-mix(in srgb, var(--warn) 50%, transparent);
+}
+/* 已中断：进程没了，这次运行永远不会有下文。
+ *
+ * 必须是**灰**、必须是**空心**：它不是失败（没人写过错，是应用重启把 runner 带走了），
+ * 也不该抢「停止/插话」的注意力——那张卡上根本没有可点的干预入口。用红会被读成
+ * 「任务出错了，去修」，用绿又跟「跑完了」混在一起。 */
+.state.lost {
+  color: var(--muted);
+  padding: 0 5px 0.5px;
+  border: 1px dashed color-mix(in srgb, var(--muted) 45%, transparent);
+}
+/* 「已等 3 分」：跟着等待 label 走，但不做第二个 pill——一层框已经够重了。
+ * 颜色取 warn-ink（与 label 同族），字重不加：它是补充说明，不是第二个状态。 */
+.wait {
+  font-size: 10.5px;
+  color: var(--warn-ink);
+  white-space: nowrap;
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
 .timer {
   margin-left: auto;
   font-variant-numeric: tabular-nums;
   color: var(--dim);
   font-size: 11.5px;
   flex: none;
+  /* 时长旁边悬停能看到「开始 23:57 · 结束 23:58」——排序对不对，用户自己能核对 */
+  cursor: help;
 }
 
 .dot {
@@ -226,7 +511,6 @@ html, body {
 }
 .dot.live { background: var(--ok); animation: pulse 2s infinite; }
 .dot.bad, .dot.stopping { background: var(--bad); }
-.dot.warn { background: var(--warn); }
 .dot.done { background: var(--dim); }
 .dot.stopping { opacity: .55; }
 @keyframes pulse {
@@ -291,13 +575,16 @@ html, body {
   white-space: nowrap;
   transition: background .13s, border-color .13s, color .13s;
 }
-.acts button:hover { border-color: var(--line-2); color: var(--fg); background: var(--surface-3); }
+/* hover 只对**能点的**生效。禁用的按钮（会话文件已被清理的「打开」、发送中的「发送」）
+ * 浏览器照样会命中 `:hover`，只给 opacity 的话鼠标一过就有底色/描边变化——看着像还能点，
+ * 点下去却毫无反应。这里一律用 `:not([disabled])` 排除掉。 */
+.acts button:not([disabled]):hover { border-color: var(--line-2); color: var(--fg); background: var(--surface-3); }
 .acts button:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
 .acts button[disabled] { opacity: .5; cursor: default; }
 .acts button.primary { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 30%, var(--line)); }
 .acts button.primary.on { background: var(--accent-weak); }
 .acts button.danger { color: var(--bad); }
-.acts button.danger:hover { background: color-mix(in srgb, var(--bad) 10%, transparent); border-color: color-mix(in srgb, var(--bad) 40%, var(--line)); }
+.acts button.danger:not([disabled]):hover { background: color-mix(in srgb, var(--bad) 10%, transparent); border-color: color-mix(in srgb, var(--bad) 40%, var(--line)); }
 .acts button.confirm { background: color-mix(in srgb, var(--bad) 12%, transparent); color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, var(--line)); }
 /* 「打开」缺席时的说明（容器 run 自己没有会话，入口在子步骤那张卡上） */
 .acts .hint { align-self: center; color: var(--dim); font-size: 11px; }
@@ -342,9 +629,9 @@ html, body {
   color: var(--muted);
   transition: .13s;
 }
-.compose-acts button:hover { border-color: var(--line-2); color: var(--fg); }
+.compose-acts button:not([disabled]):hover { border-color: var(--line-2); color: var(--fg); }
 .compose-acts button.send { background: var(--accent); border-color: var(--accent); color: var(--pi-primary-foreground, #fff); }
-.compose-acts button.send:hover { filter: brightness(1.08); color: var(--pi-primary-foreground, #fff); }
+.compose-acts button.send:not([disabled]):hover { filter: brightness(1.08); color: var(--pi-primary-foreground, #fff); }
 .compose-acts button[disabled] { opacity: .6; cursor: default; }
 .form-error { margin: 6px 0 0; font-size: 11.5px; color: var(--bad); }
 
@@ -367,6 +654,8 @@ html, body {
 .chip-read { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 30%, transparent); background: color-mix(in srgb, var(--ok) 12%, transparent); }
 .chip-warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 30%, transparent); background: color-mix(in srgb, var(--warn) 10%, transparent); }
 .chip-bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 30%, transparent); background: color-mix(in srgb, var(--bad) 10%, transparent); }
+/* 中性回执：如「点停止时它已经自己结束了」。既不是成功也不是失败，别用红色吓人 */
+.chip-muted { color: var(--muted); border-color: var(--line); background: var(--surface-3); }
 @keyframes fade { from { opacity: 0; transform: translateY(-2px); } to { opacity: 1; transform: none; } }
 
 /* ---------- 代际链 / 子代理明细：折成一行 ---------- */

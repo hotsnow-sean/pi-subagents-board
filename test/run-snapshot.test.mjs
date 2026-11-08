@@ -3,14 +3,28 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
+import { spawnSync } from 'node:child_process'
 
 import {
+  clearLaunchCache,
+  clearRunEventsCache,
   clearRunSnapshotCache,
+  clearTaskTextCache,
   describeSteerFailure,
   isReviveNoise,
+  launchDescriptorPath,
+  launchKindOf,
   normalizeSteering,
+  parseRunEventsTail,
+  pendingStepsOf,
+  isProcessAlive,
+  readLaunchDescriptor,
+  readRunEvents,
   readRunSnapshot,
+  readRunTaskText,
   resolveRunTitle,
+  resumeSourceOf,
+  runIdFromSessionFile,
   stepLabel,
   steeringEntry,
 } from '../lib/run-snapshot.mjs'
@@ -146,6 +160,27 @@ test('readRunSnapshot: 从 status.json 取会话名与 steering', () => {
   assert.equal(snap.steps[1].index, 1, '缺 index 时按位置补')
   assert.equal(snap.steps[0].steering.failed, 1)
   assert.equal(snap.steering.requested, 2)
+})
+
+test('readRunSnapshot: 取到 steps[].activityState（P10「等人回答」的唯一信号）', () => {
+  clearRunSnapshotCache()
+  const dir = tmpRunDir({
+    'status.json': JSON.stringify({
+      runId: 'run-wait',
+      state: 'running',
+      // 实测形状：`state` / `status` 都是 running，只有 activityState 说它在等人
+      steps: [
+        { agent: 'delegate', status: 'running', activityState: 'needs_attention' },
+        { agent: 'delegate', status: 'running', activityState: 'active_long_running' },
+        { agent: 'delegate', status: 'running' },
+      ],
+    }),
+  })
+  const snap = readRunSnapshot(dir)
+  assert.equal(snap.state, 'running')
+  assert.equal(snap.steps[0].activityState, 'needs_attention')
+  assert.equal(snap.steps[1].activityState, 'active_long_running')
+  assert.equal(snap.steps[2].activityState, '', '字段缺就是空串，不要继承上一步的值')
 })
 
 test('readRunSnapshot: 文件没变就复用解析结果（面板每秒一次 getState）', () => {
@@ -294,4 +329,344 @@ test('readRunSnapshot: steps 带上 label / workflowKey / sessionFile（P6 + P8 
   assert.equal(snap.steps[0].label, '标签A-回声')
   assert.equal(snap.steps[0].workflowKey, 'a')
   assert.equal(snap.steps[0].sessionFile, 'C:/s/child.jsonl')
+})
+
+
+/* ---------- 排队中的步骤：只有容器 run 才有 ---------- */
+
+test('pendingSteps: 普通代理的单步不算占位（steps[0] 就是它自己）', () => {
+  // 实测形状：57 个 single run 全部是「1 步、无 runId」，status 取到 complete/failed/stopped
+  for (const status of ['complete', 'failed', 'stopped', 'running']) {
+    const snap = { mode: 'single', steps: [{ index: 0, runId: '', agent: 'delegate', status }] }
+    assert.deepEqual(pendingStepsOf(snap), [], status)
+  }
+})
+
+test('pendingSteps: workflow 里没 runId 的步骤才是排队占位', () => {
+  const snap = {
+    mode: 'workflow',
+    steps: [
+      { index: 0, runId: 'run-a', agent: 'delegate', status: 'running', label: '取数' },
+      { index: 1, runId: '', agent: 'delegate', status: 'pending', label: '汇总' },
+      { index: 2, runId: '', agent: 'delegate', status: 'completed', label: '收尾' },
+    ],
+  }
+  assert.deepEqual(pendingStepsOf(snap), [{ index: 1, label: '汇总', agent: 'delegate' }])
+})
+
+test('pendingSteps: 终态步骤不再当排队（跑完了还挂「待启动」会以为是它没动）', () => {
+  const snap = {
+    mode: 'workflow',
+    steps: [
+      { index: 0, runId: '', status: 'complete' },
+      { index: 1, runId: '', status: 'failed' },
+      { index: 2, runId: '', status: 'stopped' },
+      { index: 3, runId: '', status: 'cancelled' },
+      { index: 4, runId: '', status: 'queued' },
+    ],
+  }
+  assert.deepEqual(pendingStepsOf(snap), [{ index: 4, label: '', agent: '' }])
+})
+
+test('pendingSteps: 没有 mode 的老数据单步按 single 处理，多步按容器', () => {
+  assert.deepEqual(pendingStepsOf({ steps: [{ index: 0, runId: '', status: 'running' }] }), [])
+  // 多步：两步都还没 runId（连 status 都没有），就都是排队占位
+  assert.deepEqual(pendingStepsOf({ steps: [{}, { index: 1, runId: '', status: 'pending' }] }), [
+    { index: 0, label: '', agent: '' },
+    { index: 1, label: '', agent: '' },
+  ])
+})
+
+/* ---------- 事件流尾部：控制信号与提问（报告 P19 / P20） ---------- */
+
+/** 实测形状（410ae341 卡死那一刻的 subagent.control） */
+const IDLE_CONTROL = JSON.stringify({
+  type: 'subagent.control',
+  event: {
+    type: 'needs_attention',
+    to: 'needs_attention',
+    ts: 1794120055464,
+    runId: '410ae341',
+    agent: 'delegate',
+    index: 0,
+    message: 'delegate needs attention (no observed activity for 60s)',
+    reason: 'idle',
+    elapsedMs: 60236,
+    taskPreview: '[prompt redacted]',
+  },
+  channels: ['event', 'async', 'intercom'],
+})
+
+test('parseRunEventsTail: reason=idle 是「无响应」，不是「等待回答」（报告 P19）', () => {
+  const { control, ask } = parseRunEventsTail(`${IDLE_CONTROL}\n`)
+  assert.equal(control.reason, 'idle')
+  assert.equal(control.type, 'needs_attention')
+  assert.equal(control.at, 1794120055464)
+  assert.equal(control.elapsedMs, 60236)
+  assert.equal(control.currentTool, '', 'idle 时没有工具在跑——这正是它和「等人回答」的区别')
+  assert.equal(ask, null)
+})
+
+test('parseRunEventsTail: 提问与回答按 toolCallId 配对，回答去掉前缀并留耗时（报告 P20）', () => {
+  const call = JSON.stringify({
+    type: 'tool_execution_start',
+    toolCallId: 'c1',
+    toolName: 'contact_supervisor',
+    args: { reason: 'need_decision', message: '请选择报告文件名：A 还是 B' },
+    observedAt: 1000,
+  })
+  const control = JSON.stringify({
+    type: 'subagent.control',
+    event: { type: 'needs_attention', reason: 'supervisor_request', ts: 1200, currentTool: 'contact_supervisor', toolCallId: 'c1' },
+  })
+  const end = JSON.stringify({
+    type: 'tool_execution_end',
+    toolCallId: 'c1',
+    toolName: 'contact_supervisor',
+    result: { content: [{ type: 'text', text: '**Reply from supervisor:**\nA（用 waiting-report.md）' }] },
+    durationMs: 399349,
+    observedAt: 400000,
+  })
+
+  const { control: seen, ask } = parseRunEventsTail([call, control, end].join('\n'))
+  assert.equal(seen.reason, 'supervisor_request')
+  assert.equal(seen.currentTool, 'contact_supervisor')
+  assert.equal(ask.question, '请选择报告文件名：A 还是 B')
+  assert.equal(ask.reason, 'need_decision')
+  assert.equal(ask.askedAt, 1000)
+  assert.equal(ask.answer, 'A（用 waiting-report.md）')
+  assert.equal(ask.answeredAt, 400000)
+  assert.equal(ask.durationMs, 399349)
+})
+
+test('parseRunEventsTail: 还没回答时 answer 留空；坏行不影响后面的行', () => {
+  const call = JSON.stringify({
+    type: 'tool_execution_start',
+    toolCallId: 'c2',
+    toolName: 'contact_supervisor',
+    args: { message: '等一个答案' },
+    observedAt: 2000,
+  })
+  const { ask } = parseRunEventsTail([call, 'not json', '{"type":', '{"type":"turn_end"}'].join('\n'))
+  assert.equal(ask.question, '等一个答案')
+  assert.equal(ask.answer, '')
+  assert.equal(ask.answeredAt, null)
+})
+
+test('parseRunEventsTail: 空文本 / 不完整的一行 → 空结果，不抛错', () => {
+  assert.deepEqual(parseRunEventsTail(''), { control: null, ask: null })
+  assert.equal(parseRunEventsTail('{"type":"message_start"').control, null)
+})
+
+test('readRunEvents: 控制事件压在几十 KB 后面也读得到，且第二次命中缓存', () => {
+  clearRunEventsCache()
+  const filler = Array.from({ length: 400 }, (_, i) =>
+    JSON.stringify({ type: 'tool_execution_update', i, pad: 'x'.repeat(180) }),
+  ).join('\n')
+  const dir = tmpRunDir({ 'events.jsonl': `${filler}\n${IDLE_CONTROL}\n` })
+  const events = readRunEvents(dir)
+  assert.equal(events?.control?.reason, 'idle')
+  assert.equal(readRunEvents(dir), events, 'mtime/size 没变就直接给同一个对象')
+})
+
+test('readRunEvents: 目录里没有 events.jsonl → null（老 run 不该报错）', () => {
+  assert.equal(readRunEvents(tmpRunDir({})), null)
+  assert.equal(readRunEvents(''), null)
+})
+
+test('readRunSnapshot: 续跑 run 没有超时保护，且带出真实 lastActivityAt（报告 P18）', () => {
+  clearRunSnapshotCache()
+  const fresh = tmpRunDir({
+    'status.json': JSON.stringify({
+      runId: 'fresh',
+      state: 'running',
+      timeoutMs: 1_800_000,
+      deadlineAt: 1794120000000,
+      lastActivityAt: 1794119990000,
+      steps: [{ status: 'running', activityState: 'active_long_running' }],
+    }),
+  })
+  const snap = readRunSnapshot(fresh)
+  assert.equal(snap.hasDeadline, true)
+  assert.equal(snap.lastActivityAt, 1794119990000)
+  assert.equal(snap.currentTool, '')
+
+  // 实测 3 个续跑 run 全都没有 deadlineAt / timeoutMs
+  const resumed = tmpRunDir({
+    'status.json': JSON.stringify({
+      runId: 'resumed',
+      state: 'running',
+      revivedFrom: 'origin',
+      steps: [{ status: 'running', activityState: 'needs_attention', currentTool: 'contact_supervisor' }],
+    }),
+  })
+  const snap2 = readRunSnapshot(resumed)
+  assert.equal(snap2.hasDeadline, false)
+  assert.equal(snap2.currentTool, 'contact_supervisor', '需要关注时它说明到底是不是在等人回答')
+})
+
+test('isProcessAlive: 活着/死了/不知道，三种都要分对', () => {
+  assert.equal(isProcessAlive(process.pid), true, '自己的 pid 当然活着')
+  // 真起一个子进程再让它退出：比随便猜一个数字稳（pid 是会被系统复用的）
+  const child = spawnSync(process.execPath, ['-e', ''], { stdio: 'ignore' })
+  assert.equal(isProcessAlive(child.pid), false, '已经退出的 pid 必须判死')
+  assert.equal(isProcessAlive(null), true, '没有 pid 时不能瞎判死')
+  assert.equal(isProcessAlive(0), true)
+})
+
+test('readRunSnapshot: 带出 pid 与 lastUpdate（判断进程死活的唯一依据）', () => {
+  const dir = tmpRunDir({
+    'status.json': JSON.stringify({
+      runId: 'run-1',
+      state: 'running',
+      pid: 4242,
+      lastUpdate: 1794123328285,
+      steps: [{ agent: 'worker' }],
+    }),
+  })
+  const snap = readRunSnapshot(dir)
+  assert.equal(snap.pid, 4242)
+  assert.equal(snap.lastUpdate, 1794123328285)
+})
+
+/* ---------- launch 描述符：resume 的「预约单」 ---------- */
+
+/** 造一份实测形状的 runs 根目录：`<tmp>/async-subagent-runs/<runId>` + 同级 launches */
+function tmpRunsRoot() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'board-launch-'))
+  fs.mkdirSync(path.join(root, 'async-subagent-runs'), { recursive: true })
+  fs.mkdirSync(path.join(root, 'async-subagent-launches'), { recursive: true })
+  return root
+}
+
+/** @param {string} root @param {string} runId @param {Record<string, unknown>} descriptor */
+function writeDescriptor(root, runId, descriptor) {
+  const dir = path.join(root, 'async-subagent-launches', runId)
+  fs.mkdirSync(dir, { recursive: true })
+  fs.writeFileSync(path.join(dir, 'recovery-descriptor.json'), JSON.stringify(descriptor))
+  return dir
+}
+
+test('launchDescriptorPath: asyncDir 是 <runsRoot>/async-subagent-runs/<runId>，launches 是它的兄弟目录', () => {
+  const asyncDir = path.join('C:', 'tmp', 'runs', 'async-subagent-runs', 'abc-123')
+  assert.equal(
+    launchDescriptorPath(asyncDir),
+    path.join('C:', 'tmp', 'runs', 'async-subagent-launches', 'abc-123', 'recovery-descriptor.json'),
+  )
+  assert.equal(launchDescriptorPath(''), '')
+})
+
+test('runIdFromSessionFile: 从子会话路径取出 runId，形状不对给空串', () => {
+  // 用 fromCharCode 拼反斜杠：heredoc 会把 `\\` 吃掉，直接写会变成 `//`
+  const win = ['C:', 'sessions', 'parent', '8bdba4a7-5310', 'run-0', 'session.jsonl'].join(String.fromCharCode(92))
+  assert.equal(runIdFromSessionFile(win), '8bdba4a7-5310')
+  assert.equal(runIdFromSessionFile('/home/u/sessions/6dec8284-4058/run-2/session.jsonl'), '6dec8284-4058')
+  assert.equal(runIdFromSessionFile('/home/u/sessions/session.jsonl'), '')
+  assert.equal(runIdFromSessionFile(''), '')
+})
+
+test('resumeSourceOf: 描述符指向别人的会话文件 = 续跑；指向自己的 = 普通 run', () => {
+  clearLaunchCache()
+  const root = tmpRunsRoot()
+  const resumeId = 'bc779a16-fed5-4afc-9530-526077153ec9'
+  const originId = '6dec8284-4058-456c-ae66-df2da5922efa'
+  const shared = path.join(root, 'sessions', originId, 'run-0', 'session.jsonl')
+
+  // 实测形状：bc779a16 的描述符 sessionFile 指向 6dec8284 的会话文件
+  writeDescriptor(root, resumeId, { sourceRunId: resumeId, sessionFile: shared })
+  const resumed = resumeSourceOf(path.join(root, 'async-subagent-runs', resumeId), resumeId)
+  assert.deepEqual(resumed, { sessionFile: shared, sourceRunId: originId })
+
+  const plainId = 'cfdcee75-cefb-4a11-97a5-0f2aa4241801'
+  const own = path.join(root, 'sessions', plainId, 'run-0', 'session.jsonl')
+  writeDescriptor(root, plainId, { sourceRunId: plainId, sessionFile: own })
+  assert.equal(
+    resumeSourceOf(path.join(root, 'async-subagent-runs', plainId), plainId),
+    null,
+    '普通 run 指向自己的新文件，不能当续跑',
+  )
+})
+
+test('readLaunchDescriptor / resumeSourceOf: 没有描述符（老版本或已清理）→ null，退回探测', () => {
+  clearLaunchCache()
+  const root = tmpRunsRoot()
+  const asyncDir = path.join(root, 'async-subagent-runs', 'no-descriptor')
+  assert.equal(readLaunchDescriptor(asyncDir), null)
+  assert.equal(resumeSourceOf(asyncDir, 'no-descriptor'), null)
+  assert.equal(resumeSourceOf('', 'x'), null)
+})
+
+test('launchKindOf: 描述符指向自己=plain，指向别人=resume，没有描述符=unknown', () => {
+  clearLaunchCache()
+  const root = tmpRunsRoot()
+  const plainId = 'cfdcee75-cefb-4a11-97a5-0f2aa4241801'
+  writeDescriptor(root, plainId, { sessionFile: path.join(root, 's', plainId, 'run-0', 'session.jsonl') })
+  assert.equal(launchKindOf(path.join(root, 'async-subagent-runs', plainId), plainId), 'plain')
+
+  const resumeId = 'bc779a16-fed5-4afc-9530-526077153ec9'
+  writeDescriptor(root, resumeId, { sessionFile: path.join(root, 's', '6dec8284-4058', 'run-0', 'session.jsonl') })
+  assert.equal(launchKindOf(path.join(root, 'async-subagent-runs', resumeId), resumeId), 'resume')
+
+  assert.equal(launchKindOf(path.join(root, 'async-subagent-runs', 'none'), 'none'), 'unknown')
+  assert.equal(launchKindOf('', 'x'), 'unknown')
+})
+
+/* ---------- 任务原文：比 status.json 早二十秒的那一份 ---------- */
+
+/** @param {string} runDir @param {Array<Record<string, unknown>>} events */
+function writeRunEvents(runDir, events) {
+  fs.mkdirSync(runDir, { recursive: true })
+  fs.writeFileSync(path.join(runDir, 'events.jsonl'), events.map((event) => JSON.stringify(event)).join('\n') + '\n')
+}
+
+/** @param {string} text */
+const userMessage = (text) => ({
+  type: 'message_start',
+  message: { role: 'user', content: [{ type: 'text', text }] },
+})
+
+test('readRunTaskText: 跳过 system，取第一条 user 消息的首行并去掉 Task: 前缀', () => {
+  clearTaskTextCache()
+  const root = tmpRunsRoot()
+  const dir = path.join(root, 'async-subagent-runs', 'run-a')
+  writeRunEvents(dir, [
+    { type: 'subagent.run.started', runId: 'run-a' },
+    { type: 'session_info_changed', name: 'subagent-delegate-run-a-1' },
+    { type: 'message_start', message: { role: 'system', content: 'SYSTEM PROMPT' } },
+    userMessage('Task: 这是一次子代理功能测试，不要做任何实际的活。\n\n步骤：\n1. 用 bash 执行 sleep 15。'),
+  ])
+  assert.equal(readRunTaskText(dir), '这是一次子代理功能测试，不要做任何实际的活。')
+})
+
+test('readRunTaskText: 复活提示语不是任务 → 空串（交给原 run 的标题）', () => {
+  clearTaskTextCache()
+  const root = tmpRunsRoot()
+  const dir = path.join(root, 'async-subagent-runs', 'run-r')
+  writeRunEvents(dir, [
+    userMessage('Task: You are reviving a previous subagent conversation.\n\nOriginal run: 3dc1a318'),
+  ])
+  assert.equal(readRunTaskText(dir), '')
+})
+
+test('readRunTaskText: 没有事件文件、只有 system 消息、或空目录 → 空串', () => {
+  clearTaskTextCache()
+  const root = tmpRunsRoot()
+  assert.equal(readRunTaskText(path.join(root, 'async-subagent-runs', 'missing')), '')
+  assert.equal(readRunTaskText(''), '')
+
+  const sys = path.join(root, 'async-subagent-runs', 'only-system')
+  writeRunEvents(sys, [{ type: 'message_start', message: { role: 'system', content: 'S' } }])
+  assert.equal(readRunTaskText(sys), '')
+})
+
+test('readRunTaskText: 首帧还没有 user 消息时不缓存空结果——文件增长后能读到', () => {
+  clearTaskTextCache()
+  const root = tmpRunsRoot()
+  const dir = path.join(root, 'async-subagent-runs', 'run-grow')
+  writeRunEvents(dir, [{ type: 'subagent.run.started', runId: 'run-grow' }])
+  assert.equal(readRunTaskText(dir), '')
+
+  // 真实现场：run 起来 1~2 秒后才写进第一条 user 消息
+  fs.appendFileSync(path.join(dir, 'events.jsonl'), JSON.stringify(userMessage('Task: 【单链测试】工作目录: C:/w')) + '\n')
+  assert.equal(readRunTaskText(dir), '【单链测试】工作目录: C:/w')
 })

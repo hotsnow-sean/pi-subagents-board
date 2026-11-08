@@ -20,7 +20,12 @@ function source(overrides = {}) {
 test('没有状态文件 → no-data', () => {
   const result = describeDegrade(null, { alive: false, ageMs: null }, NOW)
   assert.equal(result.kind, 'no-data')
+  // 空态标记：没派过子代理是正常状态，面板该画虚线占位而不是警示横幅
+  assert.equal(result.asEmpty, true)
   assert.match(result.detail, /派过子代理/)
+  // 诊断提示单独一行（断行用），不挤进主说明
+  assert.match(result.hint, /worker/)
+  assert.doesNotMatch(result.detail, /worker/)
 })
 
 test('RPC 没连上 → rpc-unavailable，带上尝试次数与错误', () => {

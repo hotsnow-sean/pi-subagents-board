@@ -4,6 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { pathToFileURL } from 'node:url'
+import { spawnSync } from 'node:child_process'
 
 import { applyComplete, applyStarted, createState } from '../lib/lineage.mjs'
 import { ensureLiveDir, liveFileOf, writeJsonAtomic } from '../lib/live-store.mjs'
@@ -73,6 +74,8 @@ test('getState: 没有会话时给出可渲染的 no-session，而不是空对�
   const state = await api.invoke('getState', { sessionFile: '' })
   assert.equal(state.ok, true)
   assert.equal(state.degrade.kind, 'no-session')
+  // 空态而非警示：渲染层据此画虚线框，而不是左侧带色条的横幅
+  assert.equal(state.degrade.asEmpty, true)
   assert.deepEqual(state.lineages, [])
 })
 
@@ -620,6 +623,163 @@ test('getState: workflow 容器认领各步骤的 run，并把子卡排在父卡
   assert.equal(got.lineages[2].segments[0].stepOf, 'run-p')
 })
 
+test('getState: resume 段与源段共用同一份会话时，链尾照样有「打开」（openState=ok）', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
+  const sessionFile = path.join(dataDir, 'sessions', 'resume.jsonl')
+  const sessionKey = sessionKeyOf(sessionFile)
+  const startedAt = Date.now() - 5_000
+  const state = createState({ sessionKey, sessionFile, pid: 11, startedAt })
+  const shared = path.join(dataDir, 'child', 'run-0', 'session.jsonl')
+  fs.mkdirSync(path.dirname(shared), { recursive: true })
+  fs.writeFileSync(shared, '{}')
+
+  const first = applyStarted(state, { id: 'run-1', agent: 'delegate' }, startedAt + 100)
+  first.segment.childSessionFile = shared
+  applyComplete(
+    state,
+    { id: 'run-1', sessionFile: shared, state: 'complete', success: true, timestamp: startedAt + 1_000, durationMs: 900 },
+    startedAt + 1_000,
+  )
+  // resume：新 runId，复用同一份子会话文件；complete 靠 sessionFile 接回原链
+  applyStarted(state, { id: 'run-2', agent: 'delegate' }, startedAt + 2_000)
+  applyComplete(
+    state,
+    { id: 'run-2', sessionFile: shared, state: 'complete', success: true, timestamp: startedAt + 3_000, durationMs: 1_000 },
+    startedAt + 3_000,
+  )
+  assert.equal(state.lineages.length, 1, '先确认这两段已经在同一条链上')
+
+  state.source.rpc = true
+  state.source.mode = 'push'
+  state.updatedAt = Date.now()
+  ensureLiveDir(dataDir)
+  writeJsonAtomic(liveFileOf(dataDir, { sessionKey, pid: 11, startedAt }), state)
+
+  const mod = await loadMain()
+  const api = await mod.activate(fakeCtx(dataDir))
+  const got = await api.invoke('getState', { sessionFile })
+  const byId = Object.fromEntries(got.lineages.flatMap((lineage) => lineage.segments).map((seg) => [seg.runId, seg]))
+
+  assert.equal(got.lineages.length, 1, 'resume 之后仍然只有一张卡')
+  assert.equal(byId['run-2'].openState, 'ok', '同一条链共用的会话不是「别人的」，必须给入口')
+  assert.equal(byId['run-2'].openShared, true, 'UI 要靠它说明「这几次共用一份会话」')
+  assert.equal(byId['run-2'].openTarget, shared)
+  assert.equal(byId['run-2'].revivedFrom, 'run-1')
+})
+
+test('getState: live 文件里的历史孤链会在读侧认回来源链（relinked）', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
+  const sessionFile = path.join(dataDir, 'sessions', 'orphan.jsonl')
+  const sessionKey = sessionKeyOf(sessionFile)
+  const startedAt = Date.now() - 5_000
+  const state = createState({ sessionKey, sessionFile, pid: 13, startedAt })
+  applyStarted(state, { id: 'run-1', agent: 'worker' }, startedAt + 100)
+  // 手工造出「resume 中途重启」留下的形状：段记着 revivedFrom，却自成一链
+  const orphan = applyStarted(state, { id: 'run-2', agent: 'worker' }, startedAt + 200)
+  const own = state.lineages.find((lineage) => lineage.lineageRoot === 'run-2')
+  state.lineages = state.lineages.filter((lineage) => lineage !== own)
+  const lonely = {
+    lineageRoot: 'run-2',
+    agent: 'worker',
+    lastActivityAt: startedAt + 200,
+    state: 'running',
+    segments: [orphan.segment],
+  }
+  orphan.segment.revivedFrom = 'run-1'
+  state.lineages.push(lonely)
+
+  state.source.rpc = true
+  state.source.mode = 'push'
+  state.updatedAt = Date.now()
+  ensureLiveDir(dataDir)
+  writeJsonAtomic(liveFileOf(dataDir, { sessionKey, pid: 13, startedAt }), state)
+  // 第二代也写一份（同样的孤链形状）：这样每轮 getState 都要跨代合并、重算一次接链，
+  // 才能复现「搬完不落盘、下一轮再搬」的真实路径（单代会被读缓存挡住，看不出问题）。
+  const state2 = createState({ sessionKey, sessionFile, pid: 16, startedAt: startedAt + 50 })
+  applyStarted(state2, { id: 'run-1', agent: 'worker' }, startedAt + 100)
+  const orphan2 = applyStarted(state2, { id: 'run-2', agent: 'worker' }, startedAt + 200)
+  state2.lineages = state2.lineages.filter((lineage) => lineage.lineageRoot !== 'run-2')
+  orphan2.segment.revivedFrom = 'run-1'
+  state2.lineages.push({
+    lineageRoot: 'run-2',
+    agent: 'worker',
+    lastActivityAt: startedAt + 200,
+    state: 'running',
+    segments: [orphan2.segment],
+  })
+  state2.source.rpc = true
+  state2.source.mode = 'push'
+  state2.updatedAt = Date.now()
+  writeJsonAtomic(liveFileOf(dataDir, { sessionKey, pid: 16, startedAt: startedAt + 50 }), state2)
+
+  const mod = await loadMain()
+  const api = await mod.activate(fakeCtx(dataDir))
+  const got = await api.invoke('getState', { sessionFile })
+
+  assert.equal(got.relinked, 1, '孤链应被并回来源链，只剩一张卡')
+  assert.deepEqual(got.lineages[0].segments.map((segment) => segment.runId), ['run-1', 'run-2'])
+
+  // 第二次读同一份数据：搬的还是同样那一段（live 文件没被改写），但**不能算新变化**。
+  // 否则 `rev` 每轮都变 → 长轮询立刻返回 → 下一轮又搬 → 0 延迟死循环（实测刷爆日志）。
+  const again = await api.invoke('getState', { sessionFile })
+  assert.equal(again.lineages.length, 1)
+  assert.equal(again.relinked, 1, '每轮都得搬（不搬这一帧就会多出一张卡）')
+  assert.equal(again.rev, got.rev, '重复自愈不该推动版本戳')
+})
+
+test('getState: 自愈搬动的段集合变化时才推版本戳（新孤段要立刻可见）', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
+  const sessionFile = path.join(dataDir, 'sessions', 'orphan2.jsonl')
+  const sessionKey = sessionKeyOf(sessionFile)
+  const startedAt = Date.now() - 5_000
+  const state = createState({ sessionKey, sessionFile, pid: 14, startedAt })
+  applyStarted(state, { id: 'run-1', agent: 'worker' }, startedAt + 100)
+  const orphan = applyStarted(state, { id: 'run-2', agent: 'worker' }, startedAt + 200)
+  state.lineages = state.lineages.filter((lineage) => lineage.lineageRoot !== 'run-2')
+  orphan.segment.revivedFrom = 'run-1'
+  state.lineages.push({
+    lineageRoot: 'run-2',
+    agent: 'worker',
+    lastActivityAt: startedAt + 200,
+    state: 'running',
+    segments: [orphan.segment],
+  })
+  state.source.rpc = true
+  state.source.mode = 'push'
+  state.updatedAt = Date.now()
+  ensureLiveDir(dataDir)
+  const livePath = liveFileOf(dataDir, { sessionKey, pid: 14, startedAt })
+  writeJsonAtomic(livePath, state)
+
+  const mod = await loadMain()
+  const api = await mod.activate(fakeCtx(dataDir))
+  const first = await api.invoke('getState', { sessionFile })
+
+  // 再来一段孤链（模拟又一次 resume 中途重启）：集合变了，版本戳必须前进
+  const snapshot = JSON.parse(fs.readFileSync(livePath, 'utf8'))
+  const state2 = createState({ sessionKey, sessionFile, pid: 14, startedAt })
+  state2.lineages = snapshot.lineages
+  const third = applyStarted(state2, { id: 'run-3', agent: 'worker' }, startedAt + 300)
+  state2.lineages = state2.lineages.filter((lineage) => lineage.lineageRoot !== 'run-3')
+  third.segment.revivedFrom = 'run-1'
+  state2.lineages.push({
+    lineageRoot: 'run-3',
+    agent: 'worker',
+    lastActivityAt: startedAt + 300,
+    state: 'running',
+    segments: [third.segment],
+  })
+  state2.source.rpc = true
+  state2.source.mode = 'push'
+  state2.updatedAt = Date.now()
+  writeJsonAtomic(livePath, state2)
+
+  const second = await api.invoke('getState', { sessionFile })
+  assert.equal(second.lineages.length, 1)
+  assert.equal(second.relinked, 2)
+  assert.notEqual(second.rev, first.rev, '新孤段进来时版本戳要变，长轮询才能立刻醒')
+})
+
 test('activate: 清理隔夜的留言与回执（昨天留的言不该在开机时突然起一轮）', async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
   const inboxDir = path.join(dataDir, 'inbox', 'abcdef123456')
@@ -638,4 +798,48 @@ test('activate: 清理隔夜的留言与回执（昨天留的言不该在开机�
   await mod.activate(fakeCtx(dataDir))
   assert.equal(fs.existsSync(oldNote), false)
   assert.equal(fs.existsSync(oldReceipt), false)
+})
+
+test('getState: 应用重启带走了 runner 进程，卡片判成「已中断」且不再给停止按钮', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
+  const sessionFile = path.join(dataDir, 'sessions', 'dead.jsonl')
+  const sessionKey = sessionKeyOf(sessionFile)
+  const runDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-run-'))
+  // 真起一个子进程再让它退出：拿到的 pid 确定已经死了（瞎猜数字会被系统复用打脸）
+  const child = spawnSync(process.execPath, ['-e', ''], { stdio: 'ignore' })
+  const now = Date.now()
+  fs.writeFileSync(
+    path.join(runDir, 'status.json'),
+    JSON.stringify({
+      runId: 'run-dead',
+      state: 'running',
+      pid: child.pid,
+      startedAt: now - 60_000,
+      lastUpdate: now - 1_000,
+      mode: 'single',
+      steps: [{ agent: 'worker' }],
+    }),
+  )
+
+  const state = createState({ sessionKey, sessionFile, pid: 77, startedAt: now - 5_000 })
+  applyStarted(state, { id: 'run-dead', agent: 'worker', asyncDir: runDir }, now - 4_000)
+  state.source.rpc = true
+  state.source.mode = 'push'
+  state.source.capabilities = ['steer', 'stop']
+  state.source.supports = { steer: true, stop: true }
+  state.updatedAt = now
+  ensureLiveDir(dataDir)
+  writeJsonAtomic(liveFileOf(dataDir, { sessionKey, pid: 77, startedAt: now - 5_000 }), state)
+
+  const mod = await loadMain()
+  const api = await mod.activate(fakeCtx(dataDir))
+  const got = await api.invoke('getState', { sessionFile })
+  const segment = got.lineages[0].segments[0]
+
+  assert.equal(segment.state, 'lost', '进程没了还要显示运行中，用户会一直等一张永远不会动的卡')
+  assert.equal(segment.lostPid, child.pid)
+  assert.equal(segment.endedAt, now - 1_000, '结束时间取 status 的最后一次写盘')
+  assert.equal(segment.canStop, false, '停止按钮必须消失：点了也没有进程接')
+  assert.equal(segment.canSteer, false)
+  assert.equal(got.activeCount, 0)
 })
