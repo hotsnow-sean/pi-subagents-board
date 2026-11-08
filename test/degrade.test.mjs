@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { describeDegrade, formatAge } from '../lib/degrade.mjs'
+import { describeDegrade } from '../lib/degrade.mjs'
 
 const NOW = 1_700_000_000_000
 const ALIVE = { alive: true, ageMs: 500, updatedAt: NOW - 500 }
@@ -37,10 +37,20 @@ test('RPC 没连上 → rpc-unavailable，带上尝试次数与错误', () => {
   assert.match(result.detail, /ping 无回复/)
 })
 
-test('心跳过期 → stale，并说明最后一次更新在多久前', () => {
+test('心跳过期 → stale，但不再弹横幅（这条提示已下线）', () => {
+  // 用户的判断：面对的自始至终是同一个会话，这条提示既给不出动作，又会在会话绑上
+  // 新 worker 时自己消失、把卡片顶上去。所以只保留 kind，不留 title/detail。
   const result = describeDegrade({ source: source() }, { alive: false, ageMs: 90_000, updatedAt: NOW - 90_000 }, NOW)
   assert.equal(result.kind, 'stale')
-  assert.match(result.detail, /1 分钟/)
+  assert.equal(result.title, '', '渲染层按「有没有标题」决定画不画横幅')
+  assert.equal(result.detail, '')
+  assert.equal(result.tone, 'ok')
+})
+
+test('心跳过期时不冒充「轮询模式」：实例都退了，说「正在每秒读一次」是假话', () => {
+  const result = describeDegrade({ source: source({ mode: 'poll' }) }, { alive: false, ageMs: 90_000 }, NOW)
+  assert.equal(result.kind, 'stale')
+  assert.equal(result.title, '')
 })
 
 test('只剩归档（livePartitions: 0）→ archived：不报警，也不占一行横幅', () => {
@@ -68,12 +78,4 @@ test('轮询模式 → poll，文案说明「慢一拍」', () => {
 test('一切正常 → ok', () => {
   const result = describeDegrade({ source: source() }, ALIVE, NOW)
   assert.equal(result.kind, 'ok')
-})
-
-test('formatAge: 秒 / 分钟 / 小时 / 天', () => {
-  assert.equal(formatAge(300), '刚刚')
-  assert.equal(formatAge(5_000), '5 秒')
-  assert.equal(formatAge(120_000), '2 分钟')
-  assert.equal(formatAge(3 * 3600_000), '3 小时')
-  assert.equal(formatAge(2 * 24 * 3600_000), '2 天')
 })

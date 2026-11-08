@@ -131,7 +131,7 @@ test('getState: 读到 live 文件并组装出链、活跃数与降级判定', a
   assert.ok(state.dataFile.endsWith('.json'))
 })
 
-test('getState: 心跳过期时 degrade 变 stale，数据照常返回', async () => {
+test('getState: 心跳过期时 degrade 变 stale，数据照常返回，但不给横幅', async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
   const sessionFile = path.join(dataDir, 'sessions', 'b.jsonl')
   seedLive(dataDir, sessionFile)
@@ -145,6 +145,7 @@ test('getState: 心跳过期时 degrade 变 stale，数据照常返回', async (
   }
   const state = await api.invoke('getState', { sessionFile })
   assert.equal(state.degrade.kind, 'stale')
+  assert.equal(state.degrade.title, '', '陈旧数据不再画横幅')
   assert.equal(state.liveness.alive, false)
   assert.equal(state.lineages.length, 1, '陈旧也要把最后一次快照给出去')
 })

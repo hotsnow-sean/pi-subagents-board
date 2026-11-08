@@ -1230,13 +1230,14 @@ function renderBanner(degrade) {
  * 空态。分成两种语气：
  *   - `asEmpty`（没打开会话 / 还没运行记录）：这里**暂时没东西**，是正常状态，
  *     画虚线框就行——横幅带左侧色条，是「有事要你注意」的语气，用在这里太重。
- *   - `kind: 'ok'` 但列表为空：数据链路是通的，只是这个会话还没派过子代理。
+ *   - 列表为空但数据链路是通的：这个会话还没派过子代理。
  *
- * 其余 kind（连不上 / 数据过期 / 插件卸载中）仍然走横幅：那些是**真问题**，
- * 该被注意到。
+ * 有横幅就不画空态（两者说的是同一件事，叠起来只会更吵）。判据与 `renderBanner`
+ * 一致——按「有没有标题」而不是枚举 kind：`ok` / `archived` / `stale` 都是静默态，
+ * 不给它们横幅，也就不该因此吞掉本该出现的空态框。
  */
 function renderEmpty(degrade) {
-  if (degrade && degrade.kind !== 'ok' && !degrade.asEmpty) return ''
+  if (degrade && degrade.title && !degrade.asEmpty) return ''
   const title = degrade?.asEmpty ? degrade.title : '还没有子代理运行记录'
   const detail = degrade?.asEmpty
     ? degrade.detail
