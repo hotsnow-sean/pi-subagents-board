@@ -163,6 +163,28 @@ test('archiveSessions: 闲置但 pid 还活着的分区不搬（安静的长会�
   assert.deepEqual(archiveSessions(dir, { now, isAlive: () => false }), { archived: 1, files: 1 })
 })
 
+test('archiveSessions: 归档记住 sessionFile——装订后「返回主会话」还得有落点', () => {
+  const dir = tmpDir()
+  const now = Date.now()
+  const old = new Date(now - ARCHIVE_IDLE_MS - 60_000)
+  const main = 'C:/sessions/parent-main.jsonl'
+  const a = liveFileOf(dir, { sessionKey: 'k1', pid: 1, startedAt: 100 })
+  writeJsonAtomic(a, { ...stateOf('k1', 100, 'run-a'), sessionFile: main })
+  fs.utimesSync(a, old, old)
+  archiveSessions(dir, { now })
+  const archived = () => readLiveFiles(dir, 'k1').find((item) => item.kind === 'archive')?.state
+  assert.equal(archived()?.sessionFile, main)
+
+  // 第二次装订：新那份分区没带 sessionFile（老版本写的），已有的不能丢
+  const b = liveFileOf(dir, { sessionKey: 'k1', pid: 2, startedAt: 200 })
+  const noPath = stateOf('k1', 200, 'run-b')
+  delete noPath.sessionFile
+  writeJsonAtomic(b, noPath)
+  fs.utimesSync(b, old, old)
+  archiveSessions(dir, { now })
+  assert.equal(archived()?.sessionFile, main, '后写的分区没路径时沿用归档里那份')
+})
+
 test('archiveSessions: 二次装订会并进已有的归档，不会丢前一次的段', () => {
   const dir = tmpDir()
   const now = Date.now()

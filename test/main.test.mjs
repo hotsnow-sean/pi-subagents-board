@@ -971,3 +971,77 @@ test('getState: 只剩归档的会话不报「未连上 pi-subagents」，历史
   assert.equal(state.degrade.kind, 'archived')
   assert.equal(state.degrade.title, '', '归档没有 source，不能拿它判「没连上」')
 })
+
+test('getState: 孤段每轮都得搬，但只在孤段集合变化时推唤醒（0.11.1）', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
+  const sessionFile = path.join(dataDir, 'sessions', 'orphan.jsonl')
+  const sessionKey = sessionKeyOf(sessionFile)
+  const now = Date.now()
+
+  // 来源段在归档里（实例早就下班了，这份文件永远不会被重写）
+  writeJsonAtomic(archiveFileOf(dataDir, sessionKey), {
+    version: 2,
+    sessionKey,
+    sessionFile,
+    startedAt: 0,
+    updatedAt: now,
+    lineages: [
+      {
+        lineageRoot: 'run-a',
+        agent: 'worker',
+        segments: [{ runId: 'run-a', agent: 'worker', state: 'complete', startedAt: now - 60_000, endedAt: now - 50_000 }],
+      },
+    ],
+  })
+  // 续跑段在活跃分区里，且没接回原链（resume 中途重启的老形状）
+  const state = createState({ sessionKey, sessionFile, pid: 7, startedAt: now - 10_000 })
+  const started = applyStarted(state, { id: 'run-b', agent: 'worker', cwd: 'C:/w' }, now - 9_000)
+  started.segment.revivedFrom = 'run-a'
+  started.segment.state = 'complete'
+  started.segment.endedAt = now - 8_000
+  state.updatedAt = now
+  writeJsonAtomic(liveFileOf(dataDir, { sessionKey, pid: 7, startedAt: state.startedAt }), state)
+
+  const mod = await loadMain()
+  const ctx = fakeCtx(dataDir)
+  const api = await mod.activate(ctx)
+  const relinkLogs = () => ctx.logs.filter((line) => line.includes('relinked')).length
+
+  const first = await api.invoke('getState', { sessionFile })
+  assert.deepEqual(
+    first.lineages[0].segments.map((segment) => segment.runId),
+    ['run-a', 'run-b'],
+    '孤段要搬回原链',
+  )
+  const afterFirst = relinkLogs()
+  await api.invoke('getState', { sessionFile })
+  await api.invoke('getState', { sessionFile })
+  assert.equal(relinkLogs(), afterFirst, '同一批孤段重复搬不该再推唤醒（否则长轮询 0 延迟空转）')
+
+  // 磁盘上的分区被重写成「已接回原链」的形状：这一轮没有孤段可搬
+  const linked = {
+    ...state,
+    lineages: [
+      {
+        lineageRoot: 'run-a',
+        agent: 'worker',
+        segments: [
+          { runId: 'run-a', agent: 'worker', state: 'complete', startedAt: now - 60_000, endedAt: now - 50_000 },
+          { runId: 'run-b', agent: 'worker', state: 'complete', startedAt: now - 9_000, endedAt: now - 8_000 },
+        ],
+      },
+    ],
+  }
+  writeJsonAtomic(liveFileOf(dataDir, { sessionKey, pid: 7, startedAt: state.startedAt }), linked)
+  await api.invoke('getState', { sessionFile })
+  assert.equal(relinkLogs(), afterFirst, '没有孤段时不该有日志')
+
+  // 又回到孤链形状（老版本的 worker 会这么写）：集合重新出现，这次必须再推一次唤醒
+  writeJsonAtomic(liveFileOf(dataDir, { sessionKey, pid: 7, startedAt: state.startedAt }), state)
+  const back = await api.invoke('getState', { sessionFile })
+  assert.deepEqual(
+    back.lineages[0].segments.map((segment) => segment.runId),
+    ['run-a', 'run-b'],
+  )
+  assert.equal(relinkLogs(), afterFirst + 1, '签名要先归零，否则同一批孤段再出现就永远推不动了')
+})

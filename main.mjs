@@ -703,12 +703,17 @@ function stateFor(sessionFile) {
     adoptRevivedFromSnapshots(state, readRunSnapshot)
     // 先记下「这次要搬哪些段」，搬完再比对：签名没变就说明只是把上一帧已经搬过的
     // 又搬了一遍（live 文件没被改写），不该再推 `lastHealAt`——否则长轮询永不休眠。
+    //
+    // 签名**只跟孤段集合走**，不由「本轮有没有搬」决定。接链是内存态，磁盘上那份分区
+    // 还是孤的、归档更永远不会被重写，所以同一批孤段会一轮轮地搬；用「本轮没搬就清空」
+    // 的写法，两个面板实例轮流调（中心视图 + 右栏）就会各推一次唤醒。
     const pendingOrphans = orphanCandidates(state)
+    const relinkSigNow = pendingOrphans.length ? `${sessionKey}|${pendingOrphans.join(',')}` : ''
     relinked = relinkOrphans(state)
-    if (relinked) {
-      const sig = `${sessionKey}|${pendingOrphans.join(',')}`
-      if (sig !== relinkSig) {
-        relinkSig = sig
+    if (relinkSigNow !== relinkSig) {
+      relinkSig = relinkSigNow
+      // 集合变空不推唤醒；真的搬动了才推（内存态修正要让挂起的请求立刻看见）
+      if (relinked) {
         lastHealAt = Date.now()
         try {
           rt?.ctx?.log?.(`relinked ${relinked} orphan segment(s) into their source chain`)
@@ -716,8 +721,6 @@ function stateFor(sessionFile) {
           // 日志失败不影响主流程
         }
       }
-    } else {
-      relinkSig = ''
     }
   }
   const liveness = livenessOf(state)
