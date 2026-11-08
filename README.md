@@ -2,7 +2,11 @@
 
 [pi-app](https://github.com/hotsnow-sean/pi-app) 桌面端插件：在**右栏**看清 [`pi-subagents`](https://www.npmjs.com/package/pi-subagents) 的后台运行。
 
-<img src="docs/shots/panel-workflow.png" width="400" alt="右栏面板：一个 workflow 父卡下面挂着三个子代理，各自的状态与耗时">
+> 需要**带插件宿主**的 pi-app 版本（fork 的 `feat/plugins-core` 分支）。插件系统目前只在
+> 这个 fork 里，上游 [`justhil/pi-app`](https://github.com/justhil/pi-app) 还没有——所以
+> 「设置 → 插件」这一页在官方版里不存在。
+
+<img src="docs/shots/panel.png" width="400" alt="右栏面板：一个 workflow 父卡下面挂着三个子代理（已完成 / 运行中 / 待启动），下方是一张被中断后重试两次的卡">
 
 ## 为什么需要它
 
@@ -59,7 +63,8 @@
 
 ## 依赖
 
-- pi-app 桌面端 `>= 0.7.7`（需要插件的 `agent` 注入、`ctx.sessions.reveal`、会话实时预览）
+- pi-app 桌面端 `>= 0.7.7`，且必须是带插件宿主的那个 fork（插件用到 `agent` 注入、
+  `ctx.sessions.reveal`、会话实时预览三样能力）
 - 宿主里已安装并启用 `pi-subagents` 扩展
 
 > `engines['pi-desktop']` 写的是 `>=0.7.7-0` 而不是 `>=0.7.7`：宿主 fork 版本号带 prerelease

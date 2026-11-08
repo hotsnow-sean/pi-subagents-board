@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 662" width="680" height="662" font-family="'PingFang SC','Microsoft YaHei',system-ui,-apple-system,'Segoe UI',sans-serif">
+  <rect width="680" height="662" fill="#f7f8fa"/>
+
+  <!-- 顶栏 -->
+  <text x="20" y="38" font-size="17" font-weight="600" fill="#1a1f36">子代理</text>
+  <text x="82" y="38" font-size="13" fill="#6b7280">· 本会话</text>
+  <text x="660" y="38" font-size="13" fill="#6b7280" text-anchor="end">2 个在跑</text>
+
+  <!-- 父卡：运行中 -->
+  <rect x="20" y="54" width="640" height="122" rx="12" fill="#ffffff" stroke="#b7e0c4" stroke-width="1.5"/>
+  <rect x="34" y="70" width="24" height="24" rx="7" fill="#ede9fb"/>
+  <path d="M42 77.5 H48.5 M48.5 77.5 V83.5 M48.5 83.5 H42" stroke="#7c6bd6" stroke-width="1.3" fill="none" stroke-linecap="round"/>
+  <rect x="39.5" y="75" width="4.6" height="4.6" rx="1.4" fill="#7c6bd6"/>
+  <rect x="46.2" y="81.2" width="4.6" height="4.6" rx="1.4" fill="#7c6bd6"/>
+  <rect x="39.5" y="86.4" width="4.6" height="4.6" rx="1.4" fill="#7c6bd6"/>
+  <text x="66" y="87" font-size="15" font-weight="600" fill="#1a1f36">workflow · 审查重构</text>
+  <rect x="220" y="72" width="52" height="20" rx="5" fill="#e8f5ec" stroke="#b7e0c4"/>
+  <text x="246" y="86" font-size="11.5" fill="#16803c" text-anchor="middle">运行中</text>
+  <text x="644" y="87" font-size="13" fill="#6b7280" text-anchor="end">1:02</text>
+  <text x="66" y="110" font-size="12.5" fill="#6b7280">3 步 · 1/3 完成 · 1 回合</text>
+  <text x="66" y="140" font-size="14" fill="#1a1f36">串行三步：取数 → 相乘 → 汇总</text>
+
+  <!-- 子卡缩进连接线 -->
+  <path d="M44 176 V424" stroke="#c9d3f0" stroke-width="1.5" fill="none"/>
+  <path d="M44 239 H52" stroke="#c9d3f0" stroke-width="1.5"/>
+  <path d="M44 337 H52" stroke="#c9d3f0" stroke-width="1.5"/>
+  <path d="M44 424 H52" stroke="#c9d3f0" stroke-width="1.5"/>
+
+  <!-- 子卡 1：已完成 -->
+  <rect x="52" y="196" width="608" height="86" rx="10" fill="#ffffff" stroke="#e8e9ed"/>
+  <rect x="66" y="208" width="20" height="20" rx="6" fill="#f2f0fd"/>
+  <path d="M72.5 213.5 H77 M77 213.5 V219 M77 219 H72.5" stroke="#7c6bd6" stroke-width="1.1" fill="none" stroke-linecap="round"/>
+  <rect x="70.6" y="211.4" width="3.8" height="3.8" rx="1.1" fill="#7c6bd6"/>
+  <rect x="75.4" y="217.2" width="3.8" height="3.8" rx="1.1" fill="#7c6bd6"/>
+  <rect x="70.6" y="222.8" width="3.8" height="3.8" rx="1.1" fill="#7c6bd6"/>
+  <text x="94" y="224" font-size="14.5" font-weight="600" fill="#1a1f36">第一步-取数</text>
+  <text x="191" y="224" font-size="12" fill="#6b7280">已完成</text>
+  <text x="644" y="224" font-size="12.5" fill="#6b7280" text-anchor="end">0:50</text>
+  <text x="94" y="244" font-size="12" fill="#6b7280">workflow · kid-1 · 1 回合</text>
+  <text x="94" y="266" font-size="13.5" fill="#1a1f36">读了 12 个文件，提炼出 3 个模块</text>
+
+  <!-- 子卡 2：运行中 -->
+  <rect x="52" y="294" width="608" height="86" rx="10" fill="#ffffff" stroke="#b7e0c4"/>
+  <rect x="66" y="306" width="20" height="20" rx="6" fill="#f2f0fd"/>
+  <path d="M72.5 311.5 H77 M77 311.5 V317 M77 317 H72.5" stroke="#7c6bd6" stroke-width="1.1" fill="none" stroke-linecap="round"/>
+  <rect x="70.6" y="309.4" width="3.8" height="3.8" rx="1.1" fill="#7c6bd6"/>
+  <rect x="75.4" y="315.2" width="3.8" height="3.8" rx="1.1" fill="#7c6bd6"/>
+  <rect x="70.6" y="320.8" width="3.8" height="3.8" rx="1.1" fill="#7c6bd6"/>
+  <text x="94" y="322" font-size="14.5" font-weight="600" fill="#1a1f36">第二步-乘法</text>
+  <text x="191" y="322" font-size="12" fill="#16803c">运行中</text>
+  <text x="644" y="322" font-size="12.5" fill="#6b7280" text-anchor="end">0:12</text>
+  <text x="94" y="342" font-size="12" fill="#6b7280">workflow · kid-2 · 1 回合</text>
+  <text x="94" y="364" font-size="13.5" fill="#1a1f36">正在计算 128 × 64</text>
+
+  <!-- 子卡 3：待启动 -->
+  <rect x="52" y="392" width="608" height="64" rx="10" fill="#fbfbfc" stroke="#dcdfe6" stroke-dasharray="4 4"/>
+  <rect x="66" y="410" width="20" height="20" rx="6" fill="#f4f4f6"/>
+  <path d="M72.5 415.5 H77 M77 415.5 V421 M77 421 H72.5" stroke="#b9bcc6" stroke-width="1.1" fill="none" stroke-linecap="round"/>
+  <rect x="70.6" y="413.4" width="3.8" height="3.8" rx="1.1" fill="#b9bcc6"/>
+  <rect x="75.4" y="419.2" width="3.8" height="3.8" rx="1.1" fill="#b9bcc6"/>
+  <rect x="70.6" y="424.8" width="3.8" height="3.8" rx="1.1" fill="#b9bcc6"/>
+  <text x="94" y="430" font-size="14.5" font-weight="600" fill="#6b7280">第 3 步</text>
+  <text x="162" y="430" font-size="12" fill="#9aa1ae">待启动</text>
+
+  <!-- 卡 2：被中断 + 续跑 -->
+  <rect x="20" y="478" width="640" height="104" rx="12" fill="#ffffff" stroke="#e8e9ed"/>
+  <rect x="34" y="494" width="24" height="24" rx="7" fill="#fdf3e3"/>
+  <path d="M42 501.5 H48.5 M48.5 501.5 V507.5 M48.5 507.5 H42" stroke="#d99427" stroke-width="1.3" fill="none" stroke-linecap="round"/>
+  <rect x="39.5" y="499" width="4.6" height="4.6" rx="1.4" fill="#d99427"/>
+  <rect x="46.2" y="505.2" width="4.6" height="4.6" rx="1.4" fill="#d99427"/>
+  <rect x="39.5" y="510.4" width="4.6" height="4.6" rx="1.4" fill="#d99427"/>
+  <text x="66" y="511" font-size="15" font-weight="600" fill="#1a1f36">reviewer · 检查迁移</text>
+  <rect x="220" y="496" width="52" height="20" rx="5" fill="#fdf3e3" stroke="#f0dcb8"/>
+  <text x="246" y="510" font-size="11.5" fill="#b45309" text-anchor="middle">已中断</text>
+  <rect x="280" y="496" width="46" height="20" rx="5" fill="#f1eefc"/>
+  <text x="303" y="509.5" font-size="11" fill="#6d5bd0" text-anchor="middle">续 ×2</text>
+  <text x="644" y="511" font-size="13" fill="#6b7280" text-anchor="end">3:47</text>
+  <text x="66" y="534" font-size="12.5" fill="#6b7280">reviewer · 2 回合</text>
+  <text x="66" y="562" font-size="14" fill="#1a1f36">runner 进程已退出，没有写终态</text>
+
+  <!-- 诊断折叠 -->
+  <line x1="20" y1="606" x2="660" y2="606" stroke="#e3e5ea" stroke-dasharray="3 5"/>
+  <path d="M21 625 l5 5 l-5 5" stroke="#9aa1ae" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="34" y="635" font-size="12.5" fill="#6b7280">诊断</text>
+</svg>
