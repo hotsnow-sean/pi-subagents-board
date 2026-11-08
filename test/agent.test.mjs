@@ -180,6 +180,28 @@ test('agent: 握手成功后把事件聚合成 live 状态并落盘', async () =
   assert.ok(state.updatedAt > 0, 'updatedAt 是 main 侧判活的依据')
 })
 
+test('agent: 没派过子代理的会话不落盘（live/ 里不留空壳）', async () => {
+  const { dataDir, harness, server } = await boot()
+  await sleep(800)
+  assert.ok(server.pings >= 1, '握手本身是成功的')
+  // 握手成功但一个段都没有：这份文件没有任何消费者——`no-data` 空态本来就是靠
+  // 「没有文件」表达的，写出去只会变成装订也收不走的空壳（isArchivable 要求有段）。
+  assert.equal(readState(dataDir), null, '没派过子代理就不该写盘')
+  assert.deepEqual(listSessionKeys(dataDir), [], '连会话目录都不该建')
+
+  harness.emit('subagent:async-started', {
+    id: 'run-first',
+    agent: 'worker',
+    cwd: 'C:/w',
+    asyncDir: 'C:/tmp/async-first',
+    sessionId: 'C:/sessions/parent.jsonl',
+  })
+  // 没有 launch 描述符 → 判不出是 plain 还是 resume，首帧压 1.2s 的探测窗口
+  await sleep(1_500)
+  assert.ok(readState(dataDir), '派了子代理就要落盘')
+  assert.deepEqual(listSessionKeys(dataDir), [sessionKeyOf('C:/sessions/parent.jsonl')])
+})
+
 test('agent: started 阶段就推导子会话路径，complete 前对话流可点（实测反馈）', async () => {
   const { dataDir, harness } = await boot()
   await sleep(500)

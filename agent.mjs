@@ -139,6 +139,38 @@ export default function subagentsBoard(pi, ctx) {
 
   // ---------- 落盘 ----------
 
+  /**
+   * 这个会话派过子代理吗？
+   *
+   * 每个会话都会有一个 worker，但**大多数会话根本不会用到子代理**。旧行为是握手成功
+   * 就写一份空的 live 文件，于是 `live/` 里堆满「`lineages: []` 的空壳」：面板照样显示
+   * 空态，文件却真实存在，装订又收不走（`isArchivable` 要求有段），只能永久沉淀。
+   * 空壳没有任何消费者——`no-data` 空态本来就是靠「没有文件」表达的。
+   */
+  function hasSegments() {
+    for (const lineage of state.lineages ?? []) {
+      if ((lineage.segments ?? []).length) return true
+    }
+    return false
+  }
+
+  /**
+   * 没有段也该写盘的唯一情形：**有故障要报告**。
+   *
+   * 那正是面板要报的 `rpc-unavailable`（装上与否、版本对不对）或「宿主不支持事件总线」，
+   * 而这些判断只存在于 `source` 里。把它们一起省掉，一个有故障的会话会安安静静显示成
+   * 「还没有子代理运行记录」——比报错更糟。
+   *
+   * 判据只认**已经失败**（`lastError` 有值），不认「正在尝试」：握手的第一次请求发出时
+   * 就会先 flush 一帧记录 attempts，若把 attempts 也算进来，每个会话都会在被证明健康之前
+   * 先落一份空壳——正是要消掉的东西。
+   */
+  function mustReport() {
+    const source = /** @type {any} */ (state.source ?? {})
+    if (source.rpc) return false
+    return Boolean(source.lastError) || Boolean(source.handshake?.lastError)
+  }
+
   /** 原子写整份状态；`updatedAt` 在写之前刷新，main 用它判活 */
   function flushNow() {
     if (flushTimer) {
@@ -150,6 +182,9 @@ export default function subagentsBoard(pi, ctx) {
     // 这里而不是 flush() 拦，是因为 flush 只是排定时器；定时器到点时
     // 状态可能已经变了，判断得放在真正写盘这一刻。
     if (Date.now() < holdFlushUntil) return
+    // 没派过子代理就不落盘（见 hasSegments）：连 `ensureLiveDir` 都不碰，这类会话
+    // 对磁盘是零写入——每次心跳只是空转一次判断。
+    if (!hasSegments() && !mustReport()) return
     state.updatedAt = Date.now()
     try {
       ensureLiveDir(ctx.dataDir)
