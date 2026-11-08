@@ -5,7 +5,7 @@ import path from 'node:path'
 import test from 'node:test'
 import { pathToFileURL } from 'node:url'
 
-import { readLiveFiles } from '../lib/live-store.mjs'
+import { listSessionKeys, readLiveFiles } from '../lib/live-store.mjs'
 import { sessionKeyOf } from '../lib/session-key.mjs'
 
 const entry = pathToFileURL(path.join(import.meta.dirname, '..', 'agent.mjs')).href
@@ -129,8 +129,15 @@ async function boot(options = {}) {
   return { dataDir, harness, server, logs }
 }
 
-function readState(dataDir) {
-  const files = readLiveFiles(dataDir)
+function readState(dataDir, sessionKey = '') {
+  /** @type {any[]} */
+  const files = []
+  if (sessionKey) files.push(...readLiveFiles(dataDir, sessionKey))
+  else {
+    for (const key of listSessionKeys(dataDir)) files.push(...readLiveFiles(dataDir, key))
+    // sessionFile 还没就位时 worker 写进 unknown 目录，测试里也要能看见
+    files.push(...readLiveFiles(dataDir, 'unknown'))
+  }
   return files.length ? files.sort((a, b) => (b.state.startedAt ?? 0) - (a.state.startedAt ?? 0))[0].state : null
 }
 

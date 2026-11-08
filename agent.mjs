@@ -27,7 +27,7 @@ import path from 'node:path'
 
 import { applyComplete, applyStarted, createState, isActiveState, linkRevived, mergeStatus } from './lib/lineage.mjs'
 import { INBOX_DIR, RECEIPT_DIR, isFresh, parseNoteFileName } from './lib/note-queue.mjs'
-import { ensureLiveDir, liveFileOf, writeJsonAtomic } from './lib/live-store.mjs'
+import { ensureLiveDir, isUnknownLiveFile, liveFileOf, writeJsonAtomic } from './lib/live-store.mjs'
 import {
   describeSteerFailure,
   isReviveNoise,
@@ -158,7 +158,7 @@ export default function subagentsBoard(pi, ctx) {
       state.sessionKey = sessionFile ? sessionKeyOf(sessionFile) : 'unknown'
       const target = liveFileOf(ctx.dataDir, { sessionKey: state.sessionKey, pid: state.pid, startedAt })
       writeJsonAtomic(target, state)
-      if (liveFile && liveFile !== target && path.basename(liveFile).startsWith('unknown-')) {
+      if (liveFile && liveFile !== target && isUnknownLiveFile(liveFile)) {
         // 真 key 到了，把临时那份删掉，别给 main 留垃圾
         try {
           fs.rmSync(liveFile, { force: true })

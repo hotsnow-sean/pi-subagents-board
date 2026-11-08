@@ -32,7 +32,18 @@ import { pathToFileURL } from 'node:url'
 const Q = import.meta.url.includes('?') ? `?${import.meta.url.split('?')[1]}` : ''
 const imp = (name) => import(pathToFileURL(path.join(import.meta.dirname, 'lib', `${name}.mjs`)).href + Q)
 
-const { latestForSession, livenessOf, pruneLiveFiles, readLiveFiles, liveDirOf } = await imp('live-store')
+const {
+  archiveSessions,
+  latestForSession,
+  livenessOf,
+  listSessionKeys,
+  partitionStamp,
+  pruneLiveFiles,
+  readIndex,
+  readLiveFiles,
+  writeIndex,
+  liveDirOf,
+} = await imp('live-store')
 const { normalizeSessionPath, sessionKeyOf } = await imp('session-key')
 const {
   listLineages,
@@ -57,6 +68,8 @@ const { readRunSnapshot, isProcessAlive, steeringEntry, describeSteerFailure } =
 const PANEL_ID = 'fleet'
 /** 巡检间隔：信箱不是实时通道，5s 足够，也不至于把盘读热 */
 const INBOX_SWEEP_MS = 5_000
+/** 归档巡检间隔：应用可能连开好几天，不能只在启动时装订一次 */
+const ARCHIVE_EVERY_MS = 10 * 60 * 1000
 /** 台账文件名（dataDir 下）：已通知过的 `<sessionKey>|<runId>` */
 const LEDGER_FILE = 'notified.json'
 
@@ -64,6 +77,8 @@ const LEDGER_FILE = 'notified.json'
 let rt = null
 /** @type {any} */
 let sweepTimer = null
+/** 上一次装订归档的时刻（巡检里每 10 分钟最多一次） */
+let lastArchiveAt = 0
 /**
  * 最近一次「自愈」发生的时刻（`healFromSnapshots` 收到 > 0 时置位）。
  *
@@ -105,41 +120,18 @@ let liveWatchDebounce = null
 const waiters = new Set()
 
 /**
- * 某个会话的版本戳：文件数 + 最大 mtime + 总大小。
+ * 某个会话的版本戳：文件数 + 最大 mtime + 总大小，**只算这个会话目录**（含归档、不含索引）。
  *
- * 为什么不用目录的 mtime：文件内容是**原子写**（`.tmp` + rename）替换的，目录 mtime
- * 只反映「多了/少了文件」，同一份文件反复覆盖它不动。用 max(mtime) 才看得见内容更新。
- *
- * **只算这个会话自己的文件**（文件名前缀 `<sessionKey>-`）：live 目录是所有会话共用的，
- * 不过滤的话别的会话一落盘就会把本面板从挂起里叫醒，醒来一算「我这儿没变」，白跑一轮。
- * 统计 22 份文件约 0.3ms，可以忽略。
+ * 0.11.0 起 live 按会话分目录，不必再对根目录做前缀过滤；索引被排除在戳之外，
+ * 否则「写完索引 → 戳变了 → 长轮询醒来 → 又写索引」会自激。归档算进戳：
+ * 「几份旧分区装订成一份」对面板是一次真实变化。
  *
  * 前缀里的 key 必须用**数据归属的会话**（子会话预览时是父会话）：预览页拿到的是父会话
  * 的链，按子会话算会恒等于 0 个文件，永远等不到变化。
  */
 function liveStamp(sessionKey) {
-  const dir = liveDirOf(rt.ctx.dataDir)
   if (!sessionKey) return '#0-0-0'
-  const prefix = `${sessionKey}-`
-  let count = 0
-  let newest = 0
-  let bytes = 0
-  try {
-    for (const name of fs.readdirSync(dir)) {
-      if (!name.endsWith('.json') || !name.startsWith(prefix)) continue
-      try {
-        const stat = fs.statSync(path.join(dir, name))
-        count += 1
-        if (stat.mtimeMs > newest) newest = stat.mtimeMs
-        bytes += stat.size
-      } catch {
-        // 文件正好被 rename 掉：这一次不计入，下一次 stat 会补上
-      }
-    }
-  } catch {
-    // 目录还不存在（一个 run 都没跑过）：戳就是空的，别让面板因此挂住
-  }
-  return `${sessionKey}#${count}-${Math.round(newest)}-${bytes}`
+  return `${sessionKey}#${partitionStamp(rt.ctx.dataDir, sessionKey)}`
 }
 
 /**
@@ -149,18 +141,28 @@ function liveStamp(sessionKey) {
 function ensureLiveWatcher() {
   if (liveWatcher) return
   const dir = liveDirOf(rt.ctx.dataDir)
+  const onEvent = () => {
+    if (liveWatchDebounce) return
+    liveWatchDebounce = setTimeout(() => {
+      liveWatchDebounce = null
+      wakeWaiters()
+    }, 60)
+    if (typeof liveWatchDebounce.unref === 'function') liveWatchDebounce.unref()
+  }
+  // 0.11.0 起 live 按下会话分目录，非递归的 watch 看不见子目录里的写入——必须 recursive。
+  // 个别平台/文件系统不支持 recursive，那就退回根目录监听（至少「新会话出现」还能触发），
+  // 再不行就靠 waitMs 到点，功能不坏，只是不即时。
   try {
-    liveWatcher = fs.watch(dir, { persistent: false }, () => {
-      if (liveWatchDebounce) return
-      liveWatchDebounce = setTimeout(() => {
-        liveWatchDebounce = null
-        wakeWaiters()
-      }, 60)
-      if (typeof liveWatchDebounce.unref === 'function') liveWatchDebounce.unref()
-    })
+    liveWatcher = fs.watch(dir, { persistent: false, recursive: true }, onEvent)
+    liveWatcher.on('error', () => closeLiveWatcher())
+    return
+  } catch {
+    /* 换非递归再试一次 */
+  }
+  try {
+    liveWatcher = fs.watch(dir, { persistent: false }, onEvent)
     liveWatcher.on('error', () => closeLiveWatcher())
   } catch {
-    // 目录不存在 / 平台不支持：退回「等满 waitMs」，功能不坏，只是不即时
     liveWatcher = null
   }
 }
@@ -490,12 +492,81 @@ function markViewing(lineages, currentFile, parentSessionFile) {
  * @param {string} sessionKey
  */
 function mergedForSession(dataDir, sessionKey) {
-  const items = readLiveFiles(dataDir).filter((item) => item.state.sessionKey === sessionKey)
+  const items = readLiveFiles(dataDir, sessionKey)
   if (!items.length) return null
   items.sort((a, b) => (Number(a.state.startedAt) || 0) - (Number(b.state.startedAt) || 0))
   const newest = items[items.length - 1]
   if (items.length === 1) return { ...newest, generations: 1 }
   return { ...newest, state: mergeLiveStates(items.map((item) => item.state)), generations: items.length }
+}
+
+/**
+ * 每会话上次写索引时的指纹：会话 key → `<分区戳>|<updatedAt>|<代数>`。
+ * 指纹没变就不重写——否则「读一次就写一次」，读路径变写路径。
+ * @type {Map<string, string>}
+ */
+const indexStamps = new Map()
+
+/**
+ * 写索引。**派生数据**：坏了、没有都能从分区重建，`getState` 不读它。
+ *
+ * 只服务两件事：反查「这段子会话属于谁」（`findOwnerOf`）与诊断。以前反查要把所有
+ * 会话的所有代读出来逐段比路径，现在读每个会话一份小索引就够。
+ * @param {string} sessionKey @param {any} state @param {number} generations
+ */
+function refreshIndex(sessionKey, state, generations) {
+  if (!state || !sessionKey || !rt) return
+  const dir = rt.ctx.dataDir
+  const stamp = `${partitionStamp(dir, sessionKey)}|${Number(state.updatedAt) || 0}|${generations}`
+  if (indexStamps.get(sessionKey) === stamp) return
+  indexStamps.set(sessionKey, stamp)
+  /** @type {any[]} */
+  const segments = []
+  for (const lineage of state.lineages ?? []) {
+    for (const segment of lineage.segments ?? []) segments.push(indexSegment(segment))
+  }
+  try {
+    writeIndex(dir, sessionKey, {
+      version: 2,
+      sessionKey,
+      sessionFile: state.sessionFile ?? '',
+      startedAt: Number(state.startedAt) || 0,
+      updatedAt: Date.now(),
+      generations: Number(generations) || 1,
+      segments,
+    })
+  } catch (error) {
+    // 索引写不进去不影响面板，下次指纹变了会重试
+    try {
+      rt?.ctx?.log?.('index write failed:', error instanceof Error ? error.message : error)
+    } catch {
+      // 日志失败就算了
+    }
+  }
+}
+
+/** 索引里的一段：够反查、够诊断，不带摘要正文 */
+function indexSegment(/** @type {any} */ segment) {
+  return {
+    runId: segment?.runId ?? '',
+    agent: segment?.agent ?? '',
+    state: segment?.state ?? '',
+    startedAt: Number(segment?.startedAt) || 0,
+    endedAt: Number(segment?.endedAt) || 0,
+    durationMs: Number(segment?.durationMs) || 0,
+    sessionName: segment?.sessionName ?? '',
+    label: segment?.label ?? '',
+    childSessionFile: segment?.childSessionFile ?? '',
+    revivedFrom: segment?.revivedFrom ?? '',
+    reviveRoot: segment?.reviveRoot ?? '',
+    reviveHops: Number(segment?.reviveHops) || 0,
+    children: (segment?.children ?? []).map((/** @type {any} */ child) => ({
+      index: child?.index ?? null,
+      agent: child?.agent ?? '',
+      sessionName: child?.sessionName ?? '',
+      sessionFile: child?.sessionFile ?? '',
+    })),
+  }
 }
 
 /**
@@ -642,6 +713,8 @@ function stateFor(sessionFile) {
     }
   }
   const liveness = livenessOf(state)
+  // 索引在自愈/接链之后写：反查要的是修正后的形状（孤链已并回、漏掉的终态已收敛）
+  refreshIndex(state?.sessionKey || sessionKey, state, latest?.generations ?? 1)
   const degrade = describeDegrade(state, liveness)
   const all = state ? listLineages(state) : []
   // 保底 + 补位的裁剪：运行中 / 刚结束的卡不参与上限竞争，剩余名额才按时间序给历史卡。
@@ -700,25 +773,59 @@ function stateFor(sessionFile) {
 }
 
 /**
- * 反查「这段会话是谁的 child」。live 文件按父会话 key 存，遍历比 childSessionFile
- * （路径归一化后比较：事件里的路径与面板上下文里的写法可能差斜杠方向与大小写）。
+ * 反查「这段会话是谁的 child」。
+ *
+ * 0.11.0 起不再读全量状态：每个会话目录有一份 `index.json`（段摘要 + 子会话路径），
+ * 只按索引匹配就能定位到会话，命中后再走一次完整读。索引不存在（新会话还没写过）
+ * 就跳过——那种会话不可能含有我们正在找的历史 child。
  * @param {string} dataDir
  * @param {string} sessionFile
  */
 function findOwnerOf(dataDir, sessionFile) {
   const target = normalizeSessionPath(sessionFile)
   if (!target) return null
-  let best = null
-  for (const item of readLiveFiles(dataDir)) {
-    for (const lineage of item.state?.lineages ?? []) {
-      for (const segment of lineage.segments ?? []) {
-        if (segment.childSessionFile && normalizeSessionPath(segment.childSessionFile) === target) {
-          if (!best || (Number(item.state.startedAt) || 0) > (Number(best.state.startedAt) || 0)) best = item
-        }
-      }
+  let bestKey = ''
+  let bestStartedAt = -1
+  for (const key of listSessionKeys(dataDir)) {
+    const index = readIndex(dataDir, key)
+    let hit = false
+    let startedAt = Number(index?.startedAt) || 0
+    if (index) {
+      hit = (index.segments ?? []).some((/** @type {any} */ segment) => segmentMatchesChild(segment, target))
+    } else {
+      // 索引还没写（迁移后第一次、或写失败了）：读这个会话的分区兜底。
+      // 索引是派生数据，读路径不能因为它缺席就失去功能。
+      const files = readLiveFiles(dataDir, key)
+      hit = files.some((item) => stateMatchesChild(item.state, target))
+      if (hit) startedAt = Math.max(...files.map((item) => Number(item.state?.startedAt) || 0), 0)
+    }
+    if (!hit) continue
+    if (startedAt > bestStartedAt) {
+      bestStartedAt = startedAt
+      bestKey = key
     }
   }
-  return best ? mergedForSession(dataDir, best.state?.sessionKey ?? '') ?? best : null
+  if (!bestKey) return null
+  return mergedForSession(dataDir, bestKey)
+}
+
+/** 索引里的一段是否指向 target（子会话路径已归一化） */
+function segmentMatchesChild(/** @type {any} */ segment, /** @type {string} */ target) {
+  const own = normalizeSessionPath(segment?.childSessionFile)
+  if (own && own === target) return true
+  return (segment?.children ?? []).some(
+    (/** @type {any} */ child) => normalizeSessionPath(child?.sessionFile) === target,
+  )
+}
+
+/** 没有索引时的兜底：直接看状态里的段 */
+function stateMatchesChild(/** @type {any} */ state, /** @type {string} */ target) {
+  for (const lineage of state?.lineages ?? []) {
+    for (const segment of lineage?.segments ?? []) {
+      if (segmentMatchesChild(segment, target)) return true
+    }
+  }
+  return false
 }
 
 /** @param {any} ctx */
@@ -868,7 +975,11 @@ function writeLedger(ctx, ledger) {
 function sweepInbox(ctx) {
   const inbox = ctx.ui?.inbox
   if (typeof inbox !== 'function') return
-  const files = readLiveFiles(ctx.dataDir)
+  // 巡检要覆盖**没打开的会话**，只能按会话目录遍历（readLiveFiles 现在只读一个会话）。
+  // 文件解析有 mtime+size 缓存，这里每 5s 一次的代价仍然很小。
+  /** @type {any[]} */
+  const files = []
+  for (const key of listSessionKeys(ctx.dataDir)) files.push(...readLiveFiles(ctx.dataDir, key))
   if (!files.length) return
   const ledger = readLedger(ctx)
   // 启动/热重载时把「早就结束」的段记进台账，不发通知：否则每次重启都会把历史重播一遍
@@ -967,6 +1078,9 @@ export async function activate(pluginContext) {
   closeLiveWatcher()
   wakeWaiters()
   rt = { ctx: pluginContext }
+  // 先装订再清理：把「已经下班、卡都结束」的分区合成一份 archive，目录常态回到 3 个文件。
+  // 归档只在启动时和巡检里做（见 sweepTimer），读路径不写盘。
+  const archived = archiveSessions(pluginContext.dataDir)
   const removed = pruneLiveFiles(pluginContext.dataDir)
   // 留言/回执留一天：够用户回看「我当时说了什么、它收到了没」，再久就是垃圾
   const staleMail = pruneMail(
@@ -978,6 +1092,7 @@ export async function activate(pluginContext) {
   )
   // 先巡检一次：把历史终态段记进台账（不发通知），之后只发新增的
   sweepInbox(pluginContext)
+  lastArchiveAt = Date.now()
   sweepTimer = setInterval(() => {
     if (!rt) return
     try {
@@ -985,10 +1100,23 @@ export async function activate(pluginContext) {
     } catch (error) {
       rt.ctx.log('inbox sweep failed:', error instanceof Error ? error.message : error)
     }
+    // 应用可能连着开好几天：归档不能只在启动时做，否则一个会话又攒出十来份分区。
+    // 10 分钟一次，代价是 20 个目录的 stat。
+    if (Date.now() - lastArchiveAt >= ARCHIVE_EVERY_MS) {
+      lastArchiveAt = Date.now()
+      try {
+        const result = archiveSessions(rt.ctx.dataDir)
+        if (result.files) rt.ctx.log(`archived ${result.files} idle live partition(s)`)
+      } catch (error) {
+        rt.ctx.log('archive failed:', error instanceof Error ? error.message : error)
+      }
+    }
   }, INBOX_SWEEP_MS)
   if (typeof sweepTimer.unref === 'function') sweepTimer.unref()
   pluginContext.log(
-    `subagents-board active, dataDir=${pluginContext.dataDir}${removed ? `, pruned ${removed} stale live file(s)` : ''}${
+    `subagents-board active, dataDir=${pluginContext.dataDir}${
+      archived.files ? `, archived ${archived.files} idle live partition(s)` : ''
+    }${removed ? `, pruned ${removed} stale live file(s)` : ''}${
       staleMail ? `, pruned ${staleMail} stale mail file(s)` : ''
     }`,
   )

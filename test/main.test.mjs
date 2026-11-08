@@ -7,7 +7,7 @@ import { pathToFileURL } from 'node:url'
 import { spawnSync } from 'node:child_process'
 
 import { applyComplete, applyStarted, createState } from '../lib/lineage.mjs'
-import { ensureLiveDir, liveFileOf, writeJsonAtomic } from '../lib/live-store.mjs'
+import { archiveFileOf, ensureLiveDir, liveFileOf, readIndex, writeJsonAtomic } from '../lib/live-store.mjs'
 import { sessionKeyOf } from '../lib/session-key.mjs'
 
 /**
@@ -67,6 +67,32 @@ function seedLive(dataDir, sessionFile) {
   return { sessionKey, startedAt }
 }
 
+/**
+ * live 下所有状态文件（分区 + 归档，**不含索引**）。
+ * 0.11.0 起按会话分目录，测试里要改 updatedAt / mtime 的用例得递归找。
+ * @param {string} dataDir
+ */
+function liveFilesOf(dataDir) {
+  /** @type {string[]} */
+  const out = []
+  const walk = (/** @type {string} */ dir) => {
+    /** @type {fs.Dirent[]} */
+    let entries = []
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name)
+      if (entry.isDirectory()) walk(full)
+      else if (entry.name.endsWith('.json') && entry.name !== 'index.json') out.push(full)
+    }
+  }
+  walk(path.join(dataDir, 'live'))
+  return out
+}
+
 test('getState: 没有会话时给出可渲染的 no-session，而不是空对象', async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
   const mod = await loadMain()
@@ -103,9 +129,7 @@ test('getState: 心跳过期时 degrade 变 stale，数据照常返回', async (
   const mod = await loadMain()
   const api = await mod.activate(fakeCtx(dataDir))
   // 把 updatedAt 改到 2 分钟前，模拟 worker 已退出
-  const live = path.join(dataDir, 'live')
-  for (const name of fs.readdirSync(live)) {
-    const file = path.join(live, name)
+  for (const file of liveFilesOf(dataDir)) {
     const parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
     parsed.updatedAt = Date.now() - 120_000
     fs.writeFileSync(file, JSON.stringify(parsed))
@@ -387,9 +411,7 @@ test('干预能力：canSteer / canStop 跟着段状态与扩展能力走（UI �
   assert.equal(running.lineages[0].segments[0].canStop, true)
 
   // 终态段不能干预（child-scoped stop 对已终态目标会报错，先置灰）
-  const live = path.join(dataDir, 'live')
-  for (const name of fs.readdirSync(live)) {
-    const file = path.join(live, name)
+  for (const file of liveFilesOf(dataDir)) {
     const parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
     parsed.lineages[0].segments[0].state = 'complete'
     fs.writeFileSync(file, JSON.stringify(parsed))
@@ -399,8 +421,7 @@ test('干预能力：canSteer / canStop 跟着段状态与扩展能力走（UI �
   assert.equal(done.lineages[0].segments[0].canStop, false)
 
   // 老版本扩展没有 steer / stop 能力：整体置灰
-  for (const name of fs.readdirSync(live)) {
-    const file = path.join(live, name)
+  for (const file of liveFilesOf(dataDir)) {
     const parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
     parsed.lineages[0].segments[0].state = 'running'
     parsed.source.supports = { steer: false, stop: false }
@@ -842,4 +863,76 @@ test('getState: 应用重启带走了 runner 进程，卡片判成「已中断�
   assert.equal(segment.canStop, false, '停止按钮必须消失：点了也没有进程接')
   assert.equal(segment.canSteer, false)
   assert.equal(got.activeCount, 0)
+})
+
+test('getState: 归档里的历史卡与活跃分区一起显示（装订对读透明）', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
+  const sessionFile = path.join(dataDir, 'sessions', 'arch.jsonl')
+  const sessionKey = sessionKeyOf(sessionFile)
+  const startedAt = Date.now() - 60_000
+
+  // 上一代已经下班：装订进 archive
+  writeJsonAtomic(archiveFileOf(dataDir, sessionKey), {
+    version: 2,
+    sessionKey,
+    startedAt: 0,
+    updatedAt: Date.now(),
+    lineages: [
+      {
+        lineageRoot: 'run-old',
+        agent: 'delegate',
+        segments: [
+          {
+            runId: 'run-old',
+            agent: 'delegate',
+            state: 'complete',
+            startedAt,
+            endedAt: startedAt + 10,
+            sessionName: 'delegate: 老任务',
+          },
+        ],
+      },
+    ],
+  })
+  // 当前这一代：还在跑
+  const state = createState({ sessionKey, sessionFile, pid: 42, startedAt: startedAt + 1_000 })
+  applyStarted(state, { id: 'run-new', agent: 'delegate', cwd: 'C:/w' }, startedAt + 1_100)
+  state.updatedAt = Date.now()
+  writeJsonAtomic(liveFileOf(dataDir, { sessionKey, pid: 42, startedAt: startedAt + 1_000 }), state)
+
+  const mod = await loadMain()
+  const api = await mod.activate(fakeCtx(dataDir))
+  const view = await api.invoke('getState', { sessionFile })
+
+  const runIds = view.lineages.flatMap((lineage) => lineage.segments.map((segment) => segment.runId)).sort()
+  assert.deepEqual(runIds, ['run-new', 'run-old'], '归档的卡和活跃的卡都要在')
+  assert.equal(view.generations, 2, '一份归档 + 一份分区 = 两代')
+  assert.ok(view.dataFile.endsWith('.json'), '诊断区显示的是当前分区')
+})
+
+test('getState: 状态一算出就落索引；反查子会话优先走它', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
+  const sessionFile = path.join(dataDir, 'sessions', 'idx.jsonl')
+  const sessionKey = sessionKeyOf(sessionFile)
+  const startedAt = Date.now() - 5_000
+  const childFile = path.join(dataDir, 'sessions', 'child', 'run-1', 'run-0', 'session.jsonl')
+  const state = createState({ sessionKey, sessionFile, pid: 5, startedAt })
+  const started = applyStarted(state, { id: 'run-1', agent: 'delegate', cwd: 'C:/w' }, startedAt + 100)
+  started.segment.childSessionFile = childFile
+  state.updatedAt = Date.now()
+  writeJsonAtomic(liveFileOf(dataDir, { sessionKey, pid: 5, startedAt }), state)
+
+  const mod = await loadMain()
+  const api = await mod.activate(fakeCtx(dataDir))
+  await api.invoke('getState', { sessionFile })
+
+  const index = readIndex(dataDir, sessionKey)
+  assert.ok(index, 'getState 之后应当落一份索引（反查与诊断都靠它）')
+  assert.equal(index.segments[0].runId, 'run-1')
+  assert.equal(index.segments[0].childSessionFile, childFile)
+
+  // 预览这段子会话：反查出父会话的链，并给出「返回主会话」的落点
+  const preview = await api.invoke('getState', { sessionFile: childFile })
+  assert.equal(preview.parentSessionFile, sessionFile)
+  assert.equal(preview.lineages[0].segments[0].runId, 'run-1')
 })
