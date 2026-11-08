@@ -1,12 +1,36 @@
-# 子代理面板 · subagents-board
+<p align="center">
+  <img src="docs/shots/hero.svg" width="100%" alt="subagents-board：多个后台子代理的事件汇聚到一块面板">
+</p>
 
-[pi-app](https://github.com/hotsnow-sean/pi-app) 桌面端插件：在**右栏**看清 [`pi-subagents`](https://www.npmjs.com/package/pi-subagents) 的后台运行。
+<h1 align="center">子代理面板</h1>
 
-> 需要**带插件宿主**的 pi-app 版本（fork 的 `feat/plugins-core` 分支）。插件系统目前只在
-> 这个 fork 里，上游 [`justhil/pi-app`](https://github.com/justhil/pi-app) 还没有——所以
-> 「设置 → 插件」这一页在官方版里不存在。
+<p align="center">
+  <b>subagents-board</b> · pi-app 桌面端插件<br>
+  <sub>在右栏看清 <code>pi-subagents</code> 的后台运行 —— 谁在跑 · 跑到哪 · 什么时候结束 · 要不要插手</sub>
+</p>
 
-<img src="docs/shots/panel.png" width="400" alt="右栏面板：一个 workflow 父卡下面挂着三个子代理（已完成 / 运行中 / 待启动），下方是一张被中断后重试两次的卡">
+<p align="center">
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/version-0.11.4-7c6bd6?style=flat-square" alt="version"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-16803c?style=flat-square" alt="license"></a>
+  <a href="test"><img src="https://img.shields.io/badge/tests-194%20passing-2f855a?style=flat-square" alt="tests"></a>
+  <img src="https://img.shields.io/badge/pi--app-plugin-4b5563?style=flat-square" alt="pi-app plugin">
+  <img src="https://img.shields.io/badge/deps-none-4b5563?style=flat-square" alt="zero dependencies">
+</p>
+
+---
+
+> **需要带插件宿主的 pi-app。** 插件系统目前只存在于
+> [`hotsnow-sean/pi-app`](https://github.com/hotsnow-sean/pi-app) 的 `feat/plugins-core` 分支上，
+> 上游 [`justhil/pi-app`](https://github.com/justhil/pi-app) 还没有——所以「设置 → 插件」这一页
+> 在官方版里不存在。
+
+## 面板长什么样
+
+<p align="center">
+  <img src="docs/shots/panel.png" width="470" alt="右栏面板：一个 workflow 父卡下面挂着三个子代理（已完成 / 运行中 / 待启动），下方是一张被中断后重试两次的卡">
+</p>
+
+<p align="center"><sub>父卡下面挂着三个子代理；再下面那张是被中断后重试过两次的 <code>reviewer</code></sub></p>
 
 ## 为什么需要它
 
@@ -60,6 +84,10 @@
 3. **新开一个会话**生效（插件扩展随 worker 启动注入，已开着的会话还挂着旧 worker）
 
 装完右栏会出现「子代理」面板。没有任何子代理在跑时，面板显示空态，不会留下文件。
+
+> **装插件 = 把宿主进程的权限交出去。** `main.mjs` 是被直接 `import` 进 pi-app 主进程运行的，
+> `node:fs`、`child_process`、Electron API 全都在手。本插件只用这些权限读写自己的
+> `plugin-data/` 目录，全部代码就在这个仓库里、可自行审阅——但宿主目前不会替你担保这一点。
 
 ## 依赖
 
@@ -144,7 +172,7 @@ PI_PLUGINS_DIR=/path/to/pi-plugins-dev PI_PLUGINS_DIR_SOURCE=dev npm run dev
 
 - 只能观测**后台** run；前台子代理没有 async id，看不到也管不了
 - 宿主没给插件扩展提供 dispose 钩子，所以插件实例只能靠「继续用 `pi` 会抛 stale」发现自己作废——在那之前它的定时器还在跑（无害，但白转）
-- 面板每 6 秒一次长轮询兜底。宿主提供事件推送后会换成推送为主（见 CHANGELOG 的讨论）
+- 面板每 6 秒一次长轮询兜底。没有做宿主侧事件推送：消费方只有这一个面板，收益不在体感上
 
 ## 许可
 

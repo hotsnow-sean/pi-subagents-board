@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 320" width="1024" height="320" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',system-ui,-apple-system,'Segoe UI',sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0a0c14"/>
+      <stop offset="0.5" stop-color="#12141f"/>
+      <stop offset="1" stop-color="#1a1426"/>
+    </linearGradient>
+    <radialGradient id="glowMid" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#8b7ce8" stop-opacity="0.6"/>
+      <stop offset="0.42" stop-color="#7c6bd6" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#7c6bd6" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowGreen" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#25c983" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#25c983" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="topLine" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#8b7ce8" stop-opacity="0"/>
+      <stop offset="0.35" stop-color="#8b7ce8" stop-opacity="0.75"/>
+      <stop offset="0.66" stop-color="#5bd6a0" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#5bd6a0" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="flowL" x1="0" y1="0" x2="416" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#8b7ce8" stop-opacity="0"/>
+      <stop offset="0.4" stop-color="#8b7ce8" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#b3a7fa" stop-opacity="0.7"/>
+    </linearGradient>
+    <linearGradient id="flowR" x1="1024" y1="0" x2="608" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4fbf95" stop-opacity="0"/>
+      <stop offset="0.4" stop-color="#4fbf95" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#5bd6a0" stop-opacity="0.55"/>
+    </linearGradient>
+    <linearGradient id="iconBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2a2447"/>
+      <stop offset="1" stop-color="#141726"/>
+    </linearGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0 H0 V32" fill="none" stroke="#ffffff" stroke-opacity="0.032" stroke-width="1"/>
+    </pattern>
+  </defs>
+
+  <rect width="1024" height="320" fill="url(#bg)"/>
+  <rect width="1024" height="320" fill="url(#grid)"/>
+  <ellipse cx="512" cy="160" rx="460" ry="290" fill="url(#glowMid)"/>
+  <ellipse cx="940" cy="30" rx="280" ry="200" fill="url(#glowGreen)"/>
+  <rect x="0" y="0" width="1024" height="2" fill="url(#topLine)"/>
+
+  <!-- 汇聚的事件流 -->
+  <g fill="none" stroke-width="1.4">
+    <path d="M0 100 Q 250 100 416 138" stroke="url(#flowL)"/>
+    <path d="M0 160 Q 270 160 416 160" stroke="url(#flowL)"/>
+    <path d="M0 220 Q 250 220 416 182" stroke="url(#flowL)"/>
+    <path d="M1024 100 Q 774 100 608 138" stroke="url(#flowR)"/>
+    <path d="M1024 160 Q 754 160 608 160" stroke="url(#flowR)"/>
+    <path d="M1024 220 Q 774 220 608 182" stroke="url(#flowR)"/>
+  </g>
+  <g fill="#c3b9fb">
+    <circle cx="142" cy="103" r="2.2" fill-opacity="0.45"/>
+    <circle cx="230" cy="120" r="2.8" fill-opacity="0.85"/>
+    <circle cx="208" cy="160" r="2.2" fill-opacity="0.5"/>
+    <circle cx="230" cy="200" r="2.4" fill-opacity="0.35"/>
+  </g>
+  <g fill="#6fe0b0">
+    <circle cx="882" cy="103" r="2.2" fill-opacity="0.4"/>
+    <circle cx="795" cy="120" r="2.8" fill-opacity="0.62"/>
+    <circle cx="785" cy="160" r="2.2" fill-opacity="0.42"/>
+    <circle cx="795" cy="200" r="2.4" fill-opacity="0.3"/>
+  </g>
+
+  <!-- 中心：多实例汇聚 -->
+  <circle cx="512" cy="160" r="96" fill="none" stroke="#7c6bd6" stroke-opacity="0.18" stroke-width="1" stroke-dasharray="2 7"/>
+  <circle cx="512" cy="160" r="78" fill="#7c6bd6" fill-opacity="0.07" stroke="#8b7ce8" stroke-opacity="0.3" stroke-width="1.2"/>
+  <circle cx="512" cy="160" r="58" fill="url(#iconBg)" stroke="#404870" stroke-width="1.4"/>
+  <circle cx="512" cy="160" r="40" fill="#8b7ce8" fill-opacity="0.09"/>
+  <circle cx="512" cy="64" r="2.8" fill="#8b7ce8" fill-opacity="0.75"/>
+  <circle cx="512" cy="256" r="2.8" fill="#6fe0b0" fill-opacity="0.65"/>
+
+  <g transform="translate(488,136) scale(2)" stroke="#ded9ff" stroke-width="1.05" fill="none" stroke-linecap="round">
+    <path d="M10.6 9.6 H19 V19.2 H10.6"/>
+  </g>
+  <g transform="translate(488,136) scale(2)" fill="#ded9ff">
+    <rect x="7" y="6.2" width="5.9" height="5.9" rx="1.8"/>
+    <rect x="16.1" y="14.7" width="5.9" height="5.9" rx="1.8"/>
+    <rect x="7" y="21.4" width="5.9" height="5.9" rx="1.8"/>
+  </g>
+</svg>
