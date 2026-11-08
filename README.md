@@ -165,7 +165,8 @@ PI_PLUGINS_DIR=/path/to/pi-plugins-dev PI_PLUGINS_DIR_SOURCE=dev npm run dev
 
 ## 版本
 
-变更记录见 [CHANGELOG.md](CHANGELOG.md)。当前 `0.11.x`。
+当前 `0.11.x`。每个版本的变化见 [Releases](https://github.com/hotsnow-sean/pi-subagents-board/releases)
+与 [CHANGELOG.md](CHANGELOG.md)。
 
 已知限制：只能观测**后台** run；前台子代理没有可跟踪的 id，看不到也管不了。状态变化正常
 立刻可见，万一漏了事件，6 秒内也会补上。
