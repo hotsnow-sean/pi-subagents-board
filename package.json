@@ -7,5 +7,13 @@
   "scripts": {
     "test": "node --test"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hotsnow-sean/pi-subagents-board.git"
+  },
+  "bugs": {
+    "url": "https://github.com/hotsnow-sean/pi-subagents-board/issues"
+  },
+  "homepage": "https://github.com/hotsnow-sean/pi-subagents-board#readme",
   "license": "MIT"
 }
