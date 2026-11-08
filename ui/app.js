@@ -1217,7 +1217,9 @@ function renderList(lineages) {
 }
 
 function renderBanner(degrade) {
-  if (!degrade || degrade.kind === 'ok') return ''
+  // 没有标题就没有横幅：`ok` 与 `archived`（只剩归档，实例都退出了）都不该占一行。
+  // 判标题而不是枚举 kind——以后再加「不需要用户行动的」状态不会漏成这样一条空横幅。
+  if (!degrade || !degrade.title) return ''
   return `<div class="banner banner-${esc(degrade.tone || 'info')}">
     <strong>${esc(degrade.title)}</strong>
     <span>${esc(degrade.detail)}</span>

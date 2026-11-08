@@ -7,7 +7,16 @@ import { pathToFileURL } from 'node:url'
 import { spawnSync } from 'node:child_process'
 
 import { applyComplete, applyStarted, createState } from '../lib/lineage.mjs'
-import { archiveFileOf, ensureLiveDir, liveFileOf, readIndex, writeJsonAtomic } from '../lib/live-store.mjs'
+import {
+  ARCHIVE_IDLE_MS,
+  archiveFileOf,
+  archiveSessions,
+  ensureLiveDir,
+  liveFileOf,
+  readIndex,
+  readLiveFiles,
+  writeJsonAtomic,
+} from '../lib/live-store.mjs'
 import { sessionKeyOf } from '../lib/session-key.mjs'
 
 /**
@@ -935,4 +944,30 @@ test('getState: 状态一算出就落索引；反查子会话优先走它', asyn
   const preview = await api.invoke('getState', { sessionFile: childFile })
   assert.equal(preview.parentSessionFile, sessionFile)
   assert.equal(preview.lineages[0].segments[0].runId, 'run-1')
+})
+
+test('getState: 只剩归档的会话不报「未连上 pi-subagents」，历史卡照常显示（0.11.1）', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'board-main-'))
+  const sessionFile = path.join(dataDir, 'sessions', 'archived.jsonl')
+  const { sessionKey } = seedLive(dataDir, sessionFile)
+  // 实例已经下班：段收敛成终态，分区闲置超时后被装订进 archive.json
+  const old = new Date(Date.now() - ARCHIVE_IDLE_MS - 60_000)
+  for (const file of liveFilesOf(dataDir)) {
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
+    parsed.lineages[0].segments[0].state = 'complete'
+    parsed.lineages[0].segments[0].endedAt = Date.now() - 60_000
+    fs.writeFileSync(file, JSON.stringify(parsed))
+    fs.utimesSync(file, old, old)
+  }
+  archiveSessions(dataDir)
+  assert.equal(fs.existsSync(archiveFileOf(dataDir, sessionKey)), true, '分区应当已被装订')
+  assert.equal(readLiveFiles(dataDir, sessionKey).filter((item) => item.kind === 'partition').length, 0)
+
+  const mod = await loadMain()
+  const api = await mod.activate(fakeCtx(dataDir))
+  const state = await api.invoke('getState', { sessionFile })
+
+  assert.equal(state.lineages.length, 1, '归档卡必须还在')
+  assert.equal(state.degrade.kind, 'archived')
+  assert.equal(state.degrade.title, '', '归档没有 source，不能拿它判「没连上」')
 })

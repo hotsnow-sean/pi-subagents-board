@@ -43,6 +43,22 @@ test('心跳过期 → stale，并说明最后一次更新在多久前', () => {
   assert.match(result.detail, /1 分钟/)
 })
 
+test('只剩归档（livePartitions: 0）→ archived：不报警，也不占一行横幅', () => {
+  // 归档里没有 source（装订时不会伪造实例的运行时能力），心跳也是装订时刻而不是真的心跳。
+  // 拿它判「连没连上 pi-subagents」会得到一句假警报——用户只是打开旧会话看历史。
+  const archivedState = { lineages: [{ segments: [{ runId: 'run-1', state: 'stopped' }] }] }
+  const result = describeDegrade(archivedState, { alive: false, ageMs: 3_600_000 }, NOW, { livePartitions: 0 })
+  assert.equal(result.kind, 'archived')
+  assert.equal(result.title, '', '渲染层按「有没有标题」决定画不画横幅')
+})
+
+test('有活跃分区但没有 source → 仍是 rpc-unavailable（这条不能一起被放过）', () => {
+  const result = describeDegrade({ lineages: [] }, ALIVE, NOW, { livePartitions: 1 })
+  assert.equal(result.kind, 'rpc-unavailable')
+  // 不传 livePartitions 的老调用方行为不变
+  assert.equal(describeDegrade({ lineages: [] }, ALIVE, NOW).kind, 'rpc-unavailable')
+})
+
 test('轮询模式 → poll，文案说明「慢一拍」', () => {
   const result = describeDegrade({ source: source({ mode: 'poll' }) }, ALIVE, NOW)
   assert.equal(result.kind, 'poll')

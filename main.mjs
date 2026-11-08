@@ -496,8 +496,16 @@ function mergedForSession(dataDir, sessionKey) {
   if (!items.length) return null
   items.sort((a, b) => (Number(a.state.startedAt) || 0) - (Number(b.state.startedAt) || 0))
   const newest = items[items.length - 1]
-  if (items.length === 1) return { ...newest, generations: 1 }
-  return { ...newest, state: mergeLiveStates(items.map((item) => item.state)), generations: items.length }
+  // 还在写的那几份。0 = 只剩归档（实例都退出了），降级判定要据此走「历史」而不是
+  // 「没连上 pi-subagents」——归档没有 source，那不是故障（见 lib/degrade.mjs）。
+  const livePartitions = items.filter((item) => item.kind === 'partition').length
+  if (items.length === 1) return { ...newest, generations: 1, livePartitions }
+  return {
+    ...newest,
+    state: mergeLiveStates(items.map((item) => item.state)),
+    generations: items.length,
+    livePartitions,
+  }
 }
 
 /**
@@ -715,7 +723,9 @@ function stateFor(sessionFile) {
   const liveness = livenessOf(state)
   // 索引在自愈/接链之后写：反查要的是修正后的形状（孤链已并回、漏掉的终态已收敛）
   refreshIndex(state?.sessionKey || sessionKey, state, latest?.generations ?? 1)
-  const degrade = describeDegrade(state, liveness)
+  const degrade = describeDegrade(state, liveness, Date.now(), {
+    livePartitions: latest?.livePartitions ?? 1,
+  })
   const all = state ? listLineages(state) : []
   // 保底 + 补位的裁剪：运行中 / 刚结束的卡不参与上限竞争，剩余名额才按时间序给历史卡。
   const picked = pickVisible(all, { limit: MAX_CARDS })
@@ -1080,7 +1090,8 @@ export async function activate(pluginContext) {
   rt = { ctx: pluginContext }
   // 先装订再清理：把「已经下班、卡都结束」的分区合成一份 archive，目录常态回到 3 个文件。
   // 归档只在启动时和巡检里做（见 sweepTimer），读路径不写盘。
-  const archived = archiveSessions(pluginContext.dataDir)
+  // isAlive 一并传下去：安静但活着的实例不能被搬（见 lib/live-store.mjs 的 archiveSessions）。
+  const archived = archiveSessions(pluginContext.dataDir, { isAlive: isProcessAlive })
   const removed = pruneLiveFiles(pluginContext.dataDir)
   // 留言/回执留一天：够用户回看「我当时说了什么、它收到了没」，再久就是垃圾
   const staleMail = pruneMail(
@@ -1105,7 +1116,7 @@ export async function activate(pluginContext) {
     if (Date.now() - lastArchiveAt >= ARCHIVE_EVERY_MS) {
       lastArchiveAt = Date.now()
       try {
-        const result = archiveSessions(rt.ctx.dataDir)
+        const result = archiveSessions(rt.ctx.dataDir, { isAlive: isProcessAlive })
         if (result.files) rt.ctx.log(`archived ${result.files} idle live partition(s)`)
       } catch (error) {
         rt.ctx.log('archive failed:', error instanceof Error ? error.message : error)

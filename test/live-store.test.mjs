@@ -147,6 +147,22 @@ test('archiveSessions: 有 running 段的分区不动；刚写过的也不动', 
   assert.equal(readLiveFiles(dir, 'k1').length, 2)
 })
 
+test('archiveSessions: 闲置但 pid 还活着的分区不搬（安静的长会话不能「断代」）', () => {
+  const dir = tmpDir()
+  const now = Date.now()
+  const old = new Date(now - ARCHIVE_IDLE_MS - 60_000)
+  // 文件名里的 pid 就是判断依据：用测试进程自己的 pid 保证「活着」
+  const idle = liveFileOf(dir, { sessionKey: 'k1', pid: process.pid, startedAt: 100 })
+  writeJsonAtomic(idle, stateOf('k1', 100, 'run-a'))
+  fs.utimesSync(idle, old, old)
+
+  assert.deepEqual(archiveSessions(dir, { now, isAlive: () => true }), { archived: 0, files: 0 })
+  assert.equal(readLiveFiles(dir, 'k1').length, 1, '活实例的分区要留着：它下次 flush 还得往这儿写')
+
+  // 同一份文件，一旦那个进程没了，就该照常装订
+  assert.deepEqual(archiveSessions(dir, { now, isAlive: () => false }), { archived: 1, files: 1 })
+})
+
 test('archiveSessions: 二次装订会并进已有的归档，不会丢前一次的段', () => {
   const dir = tmpDir()
   const now = Date.now()
